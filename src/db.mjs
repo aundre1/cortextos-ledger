@@ -90,17 +90,25 @@ export function openDb(path) {
     mkdirSync(dir, { recursive: true });
   }
   const db = new DatabaseSync(path);
-  db.exec('PRAGMA foreign_keys = ON;');
-  db.exec('PRAGMA journal_mode = WAL;');
   // Concurrent access is real, not hypothetical: `run:launch` spawns a
   // detached `cortexctl watch` process that opens its own connection to the
-  // same file (docs/state-machine.md "Wall clock watchdog"), and two CLI
+  // same file (docs/state-machine.md "Wall clock watchdog"), two CLI
   // invocations can legitimately race a moment apart (a test's `run:launch`
-  // followed immediately by `run:end`, or two orchestrator scripts). Without
-  // a busy timeout, node:sqlite raises SQLITE_BUSY immediately instead of
-  // waiting the brief moment a WAL writer needs; this is the standard fix
-  // (not a retry/sleep in the tests themselves).
+  // followed immediately by `run:end`, or two orchestrator scripts), and
+  // several `run:start` processes can race outright (review round 1, F1 -
+  // test/concurrency.test.mjs). Without a busy timeout, node:sqlite raises
+  // SQLITE_BUSY ("database is locked") immediately instead of waiting the
+  // brief moment another writer needs; this is the standard fix (not a
+  // retry/sleep in the tests themselves). It is set FIRST, before any other
+  // pragma or statement - `PRAGMA journal_mode = WAL` itself briefly needs
+  // the write lock on a database another connection is mid-write on (most
+  // often true only on the very first ever open of a fresh file, since the
+  // mode then persists in the file - but that race is exactly what a dozen
+  // processes calling `openDb` for the first time, concurrently, hits), so
+  // setting it any later leaves that one pragma unprotected.
   db.exec('PRAGMA busy_timeout = 5000;');
+  db.exec('PRAGMA foreign_keys = ON;');
+  db.exec('PRAGMA journal_mode = WAL;');
   return db;
 }
 
@@ -163,6 +171,48 @@ async function applyOne(db, migration) {
     }
     mod.up(db);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Atomic limit gates (review round 1, F1): a check-then-insert sequence
+// (attempts/spend/quota gate, then insertRun; a verdict uniqueness gate,
+// then insertVerdict; a proposal status gate, then insertTask) is only a
+// real limit if no other connection can insert between the check and the
+// write. `BEGIN IMMEDIATE` takes SQLite's RESERVED lock up front, before any
+// statement runs, so a second process's own `BEGIN IMMEDIATE` blocks (up to
+// `busy_timeout`, see openDb above) rather than interleaving - the two
+// callers are serialized, not merely both individually consistent.
+// ---------------------------------------------------------------------------
+
+/**
+ * Run `fn()` (synchronous - node:sqlite's DatabaseSync has no async surface)
+ * inside a `BEGIN IMMEDIATE ... COMMIT` transaction on `db`, returning
+ * whatever `fn` returns. `fn` should only read/write through `db` - no
+ * external I/O (git, network, other files), since that work should already
+ * be done before this is called (holding the write lock for anything slower
+ * than a handful of prepared statements starves every other writer for up to
+ * `busy_timeout`). On any throw from `fn`, the transaction is rolled back and
+ * the error re-thrown; the caller decides what a "gate failed" result versus
+ * a genuine exception looks like (a gate failure should normally be returned
+ * from `fn`, not thrown, so the transaction still commits and the lock is
+ * released promptly).
+ */
+export function withImmediateTransaction(db, fn) {
+  db.exec('BEGIN IMMEDIATE');
+  let result;
+  try {
+    result = fn();
+  } catch (e) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // best effort - if the connection is already unusable there is
+      // nothing more productive to do than let the original error surface.
+    }
+    throw e;
+  }
+  db.exec('COMMIT');
+  return result;
 }
 
 /**

@@ -12,15 +12,21 @@ import { filterEnv, redact } from './credential-boundary.mjs';
 const ARGS_SUMMARY_MAX = 200;
 
 /**
- * buildArgv({ prompt, cwd, model, allowedTools, auth }) -> { cmd, args, cwd, env }
- * per docs/adapters.md: prompt is always an argument, never stdin. Permission
- * flags come from config's `allowedTools`; this kit never passes
- * `--dangerously-skip-permissions` (docs/adapters.md "Permissions").
+ * buildArgv({ prompt, cwd, model, allowedTools, auth, cmd, argsPrefix }) ->
+ * { cmd, args, cwd, env } per docs/adapters.md: prompt is always an
+ * argument, never stdin. Permission flags come from config's
+ * `allowedTools`; this kit never passes `--dangerously-skip-permissions`
+ * (docs/adapters.md "Permissions"). `cmd`/`argsPrefix` (review round 1, F2
+ * test harness) override the executable and prepend extra argv - default
+ * cmd is `claude`, argsPrefix defaults to none - so a stub binary
+ * (`config.adapters.claude.cmd`/`argsPrefix`) can stand in for the real CLI
+ * in tests without this function otherwise changing shape.
  */
-export function buildArgv({ prompt, cwd, model, allowedTools, auth }) {
+export function buildArgv({ prompt, cwd, model, allowedTools, auth, cmd, argsPrefix }) {
   return {
-    cmd: 'claude',
+    cmd: cmd ?? 'claude',
     args: [
+      ...(argsPrefix ?? []),
       '-p', prompt,
       '--output-format', 'stream-json',
       '--verbose',
@@ -39,10 +45,15 @@ function capSummary(value) {
 }
 
 /**
- * parseStream(lines) -> normalized events (docs/adapters.md "Normalized
- * event format") from Claude Code's `--output-format stream-json` lines.
- * `lines` may be an array of raw JSON text lines or a single newline
- * delimited string; blank and unparsable lines are skipped.
+ * createStreamParser() -> { push(line) -> events[], flush() -> events[] }
+ * (review round 1, F2): the incremental form of the translation described
+ * below, driven one raw stdout line at a time by src/adapters/runner.mjs so
+ * events.jsonl is written live instead of only ever appearing in a batch
+ * after the harness exits. All state (the session id and the tool-name-by-id
+ * map used to attach a tool_use's name to its later tool_result) lives in
+ * this closure, one per run. `flush()` has nothing to add for Claude Code -
+ * every event claude.mjs emits comes directly off a single line - so it
+ * always returns [].
  *
  * - `system`/`init` -> `session.start`.
  * - `assistant`/`user` message content: `tool_use` blocks -> `tool.call`;
@@ -57,27 +68,26 @@ function capSummary(value) {
  *   harness's own final text, capped and redacted) used to build a run
  *   summary.
  */
-export function parseStream(lines) {
-  const events = [];
+export function createStreamParser() {
   let sessionId = null;
   const toolNameById = new Map();
-  const list = Array.isArray(lines) ? lines : String(lines ?? '').split('\n');
 
-  for (const raw of list) {
+  function pushLine(raw) {
     const text = typeof raw === 'string' ? raw.trim() : '';
-    if (!text) continue;
+    if (!text) return [];
     let obj;
     try {
       obj = JSON.parse(text);
     } catch {
-      continue;
+      return [];
     }
+    const events = [];
     const ts = new Date().toISOString();
 
     if (obj.type === 'system' && obj.subtype === 'init') {
       sessionId = obj.session_id ?? sessionId;
       events.push({ ts, type: 'session.start', session_id: sessionId, agent: obj.agent ?? null, model: obj.model ?? null });
-      continue;
+      return events;
     }
 
     if (obj.type === 'assistant' || obj.type === 'user') {
@@ -110,7 +120,7 @@ export function parseStream(lines) {
           cost_usd: obj.cost_usd ?? 0,
         });
       }
-      continue;
+      return events;
     }
 
     if (obj.type === 'result') {
@@ -126,9 +136,34 @@ export function parseStream(lines) {
         duration_ms: obj.duration_ms ?? null,
         result_excerpt: typeof obj.result === 'string' ? capSummary(obj.result).slice(0, 300) : null,
       });
-      continue;
+      return events;
     }
+
+    return [];
   }
+
+  return {
+    push: pushLine,
+    flush() {
+      return [];
+    },
+  };
+}
+
+/**
+ * parseStream(lines) -> normalized events, batch form. `lines` may be an
+ * array of raw JSON text lines or a single newline delimited string; blank
+ * and unparsable lines are skipped. A thin wrapper over createStreamParser()
+ * kept for the existing unit tests (and any other caller that already has
+ * the whole stream in hand, e.g. run()'s own non-detached path below) - see
+ * createStreamParser()'s own doc comment for the translation rules.
+ */
+export function parseStream(lines) {
+  const parser = createStreamParser();
+  const list = Array.isArray(lines) ? lines : String(lines ?? '').split('\n');
+  const events = [];
+  for (const raw of list) events.push(...parser.push(raw));
+  events.push(...parser.flush());
   return events;
 }
 

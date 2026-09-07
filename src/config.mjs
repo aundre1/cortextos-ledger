@@ -33,6 +33,14 @@ export const DEFAULTS = {
   // docs/autonomy.md "Goals contract": path to the private goals file. Never
   // shipped populated - examples/cortex-goals.example.json is the template.
   goals: './cortex-goals.json',
+  // docs/adapters.md "Concurrency note" (review round 1, F4): when true,
+  // `run:start --agent <a>` for an agent whose adapter resolves to
+  // `opencode` refuses (exit 6, reason opencode_serial) while any task_runs
+  // row anywhere in the ledger is still `running` with `adapter = 'opencode'`
+  // - the fallback for an OpenCode version where the per agent
+  // `XDG_DATA_HOME` isolation (run:launch, `dataHome`) is found not to hold.
+  // Off by default: the isolation is the primary fix, this is the backstop.
+  opencode_serial: false,
   // docs/autonomy.md "The autonomy dial", verbatim.
   autonomy: {
     enabled: false,

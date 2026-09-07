@@ -19,8 +19,14 @@ const RUNNER_PATH = join(HERE, 'runner.mjs');
  * `argv.cmd`. Returns immediately with { runnerPid } - the runner process's
  * own pid, not the harness's (the harness's pid lands in <outDir>/pid.txt,
  * written by the runner once it has spawned it).
+ *
+ * `adapter` (review round 1, F2) names the adapter module (`claude` |
+ * `codex` | `opencode` | `fake`) so the runner can dynamically import it and
+ * tee the harness's stdout through its `createStreamParser()`, when it has
+ * one, into `eventsPath` live; omit both to get the runner's old behaviour
+ * (redacted out.txt only, no events.jsonl of its own).
  */
-export function launchDetached({ argv, cwd, outDir, timeoutMs }) {
+export function launchDetached({ argv, cwd, outDir, timeoutMs, adapter, eventsPath }) {
   mkdirSync(outDir, { recursive: true });
   const runnerArgs = [
     RUNNER_PATH,
@@ -29,6 +35,8 @@ export function launchDetached({ argv, cwd, outDir, timeoutMs }) {
     '--cwd',
     cwd,
     ...(timeoutMs !== undefined ? ['--timeout-ms', String(timeoutMs)] : []),
+    ...(adapter ? ['--adapter', adapter] : []),
+    ...(eventsPath ? ['--events', eventsPath] : []),
     '--',
     argv.cmd,
     ...(argv.args ?? []),

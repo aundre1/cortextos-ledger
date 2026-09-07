@@ -220,9 +220,13 @@ function launchWithFixture(ctx, taskId, fixture, extraFlags = []) {
   writeFileSync(fixturePath, JSON.stringify(resolvedFixture));
   const promptPath = join(ctx.homeDir, 'prompt.txt');
   writeFileSync(promptPath, 'do the thing');
+  // --sync (review round 1, F2): run:launch's default path now spawns even
+  // the fake adapter detached through runner.mjs, same as every real
+  // adapter; --sync keeps the old in-process, run-to-completion-before-
+  // returning behaviour this test's immediately following run:end relies on.
   return cli(
     ['run:launch', '--task', taskId, '--agent', 'builder', '--provider', 'fake', '--model', 'fake-model',
-     '--adapter', 'fake', '--prompt-file', promptPath, ...extraFlags],
+     '--adapter', 'fake', '--sync', '--prompt-file', promptPath, ...extraFlags],
     ctx,
     { ...ctx.env, CORTEX_FAKE_FIXTURE: fixturePath }
   );

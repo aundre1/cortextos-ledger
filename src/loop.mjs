@@ -185,6 +185,12 @@ function tryAssignedAction(db, config, { agent, adapterOverride }) {
       'run:launch', '--task', task.id, '--agent', targetAgent,
       '--adapter', adapterName, '--provider', provider, '--model', model,
       '--prompt-file', promptPath,
+      // `--sync` (review round 1, F2): the loop's very next tick expects
+      // done.marker to already exist for this run (liveRunWithDoneMarker
+      // above) - true for the fake adapter's fixtures, which finish
+      // instantly, but not something a detached real harness could promise,
+      // so this only applies when the adapter actually is fake.
+      ...(adapterName === 'fake' ? ['--sync'] : []),
     ]);
     if (launch.code !== 0) return { action: 'run_launch_failed', taskId: task.id, note: launch.stderr.trim().slice(0, 300) };
     return { action: isReviewer ? 'run_launch_reviewer' : 'run_launch', taskId: task.id, note: `run ${launch.stdout}` };

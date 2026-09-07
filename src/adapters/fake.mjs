@@ -27,6 +27,58 @@
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, isAbsolute } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HARNESS_PATH = fileURLToPath(new URL('./fake-harness.mjs', import.meta.url));
+
+/**
+ * buildArgv({ cmd, argsPrefix }) -> { cmd, args, cwd, env } (review round 1,
+ * F2): lets `run:launch`'s default (non `--sync`) path spawn the fake
+ * adapter exactly like every real one - through
+ * src/adapters/spawn.mjs's launchDetached() and src/adapters/runner.mjs's
+ * tee - instead of only ever running in process. The spawned command is
+ * this same node process re-invoked on src/adapters/fake-harness.mjs, which
+ * reads the identical fixture format this file's own run() reads (from
+ * `CORTEX_FAKE_FIXTURE` in the child's env, inherited from `process.env`
+ * here) and prints each fixture event as one normalized JSON line to
+ * stdout - createStreamParser() below passes those straight through.
+ * `cmd`/`argsPrefix`, if given, override the executable/prepend args exactly
+ * like the real adapters' buildArgv (unused by the fake harness itself, kept
+ * only so callers that always forward `config.adapters.fake.*` do not need a
+ * special case).
+ */
+export function buildArgv({ cwd, cmd, argsPrefix } = {}) {
+  return {
+    cmd: cmd ?? process.execPath,
+    args: [...(argsPrefix ?? []), HARNESS_PATH],
+    cwd,
+    env: { ...process.env },
+  };
+}
+
+/**
+ * createStreamParser() -> { push(line) -> events[], flush() -> events[] }
+ * (review round 1, F2): "pass through" (docs/adapters.md "fake") - the fake
+ * harness already prints exactly this kit's normalized event shape, one per
+ * line, so there is nothing to translate; a line that is not valid JSON is
+ * simply not an event (e.g. `fixture.out` text mixed into the same stdout).
+ */
+export function createStreamParser() {
+  return {
+    push(raw) {
+      const text = typeof raw === 'string' ? raw.trim() : '';
+      if (!text) return [];
+      try {
+        return [JSON.parse(text)];
+      } catch {
+        return [];
+      }
+    },
+    flush() {
+      return [];
+    },
+  };
+}
 
 function loadFixture(opts) {
   if (opts.fixture) return opts.fixture;

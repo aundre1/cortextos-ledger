@@ -36,6 +36,7 @@ const BOOLEAN_FLAGS = new Set([
   'strict',
   'no-preflight',
   'detach',
+  'sync',
   'challenge',
   'no-tests',
   'retry-authorized',

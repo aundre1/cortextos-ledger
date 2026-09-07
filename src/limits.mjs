@@ -151,6 +151,28 @@ export function checkQuota(db, config, provider, model, projectedCost = 0, { isP
 }
 
 // ---------------------------------------------------------------------------
+// OpenCode serial refusal (docs/adapters.md "Concurrency note", review round
+// 1 F4). Off by default: the primary fix is `run:launch`'s per agent
+// `XDG_DATA_HOME` isolation (`dataHome`); this is the backstop for an
+// OpenCode version where that isolation is found not to hold.
+// ---------------------------------------------------------------------------
+
+/**
+ * When `config.opencode_serial` is true and `adapterName` is `opencode`,
+ * refuses if any task_runs row anywhere in the ledger is currently `running`
+ * with `adapter = 'opencode'` (docs/adapters.md: "run:start refuses a
+ * second concurrent OpenCode run on the same host with exit 6 and reason
+ * opencode_serial"). Every other adapter, or the dial off, always passes.
+ */
+export function checkOpencodeSerial(db, config, adapterName) {
+  if (!config.opencode_serial || adapterName !== 'opencode') return { ok: true, running: 0 };
+  const row = db
+    .prepare("SELECT COUNT(*) AS c FROM task_runs WHERE status = 'running' AND adapter = 'opencode'")
+    .get();
+  return { ok: row.c === 0, running: row.c };
+}
+
+// ---------------------------------------------------------------------------
 // Task state machine (docs/state-machine.md "Task states")
 // ---------------------------------------------------------------------------
 

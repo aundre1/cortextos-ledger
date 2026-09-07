@@ -97,9 +97,63 @@ exist at any dial setting.
   goals contract template and a worked walkthrough of turning the dial from
   off to a small amount of autonomous building.
 
+### Review round 1 fixes (executor H)
+
+Fixes for the five findings recorded in `.claude/tasks/PLAN-REVIEW-LOG.md`
+(F1-F5), each with a new regression test:
+
+- **F1 (blocker, atomic limit gates)**: `doRunStart` (`src/commands/runs.mjs`),
+  `storeVerdict` (`src/review.mjs`), and proposal approval
+  (`src/proposals.mjs`) now re-check their ledger gates and perform their
+  inserts inside a single `BEGIN IMMEDIATE` transaction (new
+  `withImmediateTransaction` helper, `src/db.mjs`), with `seq`/
+  `challenge_seq` assignment moved inside it, closing a check-then-insert
+  race between concurrent processes. Preflight's git/filesystem work still
+  runs before the transaction opens. Also fixed a `PRAGMA` ordering bug in
+  `openDb()` (`busy_timeout` must be set before `journal_mode = WAL`) and a
+  gate-recheck bug where a task's first `retry_limit` halt escalation
+  incorrectly blocked all later `run:start` attempts with exit 6 instead of
+  a fresh exit 3 re-check (`blockingOpenHalts`). Test:
+  `test/concurrency.test.mjs` (12 concurrent `run:start` processes against
+  one task, `builder_attempts_max=3`, asserting exactly 3 successes, seq
+  1/2/3 with no duplicates, and no `SQLITE_BUSY`/"database is locked").
+- **F2 (blocker, one launch path)**: `src/adapters/runner.mjs` tees every
+  adapter's child stdout line by line through the adapter's own
+  `createStreamParser()` into `events.jsonl` live, for every adapter
+  including `fake` by default (`--sync` is now the opt-in exception for the
+  e2e/loop fixtures that need a synchronous fake run). `claude.mjs`,
+  `codex.mjs`, `opencode.mjs`, and `fake.mjs` all gained
+  `createStreamParser()`; `parseStream()` is now a thin wrapper over it.
+  `config.adapters.<name>.{cmd,argsPrefix}` overrides let tests stand a stub
+  harness in for the real CLI. Test: `test/launch-real-path.test.mjs` (stub
+  `claude`/`codex`/`opencode` harnesses driven through the real, non-`--sync`
+  `run:launch` path).
+- **F3 (major, redaction at rest)**: every line written to `out.txt` passes
+  through `redact()` before it hits disk, not only after the run finishes.
+  Test: `test/runner.test.mjs` (an `sk-ant-` style key), plus
+  `test/launch-real-path.test.mjs` (a `ghp_` style key printed to stderr by
+  each stub harness).
+- **F4 (major, OpenCode isolation)**: `run:launch` computes and creates a
+  per-agent OpenCode data directory (`XDG_DATA_HOME`, and `LOCALAPPDATA` on
+  win32) so two OpenCode processes never deadlock on a shared database. New
+  `config.opencode_serial` dial (default `false`): when `true`, `run:start`
+  for adapter `opencode` refuses (exit 6, reason `opencode_serial`) while
+  any `task_runs` row anywhere is `running` with `adapter = 'opencode'` -
+  tracked via a new `task_runs.adapter` column
+  (`src/schema/004-v02-run-adapter.mjs`). Test:
+  `test/opencode-isolation.test.mjs`.
+- **F5 (minor, exit.txt precedence)**: `runner.mjs` writes `exit.txt` only if
+  it does not already exist, so a watchdog kill's `137` always wins over the
+  runner's own, later `child.on('close')` handler. Test:
+  `test/runner.test.mjs`.
+
+Doc mismatch (not edited - see "Doc mismatches found" below): docs/cli.md's
+`run:launch` line is also now missing `--adapter`/`--provider`/`--model` (a
+pre-existing gap, see below) and the new `--sync` flag.
+
 ### Test counts
 
-236 tests across 27 files under `test/*.test.mjs` (`node --test`), including
+247 tests across 29 files under `test/*.test.mjs` (`node --test`), including
 `test/e2e.test.mjs`: one scenario driven entirely through the CLI (`runCli`)
 with the fake adapter and a temp git repo — control arm (`task:new` through
 `task:close`), tri arm (`task:new --sibling` through blind `review:brief`,
@@ -243,4 +297,8 @@ pass)
   `--task <id> --agent <a> --prompt-file <f> [--detach]`, but the command
   already accepts and forwards every `run:start` flag
   (`--adapter <x> --provider <p> --model <m> --public --no-preflight`),
-  which README.md's quick start already assumes.
+  which README.md's quick start already assumes. As of review round 1 it is
+  also missing the new `--sync` flag (`bin/cortexctl.mjs`'s `BOOLEAN_FLAGS`),
+  which opts into the old in-process/synchronous adapter call instead of the
+  default detached `buildArgv()` + `launchDetached()` path every adapter
+  (fake included) now goes through.

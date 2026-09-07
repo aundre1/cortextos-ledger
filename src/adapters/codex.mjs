@@ -16,22 +16,27 @@ function capSummary(value) {
 }
 
 /**
- * buildArgv({ prompt, cwd, sandbox, readOnly, outDir, resumeThreadId, auth })
- * per docs/adapters.md: stdin is always closed by run() (an open stdin hangs
- * the process); `--sandbox` defaults to `read-only` for reviewer roles
- * (`readOnly: true`) and `workspace-write` otherwise; `danger-full-access`
- * is refused outright, whether it arrived as an explicit `sandbox` or as a
- * default (there is no default that resolves to it). A resumed thread never
- * accepts `--sandbox` (Codex would otherwise inherit `~/.codex/config.toml`),
- * so it force-sets `-c sandbox_mode="read-only"` instead.
+ * buildArgv({ prompt, cwd, sandbox, readOnly, outDir, resumeThreadId, auth,
+ * cmd, argsPrefix }) per docs/adapters.md: stdin is always closed by run()
+ * (an open stdin hangs the process); `--sandbox` defaults to `read-only` for
+ * reviewer roles (`readOnly: true`) and `workspace-write` otherwise;
+ * `danger-full-access` is refused outright, whether it arrived as an
+ * explicit `sandbox` or as a default (there is no default that resolves to
+ * it). A resumed thread never accepts `--sandbox` (Codex would otherwise
+ * inherit `~/.codex/config.toml`), so it force-sets
+ * `-c sandbox_mode="read-only"` instead. `cmd`/`argsPrefix` (review round 1,
+ * F2 test harness) override the executable and prepend extra argv - default
+ * cmd is `codex` - so a stub binary (`config.adapters.codex.cmd`/
+ * `argsPrefix`) can stand in for the real CLI in tests.
  */
-export function buildArgv({ prompt, cwd, sandbox, readOnly, outDir, resumeThreadId, auth }) {
+export function buildArgv({ prompt, cwd, sandbox, readOnly, outDir, resumeThreadId, auth, cmd, argsPrefix }) {
   const lastMessagePath = join(outDir, 'last-message.md');
+  const prefix = argsPrefix ?? [];
 
   if (resumeThreadId) {
     return {
-      cmd: 'codex',
-      args: ['exec', 'resume', resumeThreadId, '-c', 'sandbox_mode="read-only"', '--json', '-o', lastMessagePath, prompt],
+      cmd: cmd ?? 'codex',
+      args: [...prefix, 'exec', 'resume', resumeThreadId, '-c', 'sandbox_mode="read-only"', '--json', '-o', lastMessagePath, prompt],
       cwd,
       env: filterEnv(process.env, { adapter: 'codex', auth }),
     };
@@ -45,101 +50,126 @@ export function buildArgv({ prompt, cwd, sandbox, readOnly, outDir, resumeThread
   }
 
   return {
-    cmd: 'codex',
-    args: ['exec', '--json', '--sandbox', chosenSandbox, '--cd', cwd, '-o', lastMessagePath, prompt],
+    cmd: cmd ?? 'codex',
+    args: [...prefix, 'exec', '--json', '--sandbox', chosenSandbox, '--cd', cwd, '-o', lastMessagePath, prompt],
     cwd,
     env: filterEnv(process.env, { adapter: 'codex', auth }),
   };
 }
 
 /**
- * parseStream(lines) -> normalized events from Codex's `exec --json` NDJSON
- * (docs/adapters.md: "Parse the NDJSON for `thread.started` (session id),
- * item events (tool calls), and `turn.completed` usage when present").
+ * createStreamParser() -> { push(line) -> events[], flush() -> events[] }
+ * (review round 1, F2), the incremental form of Codex's `exec --json` NDJSON
+ * translation (docs/adapters.md: "Parse the NDJSON for `thread.started`
+ * (session id), item events (tool calls), and `turn.completed` usage when
+ * present"), driven one raw stdout line at a time by
+ * src/adapters/runner.mjs.
  *
  * - `thread.started` -> `session.start`.
  * - `item.started` / `item.completed` on a tool-shaped item
  *   (`command_execution`, `file_change`, `mcp_tool_call`) -> `tool.call` /
  *   `tool.result`.
  * - `turn.completed` -> `session.end`; when it carries `usage`,
- *   `usage_source: 'reported'`. When no `turn.completed` (or one with no
- *   `usage`) is ever seen, a `session.end` with zero tokens and
- *   `usage_source: 'manual'` is synthesized, "so they are visibly missing
- *   rather than silently wrong" (docs/adapters.md).
+ *   `usage_source: 'reported'`.
+ * - Unlike every other event above, "no `turn.completed` (or one with no
+ *   `usage`) was ever seen" can only be known once the stream has ended, so
+ *   that zero-token `session.end` with `usage_source: 'manual'` ("so they
+ *   are visibly missing rather than silently wrong", docs/adapters.md) is
+ *   `flush()`'s job, not `push()`'s.
  */
-export function parseStream(lines) {
-  const events = [];
+export function createStreamParser() {
   let sessionId = null;
   let sawUsage = false;
-  const list = Array.isArray(lines) ? lines : String(lines ?? '').split('\n');
 
-  for (const raw of list) {
+  function pushLine(raw) {
     const text = typeof raw === 'string' ? raw.trim() : '';
-    if (!text) continue;
+    if (!text) return [];
     let obj;
     try {
       obj = JSON.parse(text);
     } catch {
-      continue;
+      return [];
     }
     const ts = new Date().toISOString();
 
     if (obj.type === 'thread.started') {
       sessionId = obj.thread_id ?? sessionId;
-      events.push({ ts, type: 'session.start', session_id: sessionId });
-      continue;
+      return [{ ts, type: 'session.start', session_id: sessionId }];
     }
 
     if (obj.type === 'item.started' && obj.item && TOOL_ITEM_TYPES.has(obj.item.type)) {
-      events.push({
-        ts,
-        type: 'tool.call',
-        tool: obj.item.type,
-        args_summary: capSummary(obj.item.command ?? obj.item.path ?? obj.item),
-      });
-      continue;
+      return [
+        {
+          ts,
+          type: 'tool.call',
+          tool: obj.item.type,
+          args_summary: capSummary(obj.item.command ?? obj.item.path ?? obj.item),
+        },
+      ];
     }
 
     if (obj.type === 'item.completed' && obj.item && TOOL_ITEM_TYPES.has(obj.item.type)) {
       const ok = obj.item.exit_code === undefined || obj.item.exit_code === 0;
       const event = { ts, type: 'tool.result', tool: obj.item.type, ok };
       if (!ok) event.error = capSummary(obj.item.error ?? obj.item.aggregated_output ?? '');
-      events.push(event);
-      continue;
+      return [event];
     }
 
     if (obj.type === 'turn.completed') {
       const usage = obj.usage;
       if (usage) {
         sawUsage = true;
-        events.push({
-          ts,
+        return [
+          {
+            ts,
+            type: 'session.end',
+            session_id: sessionId,
+            tokens_in: usage.input_tokens ?? 0,
+            tokens_out: usage.output_tokens ?? 0,
+            cost_usd: 0,
+            requests: 1,
+            usage_source: 'reported',
+          },
+        ];
+      }
+      return [];
+    }
+
+    return [];
+  }
+
+  return {
+    push: pushLine,
+    flush() {
+      if (sawUsage) return [];
+      return [
+        {
+          ts: new Date().toISOString(),
           type: 'session.end',
           session_id: sessionId,
-          tokens_in: usage.input_tokens ?? 0,
-          tokens_out: usage.output_tokens ?? 0,
+          tokens_in: 0,
+          tokens_out: 0,
           cost_usd: 0,
-          requests: 1,
-          usage_source: 'reported',
-        });
-      }
-      continue;
-    }
-  }
+          requests: 0,
+          usage_source: 'manual',
+        },
+      ];
+    },
+  };
+}
 
-  if (!sawUsage) {
-    events.push({
-      ts: new Date().toISOString(),
-      type: 'session.end',
-      session_id: sessionId,
-      tokens_in: 0,
-      tokens_out: 0,
-      cost_usd: 0,
-      requests: 0,
-      usage_source: 'manual',
-    });
-  }
-
+/**
+ * parseStream(lines) -> normalized events, batch form. A thin wrapper over
+ * createStreamParser() kept for the existing unit tests (and run()'s own
+ * non-detached path below) - see createStreamParser()'s doc comment for the
+ * translation rules.
+ */
+export function parseStream(lines) {
+  const parser = createStreamParser();
+  const list = Array.isArray(lines) ? lines : String(lines ?? '').split('\n');
+  const events = [];
+  for (const raw of list) events.push(...parser.push(raw));
+  events.push(...parser.flush());
   return events;
 }
 

@@ -115,24 +115,40 @@ export function insertRun(db, fields) {
     wallclock_limit_s: nullish(fields.wallclock_limit_s),
     halted_reason: nullish(fields.halted_reason),
     pid: nullish(fields.pid),
+    // Review round 1, F4: recorded so run:start can enforce
+    // `opencode_serial` (refuse a second concurrent opencode run) without
+    // guessing an adapter from `agent`/`provider` - see
+    // src/schema/004-v02-run-adapter.mjs.
+    adapter: nullish(fields.adapter),
   };
   db.prepare(
     `INSERT INTO task_runs
        (id, task_id, seq, agent, provider, model, started_at, ended_at, status,
         tokens_in, tokens_out, cost_usd, tool_calls, session_id, summary,
-        worktree, out_dir, exit_code, files_touched, wallclock_limit_s, halted_reason, pid)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+        worktree, out_dir, exit_code, files_touched, wallclock_limit_s, halted_reason, pid, adapter)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.task_id, row.seq, row.agent, row.provider, row.model, row.started_at,
     row.ended_at, row.status, row.tokens_in, row.tokens_out, row.cost_usd, row.tool_calls,
     row.session_id, row.summary, row.worktree, row.out_dir, row.exit_code, row.files_touched,
-    row.wallclock_limit_s, row.halted_reason, row.pid
+    row.wallclock_limit_s, row.halted_reason, row.pid, row.adapter
   );
   return row;
 }
 
 export function listRuns(db, taskId) {
   return db.prepare('SELECT * FROM task_runs WHERE task_id = ? ORDER BY seq').all(taskId);
+}
+
+/**
+ * Next seq value for a new run on `taskId`: MAX(seq)+1, not COUNT+1 (review
+ * round 1, F1) - under `withImmediateTransaction` this is read and the row
+ * it feeds `insertRun` inserted atomically, so two concurrent run:start
+ * calls can never compute the same seq.
+ */
+export function nextRunSeq(db, taskId) {
+  const row = db.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM task_runs WHERE task_id = ?').get(taskId);
+  return row.m + 1;
 }
 
 /** Number of runs for a task, optionally restricted to a set of agents. */

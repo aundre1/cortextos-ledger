@@ -3,7 +3,7 @@
 // approves and converts to a real task through the same insertTask path as
 // `task:new`.
 
-import { nowIso } from './db.mjs';
+import { nowIso, withImmediateTransaction } from './db.mjs';
 import {
   insertProposal,
   getProposal,
@@ -126,43 +126,61 @@ export function canAutoApprove(config, proposal, reviews) {
  * min_reviews supporting reviews and no opposing review, unless --force.
  * `by` is a human id normally, or the agent name when the loop auto approves
  * under the dial (docs/autonomy.md "auto approved by the loop itself").
+ *
+ * Review round 1, F1: the status/review-count checks and the conversion
+ * (insertTask + setProposalStatus) are one `BEGIN IMMEDIATE` transaction
+ * (src/db.mjs's withImmediateTransaction), so two concurrent `approve` calls
+ * on the same proposal - a human and the loop's own auto approval
+ * (src/loop.mjs's tryAutoApprove), or two loop ticks racing - can no longer
+ * both observe "not yet converted" and both insert a task.
  */
 export function approve(db, config, { id, by, note, force = false }) {
-  const proposal = getProposal(db, id);
-  if (!proposal) throw invalid(`no such proposal: ${id}`);
-  if (['converted', 'rejected', 'expired'].includes(proposal.status)) {
-    throw stateError(`proposal ${id} is already ${proposal.status}`);
-  }
+  const outcome = withImmediateTransaction(db, () => {
+    const proposal = getProposal(db, id);
+    if (!proposal) return { ok: false, code: 1, message: `no such proposal: ${id}` };
+    if (['converted', 'rejected', 'expired'].includes(proposal.status)) {
+      return { ok: false, code: 6, message: `proposal ${id} is already ${proposal.status}` };
+    }
 
-  const reviews = listProposalReviews(db, { proposalId: id });
-  const supporting = reviews.filter((r) => r.verdict === 'support').length;
-  const opposing = reviews.filter((r) => r.verdict === 'oppose').length;
+    const reviews = listProposalReviews(db, { proposalId: id });
+    const supporting = reviews.filter((r) => r.verdict === 'support').length;
+    const opposing = reviews.filter((r) => r.verdict === 'oppose').length;
 
-  if (supporting < config.autonomy.min_reviews) {
-    throw stateError(`proposal ${id} has ${supporting} supporting review(s), needs ${config.autonomy.min_reviews}`);
-  }
-  if (opposing > 0 && !force) {
-    throw stateError(`proposal ${id} has an opposing review; pass --force to approve anyway`);
-  }
+    if (supporting < config.autonomy.min_reviews) {
+      return {
+        ok: false,
+        code: 6,
+        message: `proposal ${id} has ${supporting} supporting review(s), needs ${config.autonomy.min_reviews}`,
+      };
+    }
+    if (opposing > 0 && !force) {
+      return { ok: false, code: 6, message: `proposal ${id} has an opposing review; pass --force to approve anyway` };
+    }
 
-  const task = insertTask(db, {
-    repo: proposal.business_id,
-    title: proposal.title,
-    task_class: proposal.task_class ?? 'autonomy',
-    arm: config.autonomy.default_arm,
-    owner: config.autonomy.default_owner,
-    kind: proposal.kind,
-    notes: `proposal=${proposal.id}`,
+    const task = insertTask(db, {
+      repo: proposal.business_id,
+      title: proposal.title,
+      task_class: proposal.task_class ?? 'autonomy',
+      arm: config.autonomy.default_arm,
+      owner: config.autonomy.default_owner,
+      kind: proposal.kind,
+      notes: `proposal=${proposal.id}`,
+    });
+
+    const updated = setProposalStatus(db, id, 'converted', {
+      converted_task_id: task.id,
+      decided_by: by,
+      decided_at: nowIso(),
+      decision_note: note,
+    });
+
+    return { ok: true, task, proposal: updated };
   });
 
-  const updated = setProposalStatus(db, id, 'converted', {
-    converted_task_id: task.id,
-    decided_by: by,
-    decided_at: nowIso(),
-    decision_note: note,
-  });
-
-  return { task, proposal: updated };
+  if (!outcome.ok) {
+    throw outcome.code === 1 ? invalid(outcome.message) : stateError(outcome.message);
+  }
+  return { task: outcome.task, proposal: outcome.proposal };
 }
 
 // ---------------------------------------------------------------------------

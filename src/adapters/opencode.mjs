@@ -21,18 +21,22 @@ function capText(value) {
 }
 
 /**
- * buildArgv({ prompt, cwd, agent, model, dataHome, outDir, auth }) ->
- * { cmd, args, cwd, env }. `dataHome` is joined with `agent` to isolate each
- * agent's OpenCode data directory (docs/adapters.md "Concurrency note": two
- * OpenCode processes sharing one data directory have deadlocked on OpenCode's
- * own database), exported as `XDG_DATA_HOME` and, on win32, also
- * `LOCALAPPDATA` per this wave's task card. `outDir` (not part of the task
- * card's literal buildArgv signature, but required to compute it - see this
- * executor's final report) sets `CORTEX_EVENTS_PATH` to `<outDir>/events.jsonl`
- * for the plugin. `rejectAnthropicModel` runs before anything else: Anthropic
- * subscription OAuth may not be used inside a third party harness.
+ * buildArgv({ prompt, cwd, agent, model, dataHome, outDir, auth, cmd,
+ * argsPrefix }) -> { cmd, args, cwd, env }. `dataHome` is joined with `agent`
+ * to isolate each agent's OpenCode data directory (docs/adapters.md
+ * "Concurrency note": two OpenCode processes sharing one data directory have
+ * deadlocked on OpenCode's own database), exported as `XDG_DATA_HOME` and,
+ * on win32, also `LOCALAPPDATA` per this wave's task card. `outDir` (not
+ * part of the task card's literal buildArgv signature, but required to
+ * compute it - see this executor's final report) sets `CORTEX_EVENTS_PATH`
+ * to `<outDir>/events.jsonl` for the plugin. `rejectAnthropicModel` runs
+ * before anything else: Anthropic subscription OAuth may not be used inside
+ * a third party harness. `cmd`/`argsPrefix` (review round 1, F2 test
+ * harness) override the executable and prepend extra argv - default cmd is
+ * `opencode` - so a stub binary (`config.adapters.opencode.cmd`/
+ * `argsPrefix`) can stand in for the real CLI in tests.
  */
-export function buildArgv({ prompt, cwd, agent, model, dataHome, outDir, auth }) {
+export function buildArgv({ prompt, cwd, agent, model, dataHome, outDir, auth, cmd, argsPrefix }) {
   rejectAnthropicModel(model);
 
   const env = filterEnv(process.env, { adapter: 'opencode', auth });
@@ -46,50 +50,75 @@ export function buildArgv({ prompt, cwd, agent, model, dataHome, outDir, auth })
   }
 
   return {
-    cmd: 'opencode',
-    args: ['run', ...(agent ? ['--agent', agent] : []), ...(model ? ['--model', model] : []), '--format', 'json', prompt],
+    cmd: cmd ?? 'opencode',
+    args: [
+      ...(argsPrefix ?? []),
+      'run',
+      ...(agent ? ['--agent', agent] : []),
+      ...(model ? ['--model', model] : []),
+      '--format', 'json', prompt,
+    ],
     cwd,
     env,
   };
 }
 
 /**
- * parseStream(lines) -> normalized events, best effort (docs/adapters.md
- * "opencode"). A line that already carries a recognized normalized `type`
- * (this is what the plugin's events.jsonl - and this fixture format - looks
- * like) is passed through, but its free text fields are re-redacted and
- * re-capped rather than trusted blindly. Anything else is treated as
- * OpenCode's own raw `run --format json` stdout and translated on a
- * best-effort basis; that stream is not authoritative (see the module
- * comment above), so unrecognized shapes are simply skipped.
+ * createStreamParser() -> { push(line) -> events[], flush() -> events[] }
+ * (review round 1, F2), best effort (docs/adapters.md "opencode") and
+ * genuinely stateless per line - unlike claude's/codex's parsers this one
+ * needs no closure state at all, so `push` is the same pure function either
+ * way and `flush()` never has anything to add. A line that already carries a
+ * recognized normalized `type` (this is what the plugin's events.jsonl - and
+ * this fixture format - looks like) is passed through, but its free text
+ * fields are re-redacted and re-capped rather than trusted blindly. Anything
+ * else is treated as OpenCode's own raw `run --format json` stdout and
+ * translated on a best-effort basis; that stream is not authoritative (see
+ * the module comment above), so unrecognized shapes are simply skipped.
+ */
+export function createStreamParser() {
+  return {
+    push(raw) {
+      const text = typeof raw === 'string' ? raw.trim() : '';
+      if (!text) return [];
+      let obj;
+      try {
+        obj = JSON.parse(text);
+      } catch {
+        return [];
+      }
+
+      if (NORMALIZED_TYPES.has(obj.type)) {
+        const event = { ...obj };
+        if (typeof event.args_summary === 'string') event.args_summary = capText(event.args_summary);
+        if (typeof event.error === 'string') event.error = capText(event.error);
+        return [event];
+      }
+
+      const sessionId = obj.sessionID ?? obj.sessionId ?? null;
+      if (sessionId) {
+        return [{ ts: new Date().toISOString(), type: 'session.start', session_id: sessionId }];
+      }
+      return [];
+    },
+    flush() {
+      return [];
+    },
+  };
+}
+
+/**
+ * parseStream(lines) -> normalized events, batch form. A thin wrapper over
+ * createStreamParser() kept for the existing unit tests (and run()'s own
+ * non-detached path below) - see createStreamParser()'s doc comment for the
+ * translation rules.
  */
 export function parseStream(lines) {
-  const events = [];
+  const parser = createStreamParser();
   const list = Array.isArray(lines) ? lines : String(lines ?? '').split('\n');
-
-  for (const raw of list) {
-    const text = typeof raw === 'string' ? raw.trim() : '';
-    if (!text) continue;
-    let obj;
-    try {
-      obj = JSON.parse(text);
-    } catch {
-      continue;
-    }
-
-    if (NORMALIZED_TYPES.has(obj.type)) {
-      const event = { ...obj };
-      if (typeof event.args_summary === 'string') event.args_summary = capText(event.args_summary);
-      if (typeof event.error === 'string') event.error = capText(event.error);
-      events.push(event);
-      continue;
-    }
-
-    const sessionId = obj.sessionID ?? obj.sessionId ?? null;
-    if (sessionId) {
-      events.push({ ts: new Date().toISOString(), type: 'session.start', session_id: sessionId });
-    }
-  }
+  const events = [];
+  for (const raw of list) events.push(...parser.push(raw));
+  events.push(...parser.flush());
   return events;
 }
 

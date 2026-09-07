@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, copyFileS
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { withImmediateTransaction } from './db.mjs';
 import {
   getTask,
   listEscalations,
@@ -254,44 +255,21 @@ function haltAndEscalate(db, { taskId, runId, reason, detail }) {
  * Validates and stores a verdict per docs/state-machine.md's "Blind review
  * gate" and docs/review-protocol.md's "Challenge cycle" and "Verdict schema"
  * sections. Returns { code, verdictId, errors }.
+ *
+ * Review round 1, F1: the challenge_seq 0 uniqueness check and the
+ * challenge-cycle count check are each a check-then-insert sequence, so each
+ * is re-checked and the row inserted inside one `BEGIN IMMEDIATE`
+ * transaction (src/db.mjs's withImmediateTransaction) - two concurrent
+ * `verdict` calls for the same reviewer can no longer both observe "no blind
+ * verdict yet" and both insert one, or both observe "one challenge cycle
+ * used" and both insert a second. Everything that does not need the lock -
+ * schema validation, reading reviewerEventsPath off disk for the blindness
+ * check - runs first, same pattern as doRunStart in
+ * src/commands/runs.mjs.
  */
 export function storeVerdict(db, config, { taskId, runId, reviewer, provider, model, verdictObj, challenge, reviewerEventsPath }) {
   const task = getTask(db, taskId);
   if (!task) return { code: 1, verdictId: null, errors: [`no such task: ${taskId}`] };
-
-  let challengeSeq = 0;
-
-  if (!challenge) {
-    const existing = countVerdicts(db, taskId, { challengeSeq: 0, reviewer });
-    if (existing > 0) {
-      return {
-        code: 6,
-        verdictId: null,
-        errors: [`reviewer ${reviewer} already has a blind (challenge_seq 0) verdict on this task`],
-      };
-    }
-  } else {
-    const blindExists = countVerdicts(db, taskId, { challengeSeq: 0, reviewer });
-    const hasArchitectChallenge = db
-      .prepare(
-        "SELECT COUNT(*) AS c FROM agent_messages WHERE task_id = ? AND kind = 'challenge' AND sender = 'architect' AND recipient = ?"
-      )
-      .get(taskId, reviewer).c;
-    const challengeCount = db
-      .prepare('SELECT COUNT(*) AS c FROM review_verdicts WHERE task_id = ? AND challenge_seq > 0')
-      .get(taskId).c;
-
-    if (blindExists === 0 || hasArchitectChallenge === 0 || challengeCount >= config.limits.challenge_cycles_max) {
-      const detail = `challenge refused for reviewer ${reviewer}: blind_verdict_exists=${blindExists > 0} architect_challenge_sent=${hasArchitectChallenge > 0} challenge_count=${challengeCount} max=${config.limits.challenge_cycles_max}`;
-      haltAndEscalate(db, { taskId, runId, reason: 'challenge_limit', detail });
-      return { code: 3, verdictId: null, errors: [detail] };
-    }
-
-    const maxSeq = db
-      .prepare('SELECT MAX(challenge_seq) AS m FROM review_verdicts WHERE task_id = ? AND reviewer = ?')
-      .get(taskId, reviewer).m;
-    challengeSeq = (maxSeq ?? 0) + 1;
-  }
 
   const testsTouchedExpected = listEscalations(db, taskId).some((e) => e.reason === 'test_edit');
   const { ok, errors } = validateVerdict(verdictObj, { testsTouchedExpected });
@@ -299,9 +277,72 @@ export function storeVerdict(db, config, { taskId, runId, reviewer, provider, mo
     return { code: 5, verdictId: null, errors };
   }
 
-  let blind = 1;
-  if (reviewerEventsPath && detectBlindnessBreach(reviewerEventsPath)) {
-    blind = 0;
+  // Blindness detection reads reviewerEventsPath off disk - do it before
+  // opening the transaction, same reasoning as F1's preflight-before-
+  // BEGIN-IMMEDIATE pattern in doRunStart.
+  const blind = reviewerEventsPath && detectBlindnessBreach(reviewerEventsPath) ? 0 : 1;
+
+  const outcome = withImmediateTransaction(db, () => {
+    let challengeSeq = 0;
+
+    if (!challenge) {
+      const existing = countVerdicts(db, taskId, { challengeSeq: 0, reviewer });
+      if (existing > 0) {
+        return {
+          ok: false,
+          reason: 'duplicate_blind',
+          detail: `reviewer ${reviewer} already has a blind (challenge_seq 0) verdict on this task`,
+        };
+      }
+    } else {
+      const blindExists = countVerdicts(db, taskId, { challengeSeq: 0, reviewer });
+      const hasArchitectChallenge = db
+        .prepare(
+          "SELECT COUNT(*) AS c FROM agent_messages WHERE task_id = ? AND kind = 'challenge' AND sender = 'architect' AND recipient = ?"
+        )
+        .get(taskId, reviewer).c;
+      const challengeCount = db
+        .prepare('SELECT COUNT(*) AS c FROM review_verdicts WHERE task_id = ? AND challenge_seq > 0')
+        .get(taskId).c;
+
+      if (blindExists === 0 || hasArchitectChallenge === 0 || challengeCount >= config.limits.challenge_cycles_max) {
+        const detail = `challenge refused for reviewer ${reviewer}: blind_verdict_exists=${blindExists > 0} architect_challenge_sent=${hasArchitectChallenge > 0} challenge_count=${challengeCount} max=${config.limits.challenge_cycles_max}`;
+        return { ok: false, reason: 'challenge_limit', detail };
+      }
+
+      const maxSeq = db
+        .prepare('SELECT MAX(challenge_seq) AS m FROM review_verdicts WHERE task_id = ? AND reviewer = ?')
+        .get(taskId, reviewer).m;
+      challengeSeq = (maxSeq ?? 0) + 1;
+    }
+
+    const row = insertVerdict(db, {
+      task_id: taskId,
+      run_id: runId ?? null,
+      reviewer,
+      provider,
+      model,
+      blind,
+      decision: verdictObj.decision,
+      findings_total: Array.isArray(verdictObj.findings) ? verdictObj.findings.length : 0,
+      findings_json: JSON.stringify(verdictObj),
+      challenge_seq: challengeSeq,
+      tests_touched: verdictObj.tests_touched ? 1 : 0,
+      scope_exceeded: verdictObj.scope_exceeded ? 1 : 0,
+      // arm defaults to the task's current arm inside insertVerdict.
+    });
+    return { ok: true, row };
+  });
+
+  if (!outcome.ok) {
+    if (outcome.reason === 'duplicate_blind') {
+      return { code: 6, verdictId: null, errors: [outcome.detail] };
+    }
+    haltAndEscalate(db, { taskId, runId, reason: 'challenge_limit', detail: outcome.detail });
+    return { code: 3, verdictId: null, errors: [outcome.detail] };
+  }
+
+  if (blind === 0) {
     escalate(db, {
       taskId,
       runId: runId ?? null,
@@ -311,23 +352,7 @@ export function storeVerdict(db, config, { taskId, runId, reviewer, provider, mo
     });
   }
 
-  const row = insertVerdict(db, {
-    task_id: taskId,
-    run_id: runId ?? null,
-    reviewer,
-    provider,
-    model,
-    blind,
-    decision: verdictObj.decision,
-    findings_total: Array.isArray(verdictObj.findings) ? verdictObj.findings.length : 0,
-    findings_json: JSON.stringify(verdictObj),
-    challenge_seq: challengeSeq,
-    tests_touched: verdictObj.tests_touched ? 1 : 0,
-    scope_exceeded: verdictObj.scope_exceeded ? 1 : 0,
-    // arm defaults to the task's current arm inside insertVerdict.
-  });
-
-  return { code: 0, verdictId: row.id, errors: [] };
+  return { code: 0, verdictId: outcome.row.id, errors: [] };
 }
 
 // ---------------------------------------------------------------------------

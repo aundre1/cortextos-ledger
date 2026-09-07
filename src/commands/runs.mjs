@@ -3,18 +3,18 @@
 // msg, artifact, test, intervene, task:close, task:resolve, task:reject.
 
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { nowIso } from '../db.mjs';
+import { nowIso, withImmediateTransaction } from '../db.mjs';
 import {
   getTask,
-  listRuns,
   listTests,
   listEscalations,
   listVerdicts,
   insertRun,
+  nextRunSeq,
   insertMessage,
   insertArtifact,
   insertTest,
@@ -24,6 +24,7 @@ import {
   checkAttempts,
   checkSpend,
   checkQuota,
+  checkOpencodeSerial,
   transition,
   escalate,
   resolveEscalations,
@@ -81,18 +82,106 @@ function resolveAgentDefaults(db, config, taskClass, agentName, flags) {
   };
 }
 
-function computeSeq(db, taskId) {
-  return listRuns(db, taskId).length + 1;
-}
-
 function openHaltEscalations(db, taskId) {
   return listEscalations(db, taskId).filter((e) => e.severity === 'halt' && !e.resolved_at);
+}
+
+// Halt reasons doRunStart's own ledger gates (checkLedgerGates) re-derive
+// from scratch on every call - unlike files_touched, secrets, dirty_worktree
+// or wallclock, a fresh run:start does not need a human to have resolved
+// one of these first: it re-checks the same gate itself and, if the
+// underlying condition has not changed, fails again with that gate's own
+// specific reason (review round 1, F1 concurrency test: once the first
+// over-limit call has escalated retry_limit and moved the task to
+// input_required, every later call - racing or sequential - must still see
+// retry_limit, not a generic task_state refusal that masks it).
+const SELF_RECHECKED_HALT_REASONS = new Set(['retry_limit', 'budget', 'quota', 'opencode_serial']);
+
+/** Open halts that block a *new* run:start outright - i.e. every open halt except one of doRunStart's own gates, which will simply re-fire with its own specific reason instead. */
+function blockingOpenHalts(db, taskId) {
+  return openHaltEscalations(db, taskId).filter((e) => !SELF_RECHECKED_HALT_REASONS.has(e.reason));
+}
+
+/**
+ * The three ledger gates plus the opencode_serial dial, read only - shared
+ * between doRunStart's fast advisory pass (before preflight's git/fs work,
+ * so an obviously-refused call never pays for a `git status` spawn) and the
+ * authoritative re-check inside `withImmediateTransaction` right before
+ * `insertRun` (review round 1, F1). Returns the first gate that fails, or
+ * `{ ok: true }`.
+ */
+function checkLedgerGates(db, config, { taskId, agent, provider, model, adapterName, isPublic }) {
+  const attempts = checkAttempts(db, config, taskId, agent);
+  if (!attempts.ok) return { ok: false, reason: 'retry_limit', attempts };
+
+  const spend = checkSpend(db, config, taskId, agent, model);
+  if (!spend.ok) return { ok: false, reason: 'budget', spend };
+
+  const quota = checkQuota(db, config, provider, model, spend.projectedNext, { isPublic });
+  if (!quota.ok) return { ok: false, reason: quota.reason, quota };
+
+  const serial = checkOpencodeSerial(db, config, adapterName);
+  if (!serial.ok) return { ok: false, reason: 'opencode_serial', serial };
+
+  return { ok: true, spend };
+}
+
+/** Turn a failing checkLedgerGates() result into the { result: <fail> } doRunStart returns, writing the matching escalation. */
+function failGate(err, db, taskId, gate) {
+  if (gate.reason === 'retry_limit') {
+    const escalation = escalate(db, {
+      taskId,
+      reason: 'retry_limit',
+      severity: 'halt',
+      detail: `${gate.attempts.used}/${gate.attempts.max} attempts used`,
+    });
+    return fail(err, 3, 'retry_limit', `${gate.attempts.used}/${gate.attempts.max} attempts used (escalation ${escalation.id})`);
+  }
+  if (gate.reason === 'budget') {
+    const escalation = escalate(db, {
+      taskId,
+      reason: 'budget',
+      severity: 'halt',
+      detail: `projected $${gate.spend.projected.toFixed(4)} exceeds limit $${gate.spend.max}`,
+    });
+    return fail(err, 3, 'budget', `projected $${gate.spend.projected.toFixed(4)} exceeds limit $${gate.spend.max} (escalation ${escalation.id})`);
+  }
+  if (gate.reason === 'opencode_serial') {
+    // Unlike the other gates, this is a transient host-wide condition, not
+    // this task's problem - the other OpenCode run will finish on its own
+    // and this same command can simply be retried, so (unlike retry_limit/
+    // budget/quota) it does not write an escalation or move the task to
+    // input_required (docs/adapters.md "Concurrency note").
+    return fail(err, 6, 'opencode_serial', `${gate.serial.running} opencode run(s) already running on this host`);
+  }
+  // quota / public_only
+  const escalation = escalate(db, {
+    taskId,
+    reason: 'quota',
+    severity: 'halt',
+    detail: gate.quota.detail ?? gate.quota.reason,
+  });
+  return fail(err, 4, gate.quota.reason, `${gate.quota.detail ?? gate.quota.reason} (escalation ${escalation.id})`);
 }
 
 /**
  * Shared body of run:start, reused by run:launch. On success returns
  * { result: {code:0, stdout: runId}, run, task, outDir, adapterName }; on
  * any gate failure returns { result: <the failing {code}> } only.
+ *
+ * Review round 1, F1: the whole check-attempts / check-spend / check-quota /
+ * preflight-decision / insertRun / setTaskStatus sequence is atomic with
+ * respect to every other `run:start` on the same db, not merely
+ * individually consistent. Preflight's git and filesystem work (slow,
+ * external, and identical regardless of what any concurrent caller is
+ * doing) runs first, outside any transaction, as does a first advisory pass
+ * of the ledger gates so an already-refused call fails fast without paying
+ * for that work. Once preflight's pass/fail decision is in hand, a single
+ * `BEGIN IMMEDIATE` transaction re-checks the same ledger gates - the
+ * authoritative check, since the lock it holds serializes every concurrent
+ * caller - and only then computes `seq` (MAX(seq)+1, not a COUNT that a
+ * concurrent insert could make stale) and inserts the run, all before
+ * releasing the lock. test/concurrency.test.mjs exercises this directly.
  */
 async function doRunStart({ db, config, flags, err }) {
   const need = missing(flags, ['task', 'agent']);
@@ -109,7 +198,7 @@ async function doRunStart({ db, config, flags, err }) {
     };
   }
   if (task.status === 'input_required') {
-    const openHalts = openHaltEscalations(db, task.id);
+    const openHalts = blockingOpenHalts(db, task.id);
     if (openHalts.length > 0) {
       return {
         result: fail(
@@ -135,48 +224,16 @@ async function doRunStart({ db, config, flags, err }) {
     };
   }
 
-  const attempts = checkAttempts(db, config, task.id, agent);
-  if (!attempts.ok) {
-    const escalation = escalate(db, {
-      taskId: task.id,
-      reason: 'retry_limit',
-      severity: 'halt',
-      detail: `${attempts.used}/${attempts.max} attempts used`,
-    });
-    return {
-      result: fail(err, 3, 'retry_limit', `${attempts.used}/${attempts.max} attempts used (escalation ${escalation.id})`),
-    };
-  }
+  const isPublic = !!flags.public;
+  const gateArgs = { taskId: task.id, agent, provider, model, adapterName, isPublic };
 
-  const spend = checkSpend(db, config, task.id, agent, model);
-  if (!spend.ok) {
-    const escalation = escalate(db, {
-      taskId: task.id,
-      reason: 'budget',
-      severity: 'halt',
-      detail: `projected $${spend.projected.toFixed(4)} exceeds limit $${spend.max}`,
-    });
-    return {
-      result: fail(
-        err,
-        3,
-        'budget',
-        `projected $${spend.projected.toFixed(4)} exceeds limit $${spend.max} (escalation ${escalation.id})`
-      ),
-    };
-  }
-
-  const quota = checkQuota(db, config, provider, model, spend.projectedNext, { isPublic: !!flags.public });
-  if (!quota.ok) {
-    const escalation = escalate(db, {
-      taskId: task.id,
-      reason: 'quota',
-      severity: 'halt',
-      detail: quota.detail ?? quota.reason,
-    });
-    return {
-      result: fail(err, 4, quota.reason, `${quota.detail ?? quota.reason} (escalation ${escalation.id})`),
-    };
+  // Advisory pass: fails fast, before preflight's git/fs work, in the exact
+  // same reason-priority order run:start has always used (attempts, spend,
+  // quota, opencode_serial). Under no concurrent writer this is also the
+  // final word; under one, the re-check inside the transaction below is.
+  const advisoryGate = checkLedgerGates(db, config, gateArgs);
+  if (!advisoryGate.ok) {
+    return { result: failGate(err, db, task.id, advisoryGate) };
   }
 
   let haltedReasonPreflight = null;
@@ -185,7 +242,7 @@ async function doRunStart({ db, config, flags, err }) {
       worktree: task.worktree,
       provider,
       model,
-      isPublic: !!flags.public,
+      isPublic,
       allowDirty: !!flags['allow-dirty'],
       strict: !!flags.strict,
       taskId: task.id,
@@ -197,24 +254,34 @@ async function doRunStart({ db, config, flags, err }) {
     haltedReasonPreflight = 'preflight_skipped';
   }
 
-  const seq = computeSeq(db, task.id);
   const outDir = join(config.runs, task.id, agent);
-  const run = insertRun(db, {
-    task_id: task.id,
-    seq,
-    agent,
-    provider,
-    model,
-    status: 'running',
-    worktree: task.worktree,
-    out_dir: outDir,
-    wallclock_limit_s: config.limits.wallclock_s,
-    halted_reason: haltedReasonPreflight,
+  const outcome = withImmediateTransaction(db, () => {
+    const gate = checkLedgerGates(db, config, gateArgs);
+    if (!gate.ok) return { ok: false, gate };
+
+    const seq = nextRunSeq(db, task.id);
+    const run = insertRun(db, {
+      task_id: task.id,
+      seq,
+      agent,
+      provider,
+      model,
+      adapter: adapterName,
+      status: 'running',
+      worktree: task.worktree,
+      out_dir: outDir,
+      wallclock_limit_s: config.limits.wallclock_s,
+      halted_reason: haltedReasonPreflight,
+    });
+    transition(db, task.id, 'working');
+    return { ok: true, run };
   });
 
-  transition(db, task.id, 'working');
+  if (!outcome.ok) {
+    return { result: failGate(err, db, task.id, outcome.gate) };
+  }
 
-  return { result: { code: 0, stdout: run.id }, run, task, outDir, adapterName };
+  return { result: { code: 0, stdout: outcome.run.id }, run: outcome.run, task, outDir, adapterName };
 }
 
 export function register(registry) {
@@ -276,7 +343,18 @@ export function register(registry) {
 
       const timeoutMs = config.limits.wallclock_s * 1000;
 
-      if (adapterName === 'fake') {
+      // Review round 1, F2: one launch path for every adapter. By default
+      // (no `--sync`) every adapter - fake included - goes through
+      // buildArgv() + launchDetached(), which tees the harness's stdout
+      // through runner.mjs so events.jsonl is written live (from the
+      // adapter's createStreamParser(), when it has one) and out.txt is
+      // redacted line by line (F3) exactly the same way for a real harness
+      // or the fake one. `--sync` is the one escape hatch, calling the
+      // adapter's own blocking run() in process instead - kept only for the
+      // e2e/loop fixtures (test/e2e.test.mjs, test/e2e-autonomy.test.mjs,
+      // test/loop.test.mjs) that need the fake run to have already finished,
+      // synchronously, by the time this command returns.
+      if (flags.sync) {
         const fixturePath = process.env.CORTEX_FAKE_FIXTURE;
         await adapter.run({
           prompt,
@@ -287,31 +365,56 @@ export function register(registry) {
           timeoutMs,
           env: process.env,
           detach: !!flags.detach,
-          fixture: fixturePath ? JSON.parse(readFileSync(fixturePath, 'utf8')) : undefined,
+          ...(adapterName === 'fake'
+            ? { fixture: fixturePath ? JSON.parse(readFileSync(fixturePath, 'utf8')) : undefined }
+            : {}),
         });
       } else {
+        const adapterConfig = config.adapters?.[adapterName] ?? {};
+        let dataHome;
+        if (adapterName === 'opencode') {
+          // Review round 1, F4: a per agent OpenCode data dir, so two
+          // OpenCode processes never share XDG_DATA_HOME and deadlock on
+          // OpenCode's own database (docs/adapters.md "Concurrency note").
+          // opencode.mjs's buildArgv joins `agent` onto `dataHome` itself
+          // (see test/adapters.test.mjs "data home isolation"), so this is
+          // the *base* dir - the directory actually used by the spawned
+          // process is dataHome/<agent>, which is what we create here.
+          dataHome = join(config.runs, '.opencode-data');
+          mkdirSync(join(dataHome, flags.agent), { recursive: true });
+        }
         const { cmd, args, env } = adapter.buildArgv({
           prompt,
           cwd: task.worktree,
           agent: flags.agent,
           model: run.model,
           outDir,
+          dataHome,
+          cmd: adapterConfig.cmd,
+          argsPrefix: adapterConfig.argsPrefix,
         });
-        launchDetached({ argv: { cmd, args, env }, cwd: task.worktree, outDir, timeoutMs });
+        launchDetached({
+          argv: { cmd, args, env },
+          cwd: task.worktree,
+          outDir,
+          timeoutMs,
+          adapter: adapterName,
+          eventsPath: join(outDir, 'events.jsonl'),
+        });
       }
 
-      // The fake adapter runs entirely in-process and writes done.marker
-      // before `adapter.run()` above returns, so a watchdog for it would
+      // A `--sync` launch (see above) has already run to completion and
+      // written done.marker before we get here, so a watchdog for it would
       // have nothing left to watch - skip spawning one rather than leaving
       // a redundant detached process (and its own db connection) racing the
       // caller's very next command (docs/state-machine.md "Wall clock
       // watchdog": "cortexctl watch ... is started by the launcher
       // immediately after the harness process" - a harness that has already
-      // finished needs no watcher). Real adapters always go through
-      // launchDetached and are still running at this point, so they always
-      // get one. `--config` is forwarded (when the run used one) so the
-      // watchdog enforces the same `stall_s`/limits the run started under,
-      // not whatever config a bare cwd lookup would otherwise find.
+      // finished needs no watcher). Every detached launch is still running
+      // at this point, so it always gets one. `--config` is forwarded (when
+      // the run used one) so the watchdog enforces the same `stall_s`/
+      // limits the run started under, not whatever config a bare cwd lookup
+      // would otherwise find.
       if (!existsSync(join(outDir, 'done.marker'))) {
         const watchArgs = [CLI_PATH, 'watch', '--run', run.id, '--db', config.db];
         if (config.configPath) watchArgs.push('--config', config.configPath);
