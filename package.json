@@ -1,0 +1,19 @@
+{
+  "name": "cortextos-ledger",
+  "version": "0.1.0",
+  "description": "Durable task ledger, state machine, guards, and blind review protocol for agent coding harnesses.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "bin": {
+    "cortexctl": "bin/cortexctl.mjs"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "lint": "node scripts/check-syntax.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

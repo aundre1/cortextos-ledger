@@ -1,0 +1,29 @@
+# Ledger database and run artifacts (docs/security.md: never committed)
+.cortex/
+orgs/
+**/events.jsonl
+**/reasoning.md
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Dependencies
+node_modules/
+
+# Test temp dirs
+test/.tmp/
+**/.tmp-cortex-*/
+*.tmp.db
+*.tmp.db-*
+
+# This wave's own internal task/orchestration log (.claude/tasks/*.md
+# records the multi-executor plan, its OPEN QUESTION entries, and the
+# original Windows dev-machine paths executors read reference material
+# from). It documents how this repository was built, not the repository
+# itself, and it is appended to rather than edited - so, unlike everything
+# else scripts/publish-check.mjs checks, its personal-path mentions cannot
+# be fixed in place. It never ships.
+.claude/

@@ -1,0 +1,43 @@
+{
+  "items": [
+    {
+      "name": "cortex-ledger",
+      "type": "skill",
+      "version": "0.1.0",
+      "description": "Durable task ledger operating procedure: start the run before touching files, close out with the artifacts the guards check for, and let the owner close the task.",
+      "author": "aundre1",
+      "tags": ["ledger", "task-board", "guards", "review"],
+      "review_status": "pending",
+      "dependencies": [],
+      "install_path": "community/skills/cortex-ledger",
+      "source": "https://github.com/aundre1/cortextos-ledger",
+      "submitted_at": "2026-09-07T00:00:00Z"
+    },
+    {
+      "name": "blind-reviewer",
+      "type": "agent",
+      "version": "0.1.0",
+      "description": "Agent template for a reviewer that receives a diff and an issue and nothing else, on a different provider from the builder, and outputs a validated verdict.json.",
+      "author": "aundre1",
+      "tags": ["review", "blind-review", "verdict", "quality"],
+      "review_status": "pending",
+      "dependencies": [],
+      "install_path": "community/agents/blind-reviewer",
+      "source": "https://github.com/aundre1/cortextos-ledger",
+      "submitted_at": "2026-09-07T00:00:00Z"
+    },
+    {
+      "name": "novice-builder",
+      "type": "agent",
+      "version": "0.1.0",
+      "description": "Agent template for a careful junior-engineer builder that verifies before claiming, never edits a failing test, and reports blockers and scope overruns instead of improvising past them.",
+      "author": "aundre1",
+      "tags": ["builder", "novice-framing", "guardrails"],
+      "review_status": "pending",
+      "dependencies": [],
+      "install_path": "community/agents/novice-builder",
+      "source": "https://github.com/aundre1/cortextos-ledger",
+      "submitted_at": "2026-09-07T00:00:00Z"
+    }
+  ]
+}

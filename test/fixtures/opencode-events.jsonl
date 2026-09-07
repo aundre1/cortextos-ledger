@@ -1,0 +1,7 @@
+{"ts":"2026-09-07T01:00:00.000Z","type":"session.start","session_id":"oc_session_1","model":"opencode/deepseek-v4"}
+{"ts":"2026-09-07T01:00:01.000Z","type":"tool.call","tool":"bash","args_summary":"command=git status"}
+{"ts":"2026-09-07T01:00:02.000Z","type":"tool.result","tool":"bash","ok":true,"ms":120}
+{"ts":"2026-09-07T01:00:03.000Z","type":"tool.call","tool":"bash","args_summary":"command=git diff --stat"}
+{"ts":"2026-09-07T01:00:04.000Z","type":"tool.result","tool":"bash","ok":false,"error":"curl failed: authorization header leaked token ghp_abcdefghijabcdefghijabcdefghijabcdef in log"}
+{"ts":"2026-09-07T01:00:05.000Z","type":"message","role":"assistant","tokens_in":900,"tokens_out":210,"cost_usd":0.0031}
+{"ts":"2026-09-07T01:00:06.000Z","type":"session.end","session_id":"oc_session_1","exit_code":0,"tokens_in":900,"tokens_out":210,"cost_usd":0.0031,"requests":1}
