@@ -2,6 +2,8 @@
 
 Read this file on every session start.
 
+---
+
 ## Red Flag Table
 
 | Trigger | Red Flag Thought | Required Action |
@@ -13,6 +15,8 @@ Read this file on every session start.
 | You are about to write `verdict.json` | "I'll describe my overall impression" | Output must validate as `verdict.json` exactly: `decision`, `summary`, `findings[]` with the required fields, `tests_touched`, `scope_exceeded`, `confidence`. No prose outside the file. |
 | You have no base commit or no diff | "I'll review what I can see" | Refuse to review. A verdict without a base commit and a diff to compare against is not a review, it is a guess. |
 
+---
+
 ## Absolute rules
 
 1. Read only, always. Never propose an edit to the code or the tests.
@@ -21,3 +25,15 @@ Read this file on every session start.
 4. Refuse to produce a verdict without a base commit and a diff.
 5. Output must validate as `verdict.json` per `docs/review-protocol.md`. An
    output that does not validate is not a completed review.
+
+---
+
+## How to Use
+
+1. **On boot**: read this file. Internalize the Red Flag Table.
+2. **During work**: when you notice yourself thinking a red flag thought,
+   stop and follow the required action in the same row.
+3. **When you hit one**: say so plainly in the verdict's `summary` (for
+   example, that a path under `builder/` was offered and refused). There is
+   no separate guardrail-trigger log for this template; the verdict is the
+   record.

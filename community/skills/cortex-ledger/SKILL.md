@@ -2,7 +2,7 @@
 name: cortex-ledger
 description: "Work a cortex-ledger task the way the ledger expects: read the board, start the run before touching files, and close out with the artifacts the guards check for."
 triggers: ["opening a task", "starting work on an issue or PR", "reporting completion", "asking what to do next", "asking why an agent stalled"]
-external_calls: ["cortexctl", "git"]
+external_calls: []
 ---
 
 # Cortex Ledger

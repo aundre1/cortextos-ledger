@@ -2,6 +2,8 @@
 
 Read this file on every session start.
 
+---
+
 ## Red Flag Table
 
 | Trigger | Red Flag Thought | Required Action |
@@ -13,6 +15,8 @@ Read this file on every session start.
 | You finished a change | "I'll just push this / merge it" | Never push, merge, force push, reset --hard, delete a branch, or run `gh pr merge`. Those are denied and are not yours to attempt either. |
 | You notice a better approach mid-task | "Let me also fix this other thing while I'm here" | Note it in `reasoning.md` under what you deliberately did not change. Scope is the issue, not what you noticed along the way. |
 
+---
+
 ## Absolute rules
 
 1. Never edit a failing test to make it pass.
@@ -20,3 +24,14 @@ Read this file on every session start.
 3. Stop at the file cap with `SCOPE_EXCEEDED`.
 4. Write `reasoning.md` and `patch.diff` before declaring done.
 5. No push, no merge, no force push, no branch delete, no `gh pr merge`.
+
+---
+
+## How to Use
+
+1. **On boot**: read this file. Internalize the Red Flag Table.
+2. **During work**: when you notice yourself thinking a red flag thought,
+   stop and follow the required action in the same row.
+3. **When you hit one**: say so plainly in `reasoning.md`, under what you
+   deliberately did not do and why. There is no separate guardrail-trigger
+   log for this template; `reasoning.md` is the record.

@@ -1,0 +1,58 @@
+# Upstream convention diff — cortex-ledger community contribution
+
+This is a byte-level comparison of this kit's `community/` contribution
+against the current `grandamenium/cortextos` upstream repository, and what
+was changed to match. It is meant to stand as the body of the upstream pull
+request description.
+
+## Sources fetched (byte-exact, `raw.githubusercontent.com/grandamenium/cortextos/main/...`, 2026-09-07)
+
+| Path | Bytes |
+|---|---|
+| `community/skills/tasks/SKILL.md` | 2894 |
+| `community/skills/heartbeat/SKILL.md` | 3069 |
+| `community/agents/analyst/config.json` | 1838 |
+| `community/agents/analyst/IDENTITY.md` | 523 |
+| `community/agents/analyst/SOUL.md` | 2727 |
+| `community/agents/analyst/GUARDRAILS.md` | 2395 |
+| `community/agents/analyst/HEARTBEAT.md` | 2734 |
+| `community/agents/research-agent/config.json` | 3636 |
+| `CONTRIBUTING.md` | 6541 |
+| `community/catalog.json` | 15350 (30 items) |
+
+All ten fetched cleanly (no 404s to report) via direct `curl` against
+`raw.githubusercontent.com`, so this pass has literal upstream bytes for
+every file listed above, not a paraphrase.
+
+## Diff table
+
+| # | Area | Was | Upstream convention (verified) | Resolution |
+|---|---|---|---|---|
+| 1 | `catalog.entry.json` key set | `name, type, version, description, author, tags, review_status, dependencies, install_path, source, submitted_at` | Every one of the 30 items in the real `community/catalog.json` uses exactly `name, description, author, type, version, tags, review_status, dependencies, install_path, submitted_at`, in that order. No item, of any type, carries a `source`/repo-link field. | **Aligned to upstream.** Reordered all three of our entries to this key order and removed `source` entirely. |
+| 2 | Contributor repository link | Carried as `source` inside each catalog item | No field for it anywhere upstream | **Aligned to upstream, relocated.** The link now lives in `community/README.md` as a plain sentence, not inside any file upstream will merge into its catalog. |
+| 3 | `SKILL.md` frontmatter keys/order | `name, description, triggers, external_calls` | Both fetched examples (`tasks`, `heartbeat`) use the identical key set and order. | **Already aligned** — no key change needed. |
+| 4 | `SKILL.md` frontmatter quoting style | `name` bare, `description` double-quoted, `triggers` bracketed array of double-quoted strings, `external_calls` bracketed array | Identical style in both fetched examples. | **Already aligned** — no change needed. |
+| 5 | `external_calls` value | `["cortexctl", "git"]` | Both fetched examples call their own project's CLI heavily (`cortextos bus ...`, dozens of times) and still declare `external_calls: []`. `CONTRIBUTING.md` defines the field as "every external API, service, or URL the skill contacts" for "network footprint" review — a project's own local CLI is not a network call. | **Aligned to upstream.** Changed to `external_calls: []`. This directly reverses the previous executor's literal reading of `docs/community.md`'s (now-corrected) instruction to list `cortexctl`/`git` here. |
+| 6 | Agent template required files | `IDENTITY.md, SOUL.md, GUARDRAILS.md, config.json, HEARTBEAT.md` | `CONTRIBUTING.md`: required = `IDENTITY.md, SOUL.md, GUARDRAILS.md, config.json`; recommended = `GOALS.md, HEARTBEAT.md, TOOLS.md`. | **Already aligned** — all required files present, plus one recommended file (`HEARTBEAT.md`). No `GOALS.md`/`TOOLS.md`; not required, not added speculatively. |
+| 7 | `config.json` — lifecycle keys | Had none of: `startup_delay, max_session_seconds, max_crashes_per_day, working_directory, timezone, approval_rules` | Both fetched examples carry all six, with `startup_delay: 0, max_session_seconds: 255600, max_crashes_per_day: 10` identical across both — reads as the standard CortextOS-daemon default block, `working_directory`/`timezone` as empty operator-set placeholders. | **Aligned to upstream.** Added all six to both agent `config.json` files, values matching the two examples' shared defaults; `working_directory`/`timezone` left `""` as upstream's own examples do. |
+| 8 | `config.json` — `runtime` key | Present on both of ours (`"opencode"`) | Present on `research-agent` (`"claude-code"`); **absent entirely** on `analyst`. Not a required key. | **Kept**, because it is a real, in-use upstream key (confirmed on one of two examples) and our agents genuinely need to name a specific non-default runtime. |
+| 9 | `config.json` — `ecosystem` key | Not present on ours | Present on both fetched examples: toggles for CortextOS-native integrations (`local_version_control`, `upstream_sync`, `catalog_browse`, `community_publish`, or a `research` block). | **Kept omitted, because** these toggle features specific to the CortextOS daemon (auto version control, upstream sync, catalog browsing) that this kit's agents don't participate in — they act through `cortexctl` against the ledger, not through `cortextos bus`. Adding an all-`false` block we can't verify does anything would be guessing at a convention, which this pass was told not to do. |
+| 10 | `config.json` — `model`, `_model_note`, `temperature`, `prompt`, `permission`, `read_only` | Present on both of ours | Present on **neither** fetched example. `CONTRIBUTING.md`'s one-line description of `config.json` ("model, crons, startup config") names `model` as expected content, but neither real example file has a `model` field at all — this is an inconsistency in upstream's own docs, not something this pass can resolve. | **Kept, because** these implement real, tested behavior this kit depends on: the OpenCode agent-runtime shape (`model`/`temperature`/`prompt`/`permission`) is what OpenCode itself reads to run the agent, and `permission`/`read_only` are literally what makes `blind-reviewer` read-only and `novice-builder`'s git-destructive commands denied. Removing them would silently disable the guardrails `docs/community.md` and `GUARDRAILS.md` both promise. Flagging upstream's own doc/example mismatch here rather than guessing which one is authoritative. |
+| 11 | `config.json` — key order | `agent_name, runtime, enabled, model, ...` | Order varies between the two examples (`agent_name, enabled, startup_delay, ...` vs `agent_name, enabled, runtime, startup_delay, ...`); not rigid, but `agent_name`/`enabled` always lead. | **Aligned loosely.** Reordered to `agent_name, enabled, runtime, startup_delay, max_session_seconds, max_crashes_per_day, working_directory, timezone, approval_rules, model, ..., crons`, matching the observed lead sequence and placing our own additions after the shared upstream block rather than before it. |
+| 12 | `IDENTITY.md` structure | Single top-level bullet list (`- **Name:** ... - **Role:** ...`) under `# Agent Identity`, then `## Work style` | `# Analyst Identity`, then separate `## Name`, `## Role`, `## Emoji`, `## Vibe` headings (blank, onboarding-placeholder in the fetched file), then `## Work Style`. | **Aligned.** Both templates now use `# <Agent> Identity` and the same five separate headings, pre-filled with our real content rather than left as onboarding placeholders — see row 15. |
+| 13 | `SOUL.md` intro line | "Read once per session. Internalize." | "Read once per session. Internalize. Do not reference in conversation. Full context: `.claude/skills/soul-philosophy/SKILL.md`", followed by `---` before the first `##` section. | **Partially aligned.** Added "Do not reference in conversation." and the `---` separator. Did **not** add a "Full context" skill link — this kit ships no `soul-philosophy` skill, and inventing a link to a file that doesn't exist would be worse than omitting it. |
+| 14 | `GUARDRAILS.md` structure | `# Guardrails: <name>` → Red Flag Table → `## Absolute rules` | `# Guardrails` → intro with a skill-reference link → `---` → Red Flag Table (+ an agent-specific `###` subsection in `analyst`) → `---` → `## How to Use` (numbered) → `---` → `## Adding Guardrails`. | **Aligned.** Added `---` separators around each major section and a `## How to Use` section (3 steps: on boot, during work, when a guardrail actually fires) adapted to each template's own artifacts (`verdict.json` for blind-reviewer, `reasoning.md` for novice-builder — this kit has no separate guardrail-trigger log command the way `cortextos bus log-event ... guardrail_triggered` gives upstream, so said so explicitly instead of inventing one). Kept `## Absolute rules` as an addition — it is real content (hard behavioral rules, not just situational red flags) upstream's own table-only format doesn't have a slot for. Did not add `## Adding Guardrails` (upstream's instruction to append new rows to a separate skill file) since we ship no such skill file. |
+| 15 | Placeholder vs. filled templates | N/A | `analyst`'s `IDENTITY.md` ships **blank**, with HTML comments (`<!-- Set during onboarding -->`) for a human/agent to fill in during a setup flow. | **Kept filled, not blanked.** This kit's two templates are meant to be usable as shipped (per `community/README.md`'s install steps), not onboarding scaffolds — blanking them to match upstream's placeholder style would make the templates non-functional out of the box. Flagging the convention difference rather than adopting it. |
+| 16 | `HEARTBEAT.md` structure | Numbered `## Step N: <title>` headings with bash fences, ending on an explicit idle/stop condition | `analyst`'s is a numbered checklist (`## Step 1` … `## Step 8`) with bash fences and an explicit closing reminder. | **Already aligned** — same numbered-step-with-bash-fence shape; no change made. |
+| 17 | `catalog.json` sample in `CONTRIBUTING.md` §3 vs. the real file | — | `CONTRIBUTING.md`'s inline example entry uses `name, type, version, description, author, tags, review_status, install_path` — no `dependencies`, no `submitted_at`, different order from every one of the 30 real entries (row 1). | **Not ours to fix.** Flagging the inconsistency for the maintainer; this pass matched the real `catalog.json` data over the illustrative snippet in the contributing guide, since the data file is what actually gets parsed. |
+
+## What could not be verified
+
+- **`codex-app-server` and `hermes` as `config.json` `runtime` values.** Only `claude-code` (on `research-agent`) and this kit's own `opencode` were seen in any fetched file. `docs/community.md` previously asserted all four as known upstream values; that line has been corrected to say only what was actually observed.
+- **Any upstream `community/agents/<name>/.claude/skills/` bundled-skill example.** `CONTRIBUTING.md` documents this directory but none of the fetched agent templates (`analyst`, `research-agent`) were inspected file-by-file beyond the five files this pass needed; neither of our two templates bundles one, so this wasn't blocking.
+- **Whether `runtime` is ever required.** Confirmed present on one of two fetched examples and absent on the other; no rule found either way.
+
+## Open questions for arbitration
+
+- **Repository URL.** `community/README.md` still states `https://github.com/aundre1/cortextos-ledger`, which was already flagged in the wave log as the working repo name/owner, unconfirmed. This pass did not change that URL or the `author: "aundre1"` catalog field — both were given as fixed facts for this task — but the same open question from the prior pass stands: reconfirm before the actual upstream PR opens.
+- **`CONTRIBUTING.md`'s `config.json` line ("model, crons, startup config") contradicts both fetched real examples**, which have crons and startup config but no `model` key at all. This kit keeps `model` (row 10) because we need it; a maintainer may want to know their own docs and their own shipped examples disagree.

@@ -1,8 +1,17 @@
 {
   "agent_name": "novice-builder",
+  "enabled": true,
   "runtime": "opencode",
   "_runtime_alternative": "codex-app-server is a documented alternative runtime for this template; swap the runtime field and the adapter section of the operator's cortex-ledger.json together, they are not independent.",
-  "enabled": true,
+  "startup_delay": 0,
+  "max_session_seconds": 255600,
+  "max_crashes_per_day": 10,
+  "working_directory": "",
+  "timezone": "",
+  "approval_rules": {
+    "always_ask": [],
+    "never_ask": []
+  },
   "model": "",
   "_model_note": "Placeholder. The operator sets this per docs/adapters.md; one agent binds one provider and one model.",
   "temperature": 0.1,

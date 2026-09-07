@@ -6,6 +6,11 @@ source code entering the upstream catalog. Register `community/catalog.entry.jso
 in upstream `community/catalog.json` and copy the directories below into the
 org's own tree; nothing else is required.
 
+Source repository: https://github.com/aundre1/cortextos-ledger. Upstream's
+`community/catalog.json` item schema has no field for this link (see
+`community/UPSTREAM-DIFF.md`), so it lives here instead of in the catalog
+entry itself.
+
 ## Layout
 
 ```
@@ -42,7 +47,8 @@ it, or the ledger database, or a run directory, be committed or packaged.
 
 ## What review_status: pending means
 
-Every entry in `catalog.entry.json` ships with `review_status: "pending"` and
-a `source` pointing at this repository, not at upstream `cortextos`. A
-maintainer flips it to `"approved"` after reviewing it against upstream's own
-checklist in `CONTRIBUTING.md`; nothing here self-approves.
+Every entry in `catalog.entry.json` ships with `review_status: "pending"`,
+matching upstream `community/catalog.json`'s own item shape exactly (see
+`community/UPSTREAM-DIFF.md` for the byte-level comparison). A maintainer
+flips it to `"approved"` after reviewing it against upstream's own checklist
+in `CONTRIBUTING.md`; nothing here self-approves.

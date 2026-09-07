@@ -4,21 +4,21 @@ Upstream (`grandamenium/cortextos`, MIT) accepts contributions into a community 
 
 ## Upstream conventions to match exactly
 
-The executor building `community/` must fetch the current upstream `CONTRIBUTING.md` and one existing skill and one existing agent template from the upstream repository and match their frontmatter, file names, and folder layout exactly. The conventions known as of 2026-09-07:
+The executor building `community/` must fetch the current upstream `CONTRIBUTING.md`, `community/catalog.json`, and existing skill and agent template examples from the upstream repository and match their frontmatter, file names, folder layout, and JSON key order exactly. Byte-verified against `raw.githubusercontent.com/grandamenium/cortextos/main/...` on 2026-09-07 (`community/skills/tasks/SKILL.md`, `community/skills/heartbeat/SKILL.md`, `community/agents/analyst/{config.json,IDENTITY,SOUL,GUARDRAILS,HEARTBEAT}.md`, `community/agents/research-agent/config.json`, `CONTRIBUTING.md`, `community/catalog.json`):
 
-- Skills live at `community/skills/<name>/SKILL.md` with frontmatter fields `name`, `description`, `triggers`, `external_calls`.
-- Agent templates require `IDENTITY.md`, `SOUL.md`, `GUARDRAILS.md`, and `config.json`, and `config.json` carries a `runtime` field (`claude-code`, `codex-app-server`, `opencode`, `hermes`).
-- Registration is an entry in `community/catalog.json` with `review_status: "pending"`.
+- Skills live at `community/skills/<name>/SKILL.md` with frontmatter fields, in this order: `name`, `description`, `triggers`, `external_calls`. `external_calls` lists external APIs/services/URLs the skill contacts over the network — **not** the skill's own project's local CLI. Upstream's own `tasks` and `heartbeat` skills call `cortextos bus ...` (their local CLI) throughout and still ship `external_calls: []`; a skill whose only calls are to its own project's CLI (`cortexctl`, `git`) should do the same.
+- Agent templates require `IDENTITY.md`, `SOUL.md`, `GUARDRAILS.md`, and `config.json` (`GOALS.md`, `HEARTBEAT.md`, `TOOLS.md` are recommended, not required). `config.json` is a CortextOS daemon lifecycle config: `agent_name`, `enabled`, an optional `runtime` (seen as `"claude-code"` on `research-agent`; absent entirely on `analyst`; `"opencode"` and `"codex-app-server"` are this kit's own values, unverified against any fetched upstream example), `startup_delay`, `max_session_seconds`, `max_crashes_per_day`, `working_directory`, `timezone`, `approval_rules: {always_ask, never_ask}`, `crons[]` (each `{name, type, interval|cron, prompt}`), and an `ecosystem` block of CortextOS-native integration toggles this kit's agents don't participate in. `CONTRIBUTING.md`'s own inline description of `config.json` ("model, crons, startup config") does not match either fetched example's actual keys (neither has a `model` field) — flagging the mismatch rather than resolving it, since it isn't ours to fix.
+- Registration is an entry in `community/catalog.json`, an object `{version, updated_at, items: [...]}`. Each item uses exactly these keys, in this order: `name`, `description`, `author`, `type`, `version`, `tags`, `review_status`, `dependencies`, `install_path`, `submitted_at`. There is no `source`/repository-link field anywhere in the 30 fetched items; a contributor's repository link does not belong in the catalog entry.
 - PR title format: `feat: add <name> [skill|agent|org] to community catalog`; branch `feat/skill-<name>` or `feat/agent-<name>`.
 - Write for agent execution, not for human readers.
 
-If any of these has changed upstream, the fetched version wins and this document is updated in the same pull request.
+Full comparison table, and what this kit kept versus aligned, is in `community/UPSTREAM-DIFF.md`. If any of these has changed upstream since this pass, the fetched version wins and this document is updated in the same pull request.
 
 ## Artifacts
 
 ### Skill `cortex-ledger`
 
-`community/skills/cortex-ledger/SKILL.md`. Triggers on: opening a task, starting work on an issue or PR, reporting completion, asking what to do next, asking why an agent stalled. Body is an operating procedure an agent follows verbatim: `cortexctl packet --board --owner <me>` first; `cortexctl run:start` before touching files; `cortexctl run:end`, `artifact`, `test` when done; `BLOCKED:` and `SCOPE_EXCEEDED` conventions; never close a task yourself, the owner closes. `external_calls` lists `cortexctl` and `git` only.
+`community/skills/cortex-ledger/SKILL.md`. Triggers on: opening a task, starting work on an issue or PR, reporting completion, asking what to do next, asking why an agent stalled. Body is an operating procedure an agent follows verbatim: `cortexctl packet --board --owner <me>` first; `cortexctl run:start` before touching files; `cortexctl run:end`, `artifact`, `test` when done; `BLOCKED:` and `SCOPE_EXCEEDED` conventions; never close a task yourself, the owner closes. `external_calls: []` — `cortexctl` and `git` are this kit's own local CLI and version control, not an external network call, matching upstream's own convention (see above).
 
 ### Agent template `blind-reviewer`
 
@@ -30,7 +30,7 @@ If any of these has changed upstream, the fetched version wins and this document
 
 ### Catalog entry
 
-`community/catalog.entry.json` holds the three entries ready to append to upstream `community/catalog.json`, each with `review_status: "pending"` and a `source` URL pointing at this repository.
+`community/catalog.entry.json` holds the three entries ready to append to upstream `community/catalog.json`, each with `review_status: "pending"` and no field beyond upstream's own item shape (`name`, `description`, `author`, `type`, `version`, `tags`, `review_status`, `dependencies`, `install_path`, `submitted_at`). The repository link lives in `community/README.md` instead, since upstream's catalog item schema has no field for it.
 
 ## Heartbeat integration
 

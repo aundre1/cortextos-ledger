@@ -1,7 +1,16 @@
 {
   "agent_name": "blind-reviewer",
-  "runtime": "opencode",
   "enabled": true,
+  "runtime": "opencode",
+  "startup_delay": 0,
+  "max_session_seconds": 255600,
+  "max_crashes_per_day": 10,
+  "working_directory": "",
+  "timezone": "",
+  "approval_rules": {
+    "always_ask": [],
+    "never_ask": []
+  },
   "model": "",
   "_model_note": "Placeholder. The operator sets this. It must be a different lab from the builder's provider, so the review is actually independent, not just a second call to the same model.",
   "temperature": 0.0,
