@@ -155,9 +155,52 @@ Doc mismatch (not edited - see "Doc mismatches found" below): docs/cli.md's
 `run:launch` line is also now missing `--adapter`/`--provider`/`--model` (a
 pre-existing gap, see below) and the new `--sync` flag.
 
+### Review round 2 fixes (executor I)
+
+This pass covers finding R2-1, the one assigned to this executor; R2-2 is
+tracked separately and is not addressed here.
+
+- **R2-1 (blocker, watchdog kill was a no-op on real launches)**: `doRunStart`
+  (`src/commands/runs.mjs`) never persisted the harness's OS pid to
+  `task_runs.pid` - only `<outDir>/pid.txt` (written by
+  `src/adapters/runner.mjs`) ever got it. `src/guards/watchdog.mjs`'s
+  `tick()` calls `killTree(run.pid)` on a stall or wall clock breach, which
+  silently does nothing when `pid` is falsy: the ledger row moved to
+  `halted`/`stalled` while the actual process kept running. Fixed at both
+  layers:
+  - `run:launch` now polls `<outDir>/pid.txt` for up to 3s (50ms steps, no
+    fixed sleep) right after `launchDetached()` and writes it to
+    `task_runs.pid` as soon as it appears (`pollPidFile`, new in
+    `src/adapters/spawn.mjs`). If it never appears in time, `pid` is left
+    null - the watchdog's own fallback (next bullet) still covers it - and a
+    `cortexctl: warn: pid.txt not found within 3s` line goes to stderr
+    without breaking the one-line stdout contract (this is a zero-exit
+    path).
+  - `tick()` now resolves the pid defensively before killing: `run.pid`,
+    falling back to reading and parsing `<outDir>/pid.txt` itself
+    (`readPidFile`, also new in `src/adapters/spawn.mjs`) when `run.pid` is
+    null. Whichever pid is found is persisted to `task_runs.pid` in the same
+    `UPDATE` that records the halt/stall. If no pid can be resolved at all,
+    `halted_reason` gets a `;pid_unknown` suffix (so `cortexctl doctor` can
+    say so) and the escalation is still written either way.
+  - `src/adapters/runner.mjs` already wrote `pid.txt` as the very first
+    thing after a successful `spawn()`, before attaching any stdout/stderr
+    listeners or the timeout timer - confirmed, no change needed there.
+  - Test: `test/watchdog-kill.test.mjs` (new) launches a real, long-lived,
+    hung child process through the actual `run:launch` path (a stub
+    `claude` adapter command, `node -e "setInterval(()=>{},1000)" --`, that
+    never emits a stream event and never exits on its own) and asserts
+    against the real OS process: `run:launch` alone already persists
+    `task_runs.pid`; `tick()` on a stall breach kills it and
+    `task_runs.status`/`pid` land correctly; the same with `task_runs.pid`
+    forced to null first, proving the `pid.txt` fallback path; and the same
+    again for a wall clock breach. Every case polls
+    `process.kill(pid, 0)` until it throws `ESRCH`, with an `afterEach` that
+    force-kills any child a failed assertion left running.
+
 ### Test counts
 
-247 tests across 29 files under `test/*.test.mjs` (`node --test`), including
+251 tests across 30 files under `test/*.test.mjs` (`node --test`), including
 `test/e2e.test.mjs`: one scenario driven entirely through the CLI (`runCli`)
 with the fake adapter and a temp git repo — control arm (`task:new` through
 `task:close`), tri arm (`task:new --sibling` through blind `review:brief`,

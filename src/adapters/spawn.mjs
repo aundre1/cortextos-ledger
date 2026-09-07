@@ -7,7 +7,7 @@
 // needs this file.
 
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -51,6 +51,45 @@ export function launchDetached({ argv, cwd, outDir, timeoutMs, adapter, eventsPa
   });
   child.unref();
   return { runnerPid: child.pid };
+}
+
+/**
+ * Parse <outDir>/pid.txt (written by runner.mjs, per docs/adapters.md
+ * "spawn helper and credential boundary") into a positive integer pid, or
+ * null if the file is missing, empty, or does not parse - never throws.
+ * Review round 2, R2-1: this is the shared fallback both run:launch (which
+ * polls it - see pollPidFile below) and the watchdog (which reads it
+ * on-demand when task_runs.pid was never populated) use to recover the
+ * harness's real OS pid.
+ */
+export function readPidFile(pidPath) {
+  if (!pidPath || !existsSync(pidPath)) return null;
+  try {
+    const raw = readFileSync(pidPath, 'utf8').trim();
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Poll for pid.txt to appear and parse, up to timeoutMs in stepMs steps (no
+ * long sleeps - review round 2, R2-1: run:launch calls this right after
+ * launchDetached so task_runs.pid is populated as soon as the runner has
+ * spawned the harness, rather than staying null until a stall or wall clock
+ * breach forces the watchdog to fall back to reading the file itself).
+ * Returns the parsed pid, or null if it never appears/parses within the
+ * deadline.
+ */
+export async function pollPidFile(pidPath, timeoutMs = 3000, stepMs = 50) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const pid = readPidFile(pidPath);
+    if (pid != null) return pid;
+    if (Date.now() >= deadline) return null;
+    await new Promise((resolve) => setTimeout(resolve, stepMs));
+  }
 }
 
 /** Kill a process tree by pid: `taskkill /T /F` on Windows, process group SIGKILL elsewhere. */

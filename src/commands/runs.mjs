@@ -39,7 +39,7 @@ import {
   missingPatch,
 } from '../guards/postrun.mjs';
 import { getAdapter } from '../adapters/index.mjs';
-import { launchDetached } from '../adapters/spawn.mjs';
+import { launchDetached, pollPidFile } from '../adapters/spawn.mjs';
 import { watch as watchRun } from '../guards/watchdog.mjs';
 import { activeFor } from '../policy.mjs';
 
@@ -401,6 +401,24 @@ export function register(registry) {
           adapter: adapterName,
           eventsPath: join(outDir, 'events.jsonl'),
         });
+
+        // Review round 2, R2-1: doRunStart's insertRun never had a pid to
+        // write (the harness doesn't exist yet at that point), so
+        // task_runs.pid stayed null and the watchdog's killTree(run.pid) was
+        // a no-op on a stall or wall clock breach. runner.mjs writes
+        // <outDir>/pid.txt immediately after spawning the harness, so poll
+        // for it here (bounded, 50ms steps, no long sleeps) and persist it
+        // as soon as it appears. If it never shows up within the deadline,
+        // leave task_runs.pid null - the watchdog's own pid.txt fallback
+        // (src/guards/watchdog.mjs resolvePid) still covers it later - and
+        // warn on stderr without breaking the one-line stdout contract for
+        // this zero-exit path.
+        const pid = await pollPidFile(join(outDir, 'pid.txt'), 3000, 50);
+        if (pid != null) {
+          db.prepare('UPDATE task_runs SET pid = ? WHERE id = ?').run(pid, run.id);
+        } else {
+          err('cortexctl: warn: pid.txt not found within 3s');
+        }
       }
 
       // A `--sync` launch (see above) has already run to completion and
