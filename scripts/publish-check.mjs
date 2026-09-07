@@ -16,13 +16,30 @@
 //     own source and anything under test/, which are exempt from the
 //     content scan only (see CONTENT_SCAN_EXEMPT_* below)
 //
+// It also guards the published *package* itself (task E5-3, on top of the
+// git-tracked-tree checks above):
+//
+//   - package.json must declare a "files" allowlist. With none, `npm pack`
+//     ships the entire working tree minus .gitignore/.npmignore - the
+//     failure mode this task exists to close.
+//   - whatever `npm pack --dry-run` would actually put in the tarball must
+//     not include anything under .claude/, anything under the forbidden
+//     dirs/basenames above, or any file whose content matches a secrets
+//     pattern - independent of what the "files" allowlist currently says,
+//     so a future edit to package.json can't silently reopen this.
+//
 // On any hit: prints the path and, for a content match, the line number
 // only, never the matched value. Exits 2. With no hits, prints one OK line
 // and exits 0.
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync as readFile } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { PATTERNS as SCAN_PATTERNS } from '../src/guards/secrets-scan.mjs';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = join(HERE, '..');
 
 const FORBIDDEN_DIRS = [/(^|\/)\.cortex\//, /(^|\/)orgs\//];
 const FORBIDDEN_BASENAMES = new Set(['events.jsonl', 'reasoning.md']);
@@ -169,12 +186,108 @@ function existsSyncSafe(path) {
   }
 }
 
+// package.json must declare a "files" allowlist (task E5-3). With none,
+// `npm pack` falls back to shipping the whole working tree minus
+// .gitignore/.npmignore - exactly the failure mode this check exists to
+// close, so a non-array or empty allowlist counts as "none" too.
+function checkFilesField(findings) {
+  let pkg;
+  try {
+    pkg = JSON.parse(readFile(join(REPO_ROOT, 'package.json'), 'utf8'));
+  } catch (e) {
+    findings.push(`BLOCKED package.json (could not read/parse: ${e.message})`);
+    return;
+  }
+  if (!Array.isArray(pkg.files) || pkg.files.length === 0) {
+    findings.push('BLOCKED package.json (no "files" allowlist - npm pack would ship the whole working tree)');
+  }
+}
+
+// What `npm pack` would *actually* put in the tarball, independent of the
+// "files" allowlist's current contents - a future edit to package.json
+// could add a path back in without anyone touching this script. Applies
+// the same forbidden-dir/basename/secret-content rules checkPath applies
+// to the git tree, plus .claude/ specifically (never git-tracked, but
+// nothing stops a future "files" entry from reaching into it by mistake).
+const PACK_FORBIDDEN_DIRS = [...FORBIDDEN_DIRS, /(^|\/)\.claude\//];
+
+function checkPackedPath(pkgPath, findings) {
+  const basename = basenameOf(pkgPath);
+
+  for (const re of PACK_FORBIDDEN_DIRS) {
+    if (re.test(pkgPath)) {
+      findings.push(`BLOCKED packaged path ${pkgPath} (npm pack would ship a directory that must never be published)`);
+      return;
+    }
+  }
+  if (FORBIDDEN_BASENAMES.has(basename) || isForbiddenSecretFile(basename)) {
+    findings.push(`BLOCKED packaged path ${pkgPath} (npm pack would ship a file matching a forbidden name pattern)`);
+    return;
+  }
+
+  // Content scan: same exemptions as the git-tree scan above (this
+  // script's own source, and test/ fixtures that deliberately embed
+  // fake-secret-shaped strings to prove the matchers work) - though
+  // neither is expected to actually be packaged once package.json's
+  // "files" allowlist is correct.
+  if (contentScanExempt(pkgPath)) return;
+  if (!existsSyncSafe(pkgPath)) return;
+
+  let buf;
+  try {
+    buf = readFile(pkgPath);
+  } catch {
+    return;
+  }
+  if (looksBinary(buf)) return;
+
+  const lines = buf.toString('utf8').split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    for (const pattern of CONTENT_PATTERNS) {
+      if (pattern.re.test(lines[i])) {
+        findings.push(`BLOCKED packaged secret ${pkgPath}:${i + 1} (matches ${pattern.name})`);
+      }
+    }
+  }
+}
+
+// Runs `npm pack --dry-run --json` and checks every path it reports.
+// Never runs `npm publish`. A pack failure (e.g. no package.json at all)
+// is reported as a finding rather than crashing this script uncommunicatively.
+function checkPackedTarball(findings) {
+  let out;
+  try {
+    out = execFileSync('npm', ['pack', '--dry-run', '--json'], {
+      cwd: REPO_ROOT,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (e) {
+    findings.push(`BLOCKED npm pack --dry-run (failed to run: ${e.message})`);
+    return;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(out);
+  } catch (e) {
+    findings.push(`BLOCKED npm pack --dry-run (could not parse --json output: ${e.message})`);
+    return;
+  }
+  const [entry] = parsed;
+  const files = entry?.files ?? [];
+  for (const f of files) {
+    checkPackedPath(f.path, findings);
+  }
+}
+
 function main() {
   const paths = collectPaths();
   const findings = [];
   for (const p of paths) {
     checkPath(p, findings);
   }
+  checkFilesField(findings);
+  checkPackedTarball(findings);
 
   if (findings.length > 0) {
     for (const line of findings) process.stdout.write(line + '\n');
@@ -182,7 +295,10 @@ function main() {
     return;
   }
 
-  process.stdout.write(`OK ${paths.length} tracked or staged path(s) checked, nothing forbidden found\n`);
+  process.stdout.write(
+    `OK ${paths.length} tracked or staged path(s) checked, package.json has a "files" allowlist, ` +
+      `and npm pack --dry-run ships nothing forbidden\n`,
+  );
   process.exitCode = 0;
 }
 

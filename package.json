@@ -10,9 +10,21 @@
   "bin": {
     "cortexctl": "bin/cortexctl.mjs"
   },
+  "files": [
+    "bin",
+    "src",
+    "prompts",
+    "plugins",
+    "examples",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md"
+  ],
   "scripts": {
     "test": "node --test \"test/**/*.test.mjs\"",
-    "lint": "node scripts/check-syntax.mjs"
+    "lint": "node scripts/check-syntax.mjs",
+    "smoke": "node scripts/smoke-pack.mjs",
+    "publish-check": "node scripts/publish-check.mjs"
   },
   "dependencies": {},
   "devDependencies": {}

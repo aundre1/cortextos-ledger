@@ -21,3 +21,24 @@ jobs:
       - run: npm test
 
       - run: node scripts/publish-check.mjs
+
+  # E5-3: proves the packed tarball (package.json "files") is actually
+  # installable and runnable, not only that `npm test` passes against the
+  # working tree. Packs, installs into a scratch dir, and runs the
+  # installed cortexctl - never `npm publish`. Runs after `test` so a
+  # broken build fails fast without also paying for the pack/install.
+  smoke:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - run: npm run smoke

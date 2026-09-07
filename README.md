@@ -4,6 +4,27 @@ The task board contract CortextOS is missing: a durable ledger, hard limits,
 blind review, and controlled measurement for agents in Claude Code, Codex, and
 OpenCode. SQLite to Postgres. Zero dependencies.
 
+## Install
+
+```bash
+npm install -g cortextos-ledger
+cortexctl help
+```
+
+Or as a local project dependency:
+
+```bash
+npm install cortextos-ledger
+npx cortexctl help
+```
+
+Requires Node 22.5 or later; see Requirements below. Zero npm dependencies -
+installing this package pulls in nothing else. The published package ships
+only what `cortexctl` needs to run (`bin/`, `src/`, `prompts/`, `plugins/`,
+`examples/`); the quick start below runs straight from a git checkout with
+`node bin/cortexctl.mjs`, so once installed via npm use `cortexctl` in its
+place.
+
 ## What it prevents
 
 - Uncommitted work destroyed by an unattended agent.
