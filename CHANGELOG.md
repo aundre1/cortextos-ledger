@@ -97,6 +97,10 @@ exist at any dial setting.
   goals contract template and a worked walkthrough of turning the dial from
   off to a small amount of autonomous building.
 
+
+### Windows verification (Node 24.14, 2026-09-07)
+- node:sqlite is now loaded lazily behind a scoped emitWarning filter (`loadSqlite`, `sqliteAvailable` in src/db.mjs), so the ExperimentalWarning never reaches stderr on any Node version; on Node 24 it was printed synchronously at load and broke the one line stderr contract on Windows.
+
 ### Review round 1 fixes (executor H)
 
 Fixes for the five findings recorded in `.claude/tasks/PLAN-REVIEW-LOG.md`

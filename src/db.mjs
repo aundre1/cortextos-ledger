@@ -3,8 +3,43 @@
 // Every exported function here takes a `db` handle and plain values/objects,
 // per the project coding rule (see .claude/tasks/todo-kit-v01-20260907.md).
 
-import { DatabaseSync } from 'node:sqlite';
+import { createRequire } from 'node:module';
 import { randomBytes } from 'node:crypto';
+
+// node:sqlite is loaded lazily, after installing a scoped emitWarning filter,
+// so the ExperimentalWarning never reaches stderr on any Node version. A static
+// import would evaluate before bin/cortexctl.mjs gets a chance to intervene,
+// and on Node 24 the warning is printed synchronously at load time, which put
+// two lines of Node noise ahead of the CLI's single stderr line on Windows.
+const require = createRequire(import.meta.url);
+let sqliteModule = null;
+
+/** Load node:sqlite once, swallowing only its own experimental warning. */
+export function loadSqlite() {
+  if (sqliteModule) return sqliteModule;
+  const original = process.emitWarning;
+  process.emitWarning = function filteredEmitWarning(warning, ...rest) {
+    const message = typeof warning === 'string' ? warning : (warning && warning.message) || '';
+    if (/SQLite is an experimental feature/i.test(message)) return undefined;
+    return original.call(process, warning, ...rest);
+  };
+  try {
+    sqliteModule = require('node:sqlite');
+  } finally {
+    process.emitWarning = original;
+  }
+  return sqliteModule;
+}
+
+/** True when node:sqlite can be loaded on this runtime (used by preflight and doctor). */
+export function sqliteAvailable() {
+  try {
+    loadSqlite();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
 import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, extname, join, basename } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -89,6 +124,7 @@ export function openDb(path) {
   if (dir && dir !== '.' && !existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
+  const { DatabaseSync } = loadSqlite();
   const db = new DatabaseSync(path);
   // Concurrent access is real, not hypothetical: `run:launch` spawns a
   // detached `cortexctl watch` process that opens its own connection to the

@@ -5,6 +5,7 @@
 import { spawnSync } from 'node:child_process';
 
 import { getTask } from '../ledger.mjs';
+import { sqliteAvailable } from '../db.mjs';
 import { escalate, checkQuota } from '../limits.mjs';
 import { scan } from './secrets-scan.mjs';
 
@@ -41,14 +42,13 @@ export async function preflight(db, config, opts = {}) {
       findings: [],
     };
   }
-  try {
-    await import('node:sqlite');
-  } catch (e) {
+  const sqlite = sqliteAvailable();
+  if (!sqlite.ok) {
     return {
       ok: false,
       code: 1,
       reason: 'node_version',
-      detail: `node:sqlite not available: ${e.message}`,
+      detail: `node:sqlite not available: ${sqlite.error}`,
       findings: [],
     };
   }
