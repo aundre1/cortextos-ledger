@@ -37,9 +37,69 @@ Claude Code, Codex, or OpenCode.
 - `examples/`: worked walkthroughs for the issue loop, PR triage, and the
   CortextOS org layout.
 
+### Autonomy layer (docs/autonomy.md, shipped default off)
+
+Agents can now build on their own from stated goals and measured outcomes,
+share ideas with each other, learn from adjudications and retros, and suggest
+routing and tooling changes - all inside the existing hard limits, guards,
+and quotas, and all off by default (`config.autonomy.enabled: false`).
+Turning it on is a deliberate, logged act; nothing here changes routing,
+prompts, or config without a human command, and autonomous merges do not
+exist at any dial setting.
+
+- New tables (`src/schema/003-v02-autonomy.sql`): `proposals`,
+  `proposal_reviews`, `lessons`, `policy`, `loop_ticks`, with ledger helpers
+  in `src/ledger.mjs` following the existing insert/list/get/update-status
+  style, plus a shared `ensureSyntheticTask` for the `_proposals`, `_goals`,
+  and `_loop` synthetic per-business tasks that anchor cost and intervention
+  rows with nowhere else to attach.
+- `src/goals.mjs`, `src/commands/goals.mjs`: the private goals contract
+  (`config.goals`, never checked in populated - see
+  `examples/cortex-goals.example.json`), `ledger:<report field>` metric
+  sourcing from `src/measure.mjs`'s `report()` (which gained `cost_per_task`
+  and `escaped_defects` per class alongside the existing fields), and
+  `goals:show` / `goals:set`.
+- `src/proposals.mjs`, `src/commands/proposals.mjs`: `propose`,
+  `proposal:review`, `proposal:list`, `proposal:approve`, `proposal:reject`.
+  An agent may never review its own proposal. Approval converts through the
+  same `insertTask` path `task:new` uses. `canAutoApprove` implements the
+  autonomy dial exactly, including that policy and tooling proposals are
+  never auto approved regardless of the dial.
+- `src/lessons.mjs`, `src/commands/lessons.mjs`: `lesson:add`, `lesson:list`,
+  `lesson:retire`, and `selectForPacket`, the only path by which a lesson
+  changes behaviour. `packet` now carries a `lessons[]` field and a markdown
+  "Lessons" section after the next action; `review:brief` carries reviewer-
+  or-all lessons after the issue text. `adjudicate` gained `--lesson` to
+  draft one in the same call.
+- `src/retro.mjs`, `src/commands/retro.mjs` (`retro`): reads the ledger for
+  every pattern in docs/autonomy.md's table (repeated guard firings, low
+  reviewer precision, control-matches-tri and tri-catches-more arm
+  comparisons, an unaddressed goal gap, a repeating tool failure, a quota
+  window at its limit) and drafts lessons/proposals without duplicating an
+  identical open one on a second run. Never changes config, prompts, or
+  routing.
+- `src/policy.mjs`, `src/commands/policy.mjs`: `policy:apply`,
+  `policy:revert`, `policy:list`. `policy:apply` re-computes its supporting
+  run count from the ledger at apply time (never trusting a count carried on
+  the proposal) and refuses under 20 with exit 6. `run:start` now consults
+  the active policy for the task's class before falling back to
+  `config.agents`.
+- `src/loop.mjs`, `src/commands/loop.mjs` (`loop`): the heartbeat body a
+  CortextOS agent template or a cron calls. One tick executes an
+  already-assigned action through the existing commands (`run:launch`,
+  `review:brief`, `run:end`, `ingest` - the same commands a human would run,
+  spawned the same way `test/helpers.mjs`'s `runCli` does), otherwise drafts
+  or reviews one proposal through the agent's adapter (`prompts/proposer.md`,
+  `prompts/proposal-reviewer.md`), and always records a `loop_ticks` row.
+  `doctor --all` now reports each agent's last tick; `report --loop` adds a
+  ticks/actions/proposal-spend section.
+- `examples/cortex-goals.example.json`, `examples/autonomy-loop.md`: the
+  goals contract template and a worked walkthrough of turning the dial from
+  off to a small amount of autonomous building.
+
 ### Test counts
 
-196 tests across 19 files under `test/*.test.mjs` (`node --test`), including
+236 tests across 27 files under `test/*.test.mjs` (`node --test`), including
 `test/e2e.test.mjs`: one scenario driven entirely through the CLI (`runCli`)
 with the fake adapter and a temp git repo — control arm (`task:new` through
 `task:close`), tri arm (`task:new --sibling` through blind `review:brief`,

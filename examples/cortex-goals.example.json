@@ -1,0 +1,17 @@
+{
+  "goals_version": "1",
+  "businesses": [
+    {
+      "id": "biz-a",
+      "name": "Example SaaS",
+      "owner": "founder",
+      "objective": "Reach 100 paying customers by end of quarter",
+      "metrics": [
+        { "name": "paying_customers", "target": 100, "current": 42, "unit": "count", "source": "manual", "updated_at": "2026-09-01T00:00:00Z" },
+        { "name": "first_pass_rate", "target": 0.7, "current": null, "unit": "ratio", "source": "ledger:report.first_pass_rate", "task_class": "feature" }
+      ],
+      "constraints": ["no autonomous merge", "spend under 20 USD per week on agents"],
+      "task_classes": ["feature", "bugfix", "growth-experiment"]
+    }
+  ]
+}

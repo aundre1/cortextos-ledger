@@ -97,8 +97,11 @@ export function register(registry) {
         escaped,
         minutes,
         note: flags.note,
+        lesson: flags.lesson,
+        appliesTo: flags['applies-to'],
       });
-      return { code: 0, stdout: result.intervention.id };
+      const stdout = result.lesson ? `${result.intervention.id}\nlesson: ${result.lesson.id}` : result.intervention.id;
+      return { code: 0, stdout };
     },
   });
 

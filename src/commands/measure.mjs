@@ -37,6 +37,7 @@ export function register(registry) {
         since: flags.since,
         guards: !!flags.guards,
         reviewers: !!flags.reviewers,
+        loop: !!flags.loop,
       });
       if (flags.json) return { code: 0, stdout: JSON.stringify(result) };
 
@@ -58,6 +59,13 @@ export function register(registry) {
       if (result.guard_firings) {
         lines.push('guard firings:');
         for (const g of result.guard_firings) lines.push(`  ${g.reason}: ${g.count}`);
+      }
+      if (result.loop) {
+        lines.push(`loop: proposal spend $${result.loop.proposal_spend_usd.toFixed(2)}`);
+        for (const a of result.loop.agents) {
+          const actions = Object.entries(a.actions).map(([k, v]) => `${k}=${v}`).join(' ');
+          lines.push(`  ${a.agent}: ${a.ticks} tick(s)  $${a.cost_usd.toFixed(2)}  ${actions}`);
+        }
       }
       return { code: 0, stdout: lines.join('\n') };
     },

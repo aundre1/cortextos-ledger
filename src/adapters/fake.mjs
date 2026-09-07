@@ -12,6 +12,12 @@
 //     exitCode: 0,              // exit.txt contents and the returned exitCode
 //     elapsedMs: 0,             // elapsed_ms.txt contents
 //     sessionId, tokensIn, tokensOut, costUsd, requests, toolCalls, summary
+//     stdout_json: {...}      // docs/autonomy.md: when present, this object
+//                              // (not `out`) becomes out.txt's only content,
+//                              // JSON stringified, and is returned as
+//                              // result.text - the loop's propose/review
+//                              // steps read the model's JSON output this way
+//                              // regardless of adapter.
 //   }
 //
 // The fixture comes from opts.fixture directly, or - when opts.fixture is
@@ -54,7 +60,8 @@ export async function run(opts) {
     opts.onEvent?.(event);
   }
 
-  writeFileSync(join(outDir, 'out.txt'), fixture.out ?? '');
+  const outText = fixture.stdout_json !== undefined ? JSON.stringify(fixture.stdout_json) : fixture.out ?? '';
+  writeFileSync(join(outDir, 'out.txt'), outText);
   writeFileSync(join(outDir, 'exit.txt'), String(exitCode));
   writeFileSync(join(outDir, 'elapsed_ms.txt'), String(elapsedMs));
   writeFileSync(join(outDir, 'done.marker'), '');
@@ -81,5 +88,6 @@ export async function run(opts) {
     requests: fixture.requests ?? 0,
     toolCalls: fixture.toolCalls ?? 0,
     summary: fixture.summary ?? '',
+    text: outText,
   };
 }

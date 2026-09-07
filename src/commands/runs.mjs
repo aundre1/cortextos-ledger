@@ -40,6 +40,7 @@ import {
 import { getAdapter } from '../adapters/index.mjs';
 import { launchDetached } from '../adapters/spawn.mjs';
 import { watch as watchRun } from '../guards/watchdog.mjs';
+import { activeFor } from '../policy.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI_PATH = join(HERE, '..', '..', 'bin', 'cortexctl.mjs');
@@ -64,9 +65,15 @@ function missing(flags, required) {
   return required.filter((name) => flags[name] === undefined);
 }
 
-/** Resolve adapter/provider/model for an agent: CLI flags, then config.agents[agent], then fallbacks. */
-function resolveAgentDefaults(config, agentName, flags) {
-  const agentConfig = config.agents?.[agentName] ?? {};
+/**
+ * Resolve adapter/provider/model for an agent: CLI flags, then the active
+ * routing policy for the task's class (docs/autonomy.md "Policy proposals":
+ * "run:start consults the active policy for the task's class before falling
+ * back to config.agents"), then config.agents[agent], then fallbacks.
+ */
+function resolveAgentDefaults(db, config, taskClass, agentName, flags) {
+  const policyOverrides = activeFor(db, taskClass)?.overrides ?? {};
+  const agentConfig = { ...(config.agents?.[agentName] ?? {}), ...(policyOverrides[agentName] ?? {}) };
   return {
     adapterName: flags.adapter ?? agentConfig.adapter ?? 'fake',
     provider: flags.provider ?? agentConfig.provider ?? 'fake',
@@ -116,7 +123,7 @@ async function doRunStart({ db, config, flags, err }) {
   }
 
   const agent = flags.agent;
-  const { adapterName, provider, model } = resolveAgentDefaults(config, agent, flags);
+  const { adapterName, provider, model } = resolveAgentDefaults(db, config, task.task_class, agent, flags);
   if (!model) {
     return {
       result: fail(

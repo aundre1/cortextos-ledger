@@ -59,11 +59,12 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
     '000-base',
     '001-v01-tables',
     '002-v01-columns',
+    '003-v02-autonomy',
   ]);
 
   const applied = await migrate(db);
-  assert.deepEqual(applied, ['000-base', '001-v01-tables', '002-v01-columns']);
-  assert.equal(schemaVersion(db), '002-v01-columns');
+  assert.deepEqual(applied, ['000-base', '001-v01-tables', '002-v01-columns', '003-v02-autonomy']);
+  assert.equal(schemaVersion(db), '003-v02-autonomy');
   assert.deepEqual(pendingMigrations(db), []);
 
   const tableNames = db
@@ -83,6 +84,11 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
     'human_interventions',
     'usage_snapshots',
     'schema_migrations',
+    'proposals',
+    'proposal_reviews',
+    'lessons',
+    'policy',
+    'loop_ticks',
   ]) {
     assert.ok(tableNames.includes(expected), `expected table ${expected}`);
   }
@@ -96,10 +102,10 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
   // Running migrate again is a no-op: nothing pending, no error, same version.
   const secondApplied = await migrate(db);
   assert.deepEqual(secondApplied, []);
-  assert.equal(schemaVersion(db), '002-v01-columns');
+  assert.equal(schemaVersion(db), '003-v02-autonomy');
 
   const migrationRows = db.prepare('SELECT version FROM schema_migrations').all();
-  assert.equal(migrationRows.length, 3);
+  assert.equal(migrationRows.length, 4);
 
   db.close();
 });

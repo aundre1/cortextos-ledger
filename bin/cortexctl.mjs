@@ -44,6 +44,9 @@ const BOOLEAN_FLAGS = new Set([
   'all',
   'guards',
   'reviewers',
+  'once',
+  'force',
+  'loop',
 ]);
 
 /** argv -> { command, args, flags }. --flag value and --boolean flags may appear anywhere. */

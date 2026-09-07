@@ -77,3 +77,29 @@ Global flags: `--config <path>`, `--db <path>` (overrides config), `--json` (mac
 5. For `--all`: every `running` run older than `stall_s` with no recent event, every `input_required` task, every quota window at or above 90 percent.
 
 Probable cause is chosen by rule: quota exhausted and last event is a model call → `quota`; process dead, no `done.marker`, no `exit.txt` → `killed externally or machine slept`; last event is a tool call with no result → `tool hang`; elapsed past the wall clock with no escalation → `watchdog missing`. Output ends with the exact `cortexctl` command that resolves the state when one exists.
+
+## Autonomy (docs/autonomy.md, default off)
+
+Every command below is a no-op or refuses outright unless `config.autonomy.enabled`
+is `true` (default `false`); `loop` refuses with exit 6 while it is off. None of
+these merge anything on their own - `proposal:approve` and `policy:apply` are
+the only two that change what runs, and both require a human `--by`.
+
+| Command | Effect |
+|---|---|
+| `goals:show [--business <id>] [--json]` | Print the goals contract with ledger sourced metrics filled and a gap per metric |
+| `goals:set --business <id> --metric <name> --current <n> [--by <who>]` | Update a manual metric's current value, recording who did it |
+| `propose --author <a> --business <id> --kind task\|policy\|tooling\|experiment --title <t> --rationale <text\|file> --impact <text> [--metric <name>] [--usd <n>] [--hours <n>] [--class <c>]` | Author a proposal |
+| `proposal:review --id <p> --reviewer <a> --verdict support\|oppose\|revise [--note ...] [--confidence <0-1>]` | Review a proposal (never your own; exit 6 on self-review) |
+| `proposal:list [--status <s>] [--business <id>] [--json]` | List proposals |
+| `proposal:approve --id <p> --by <who> [--note ...] [--force]` | Human approval: converts an eligible proposal to a task |
+| `proposal:reject --id <p> --by <who> --note ...` | Human refusal of a proposal |
+| `lesson:add --source adjudication\|retro\|human --lesson <text> [--task <id>] [--class <c>] [--applies-to builder\|reviewer\|architect\|all] [--evidence <text>] [--confidence <0-1>]` | Add a lesson, injected into packets/briefs for its task class and actor |
+| `lesson:list [--class <c>] [--applies-to <a>] [--status <s>] [--json]` | List active/retired lessons |
+| `lesson:retire --id <l> --reason ...` | Retire a lesson so it stops being injected |
+| `adjudicate --task <id> --real <n> --noise <n> [--escaped <n>] [--minutes <m>] [--note ...] [--lesson <text>] [--applies-to <a>]` | Human adjudication; `--lesson` drafts a lesson in the same call |
+| `retro [--since <iso>] [--business <id>] [--out <dir>] [--json]` | Read the ledger for every docs/autonomy.md pattern, draft lessons/proposals without duplicating an open one, write `retro.md`/`retro.json` |
+| `policy:apply --id <po> --by <who> [--overrides <json\|file>]` | Apply a policy proposal as `config.agents` overrides for its task class; refuses under 20 supporting runs (exit 6) |
+| `policy:revert --id <po>` | Deactivate a routing policy |
+| `policy:list [--class <c>] [--active <true\|false>] [--json]` | List routing policies |
+| `loop --agent <a> [--once] [--max-tasks <n>] [--max-usd <n>] [--business <id>] [--adapter <x>] [--json]` | One bounded autonomous action per tick: an assigned task's next action, an auto approve, a drafted proposal, or a proposal review; always records a `loop_ticks` row |

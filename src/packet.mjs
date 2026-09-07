@@ -18,6 +18,7 @@ import {
   insertArtifact,
   insertMessage,
 } from './ledger.mjs';
+import { selectForPacket } from './lessons.mjs';
 
 const OPEN_STATUSES = ['submitted', 'working', 'input_required'];
 const TERMINAL_STATUSES = ['completed', 'canceled', 'failed', 'rejected'];
@@ -247,6 +248,11 @@ function renderTaskMarkdown(p) {
   lines.push(`next action (${p.next_action.actor}): ${p.next_action.action}`);
   if (p.next_action.command) lines.push(p.next_action.command);
   lines.push('');
+  if (p.lessons && p.lessons.length) {
+    lines.push('Lessons');
+    for (const l of p.lessons) lines.push(`  [${l.applies_to}] ${l.lesson} (confidence ${l.confidence})`);
+    lines.push('');
+  }
   if (p.latest_verdict) {
     lines.push(
       `latest verdict: ${p.latest_verdict.decision}  (${p.latest_verdict.findings_real ?? '?'} real / ${p.latest_verdict.findings_total} total)`
@@ -286,6 +292,20 @@ function renderBoardMarkdown(p) {
   }
   if (!p.tasks.length) lines.push('no open tasks');
   return lines.join('\n');
+}
+
+/**
+ * Which lessons `applies_to` role best matches a task's next agent action
+ * (docs/autonomy.md "Injection": lessons target builder/reviewer/architect/
+ * all, but next_action's actor is the coarser agent/human/system/none).
+ * 'architect' is the fallback for anything that is not clearly a builder or
+ * reviewer step - a human resolving an escalation, or a terminal task, is
+ * closest in spirit to the architect's envelope-only view.
+ */
+function lessonActorForTask(nextAction) {
+  if (nextAction.actor !== 'agent') return 'architect';
+  if (nextAction.action.includes('reviewer')) return 'reviewer';
+  return 'builder';
 }
 
 function boardCompare(a, b) {
@@ -334,6 +354,7 @@ export function buildTaskPacket(db, config, taskId, { maxBytes = 8000, now = new
     .filter((e) => !e.resolved_at)
     .map((e) => ({ reason: e.reason, severity: e.severity, detail: e.detail }));
   const allMessages = rawMessagesForTask(db, taskId, 50); // newest first, generous cap
+  const lessons = selectForPacket(db, config, { taskClass: task.task_class, actor: lessonActorForTask(nextAction) });
 
   let messagesLimit = Math.min(allMessages.length, 10);
   let artifactsLimit = allArtifacts.length;
@@ -366,6 +387,7 @@ export function buildTaskPacket(db, config, taskId, { maxBytes = 8000, now = new
       artifacts,
       open_escalations: openEscalations,
       recent_messages: messages,
+      lessons: lessons.map((l) => ({ id: l.id, task_class: l.task_class, applies_to: l.applies_to, lesson: l.lesson, confidence: l.confidence })),
       next_action: nextAction,
     };
     return jsonObj;

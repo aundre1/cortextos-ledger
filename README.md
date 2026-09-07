@@ -109,6 +109,17 @@ side by side and refuses to name a winner when either arm is unadjudicated.
 and says `n < 20, not routing grade` under that threshold; nothing reads the
 ledger back to change routing before then. See `docs/measurement.md`.
 
+## Autonomy
+
+Off by default (`config.autonomy.enabled: false`). Turned on, agents read a
+private goals file (`config.goals`, see `examples/cortex-goals.example.json`)
+and a `loop` heartbeat lets them propose work, review each other's proposals,
+and learn from adjudications and retros - one dial in config, from fully
+manual up to a small, bounded amount of autonomous building, and never
+autonomous merges at any setting. See `docs/autonomy.md` for the exact dial
+fields and thresholds, and `examples/autonomy-loop.md` for a worked walkthrough
+of turning it up one notch at a time.
+
 ## Requirements
 
 - Node 22.5 or later (the ledger uses `node:sqlite`; zero npm dependencies).
@@ -136,6 +147,7 @@ v0.1. Windows is the first class target; CI runs on both `windows-latest` and
 | `docs/measurement.md` | Control versus tri, `compare`, `report`, `export` |
 | `docs/cli.md` | Every `cortexctl` command and flag |
 | `docs/community.md` | Packaging the kit as a CortextOS skill and agent templates |
+| `docs/autonomy.md` | The goals contract, proposals, lessons, retro, policy, and the heartbeat loop dial |
 
 ## License
 

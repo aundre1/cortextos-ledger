@@ -195,7 +195,7 @@ function tasksForReport(db, { taskClass, since }) {
  * than 20 adjudicated runs is marked 'n < 20, not routing grade' rather than
  * silently reported as if it were reliable.
  */
-export function report(db, config, { taskClass, since, guards, reviewers } = {}) {
+export function report(db, config, { taskClass, since, guards, reviewers, loop } = {}) {
   const tasks = tasksForReport(db, { taskClass, since });
   const byClass = new Map();
   for (const t of tasks) {
@@ -222,6 +222,12 @@ export function report(db, config, { taskClass, since, guards, reviewers } = {})
       first_pass_rate: { tri: firstPassRate('tri'), control: firstPassRate('control') },
       mean_cost_usd: { tri: mean(byArm('tri').map((b) => b.total_cost_usd)), control: mean(byArm('control').map((b) => b.total_cost_usd)) },
       mean_elapsed_s: { tri: mean(byArm('tri').map((b) => b.elapsed_s)), control: mean(byArm('control').map((b) => b.elapsed_s)) },
+      // Sourced by the goals contract (docs/autonomy.md "Goals contract",
+      // `ledger:report.cost_per_task` / `ledger:report.escaped_defects`):
+      // both arms pooled, since a goal metric asks "what does this class
+      // cost/lose" regardless of which arm ran it.
+      cost_per_task: mean(bundles.map((b) => b.total_cost_usd)),
+      escaped_defects: mean(bundles.map((b) => b.defects_escaped)),
     };
   });
 
@@ -253,6 +259,30 @@ export function report(db, config, { taskClass, since, guards, reviewers } = {})
   if (guards) {
     const rows = db.prepare('SELECT reason, COUNT(*) AS c FROM escalations GROUP BY reason ORDER BY reason').all();
     result.guard_firings = rows.map((r) => ({ reason: r.reason, count: r.c }));
+  }
+
+  if (loop) {
+    // Autonomous activity per agent (docs/autonomy.md "The loop"): tick
+    // counts, an actions histogram, and proposal/review spend (cost_usage
+    // rows against every `_proposals` synthetic task, since that is where
+    // the loop records what a proposal or review model call cost).
+    const tickRows = db.prepare('SELECT agent, action, cost_usd FROM loop_ticks').all();
+    const byAgent = new Map();
+    for (const row of tickRows) {
+      const acc = byAgent.get(row.agent) ?? { agent: row.agent, ticks: 0, actions: {}, cost_usd: 0 };
+      acc.ticks += 1;
+      acc.actions[row.action] = (acc.actions[row.action] ?? 0) + 1;
+      acc.cost_usd += row.cost_usd ?? 0;
+      byAgent.set(row.agent, acc);
+    }
+    const proposalSpend = db
+      .prepare(
+        `SELECT COALESCE(SUM(cu.cost_usd), 0) AS total
+         FROM cost_usage cu JOIN tasks t ON t.id = cu.task_id
+         WHERE t.task_class = '_proposals'`
+      )
+      .get().total;
+    result.loop = { agents: [...byAgent.values()], proposal_spend_usd: proposalSpend };
   }
 
   return result;

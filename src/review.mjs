@@ -15,6 +15,7 @@ import {
   insertIntervention,
 } from './ledger.mjs';
 import { escalate } from './limits.mjs';
+import { selectForPacket, add as addLesson } from './lessons.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
@@ -103,6 +104,11 @@ export function buildReviewerBrief(db, config, { taskId, reviewer, issueFile }) 
     issueText = briefMsg ? briefMsg.body : '(no brief message found in the ledger and no --issue-file given)';
   }
   sections.push(`# Issue\n\n${issueText.trim()}`);
+
+  const lessons = selectForPacket(db, config, { taskClass: task.task_class, actor: 'reviewer' });
+  if (lessons.length) {
+    sections.push(`# Lessons\n\n${lessons.map((l) => `- ${l.lesson} (confidence ${l.confidence})`).join('\n')}`);
+  }
 
   sections.push(`# Base\n\ncommit: ${task.base_commit ?? '-'}\nbranch: ${task.branch ?? '-'}`);
 
@@ -334,7 +340,7 @@ export function storeVerdict(db, config, { taskId, runId, reviewer, provider, mo
  * on the task, because the control arm has none - "unadjudicated" there is
  * instead defined by the absence of this human_interventions row.
  */
-export function adjudicate(db, { taskId, real, noise, escaped, minutes, note }) {
+export function adjudicate(db, { taskId, real, noise, escaped, minutes, note, lesson, appliesTo }) {
   const verdicts = listVerdicts(db, taskId);
   const latest = verdicts.length ? verdicts[verdicts.length - 1] : null;
 
@@ -357,7 +363,21 @@ export function adjudicate(db, { taskId, real, noise, escaped, minutes, note }) 
     detail: note ?? null,
   });
 
-  return { verdictId: latest ? latest.id : null, intervention };
+  let lessonRow = null;
+  if (lesson) {
+    const task = getTask(db, taskId);
+    lessonRow = addLesson(db, {
+      source: 'adjudication',
+      taskId,
+      taskClass: task ? task.task_class : null,
+      appliesTo: appliesTo ?? 'all',
+      lesson,
+      evidence: `adjudicate task=${taskId} real=${real ?? '-'} noise=${noise ?? '-'}`,
+      confidence: 0.5,
+    });
+  }
+
+  return { verdictId: latest ? latest.id : null, intervention, lesson: lessonRow };
 }
 
 // ---------------------------------------------------------------------------

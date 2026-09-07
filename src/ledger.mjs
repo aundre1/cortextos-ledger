@@ -497,3 +497,303 @@ export function listQuota(db, { provider } = {}) {
   }
   return db.prepare('SELECT * FROM provider_quota ORDER BY provider, model, window_kind').all();
 }
+
+// ---------------------------------------------------------------------------
+// autonomy layer (docs/autonomy.md): proposals, proposal_reviews, lessons,
+// policy, loop_ticks. Same style as every table above: insert/list/get/
+// update-status helpers, plain objects in and out.
+// ---------------------------------------------------------------------------
+
+// -- proposals ---------------------------------------------------------------
+
+export function insertProposal(db, fields) {
+  const row = {
+    id: newId('p'),
+    created_at: nowIso(),
+    author: fields.author,
+    business_id: fields.business_id,
+    goal_metric: nullish(fields.goal_metric),
+    kind: fields.kind,
+    title: fields.title,
+    rationale: nullish(fields.rationale),
+    expected_impact: nullish(fields.expected_impact),
+    estimated_usd: nullish(fields.estimated_usd),
+    estimated_hours: nullish(fields.estimated_hours),
+    task_class: nullish(fields.task_class),
+    status: fields.status ?? 'proposed',
+    converted_task_id: nullish(fields.converted_task_id),
+    decided_by: nullish(fields.decided_by),
+    decided_at: nullish(fields.decided_at),
+    decision_note: nullish(fields.decision_note),
+  };
+  db.prepare(
+    `INSERT INTO proposals
+       (id, created_at, author, business_id, goal_metric, kind, title, rationale, expected_impact,
+        estimated_usd, estimated_hours, task_class, status, converted_task_id, decided_by, decided_at, decision_note)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(
+    row.id, row.created_at, row.author, row.business_id, row.goal_metric, row.kind, row.title,
+    row.rationale, row.expected_impact, row.estimated_usd, row.estimated_hours, row.task_class,
+    row.status, row.converted_task_id, row.decided_by, row.decided_at, row.decision_note
+  );
+  return row;
+}
+
+export function getProposal(db, id) {
+  return db.prepare('SELECT * FROM proposals WHERE id = ?').get(id) ?? null;
+}
+
+/** listProposals({ status, businessId, author, kind }): every filter optional. */
+export function listProposals(db, { status, businessId, author, kind } = {}) {
+  const clauses = [];
+  const params = [];
+  if (status) {
+    clauses.push('status = ?');
+    params.push(status);
+  }
+  if (businessId) {
+    clauses.push('business_id = ?');
+    params.push(businessId);
+  }
+  if (author) {
+    clauses.push('author = ?');
+    params.push(author);
+  }
+  if (kind) {
+    clauses.push('kind = ?');
+    params.push(kind);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  return db.prepare(`SELECT * FROM proposals ${where} ORDER BY created_at`).all(...params);
+}
+
+/** Update a proposal's status, plus any decision fields given (converted_task_id, decided_by, decided_at, decision_note). */
+export function setProposalStatus(db, id, status, extra = {}) {
+  const current = getProposal(db, id);
+  if (!current) return null;
+  const merged = {
+    converted_task_id: extra.converted_task_id !== undefined ? extra.converted_task_id : current.converted_task_id,
+    decided_by: extra.decided_by !== undefined ? extra.decided_by : current.decided_by,
+    decided_at: extra.decided_at !== undefined ? extra.decided_at : current.decided_at,
+    decision_note: extra.decision_note !== undefined ? extra.decision_note : current.decision_note,
+  };
+  db.prepare(
+    'UPDATE proposals SET status = ?, converted_task_id = ?, decided_by = ?, decided_at = ?, decision_note = ? WHERE id = ?'
+  ).run(status, merged.converted_task_id, merged.decided_by, merged.decided_at, merged.decision_note, id);
+  return getProposal(db, id);
+}
+
+// -- proposal_reviews ---------------------------------------------------------
+
+export function insertProposalReview(db, fields) {
+  const row = {
+    id: newId('pr'),
+    proposal_id: fields.proposal_id,
+    created_at: nowIso(),
+    reviewer: fields.reviewer,
+    verdict: fields.verdict,
+    note: nullish(fields.note),
+    confidence: nullish(fields.confidence),
+  };
+  db.prepare(
+    `INSERT INTO proposal_reviews (id, proposal_id, created_at, reviewer, verdict, note, confidence)
+     VALUES (?,?,?,?,?,?,?)`
+  ).run(row.id, row.proposal_id, row.created_at, row.reviewer, row.verdict, row.note, row.confidence);
+  return row;
+}
+
+/** listProposalReviews({ proposalId, reviewer }): both filters optional. */
+export function listProposalReviews(db, { proposalId, reviewer } = {}) {
+  const clauses = [];
+  const params = [];
+  if (proposalId) {
+    clauses.push('proposal_id = ?');
+    params.push(proposalId);
+  }
+  if (reviewer) {
+    clauses.push('reviewer = ?');
+    params.push(reviewer);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  return db.prepare(`SELECT * FROM proposal_reviews ${where} ORDER BY created_at`).all(...params);
+}
+
+// -- lessons -------------------------------------------------------------
+
+export function insertLesson(db, fields) {
+  const row = {
+    id: newId('l'),
+    created_at: nowIso(),
+    source: fields.source,
+    task_id: nullish(fields.task_id),
+    business_id: nullish(fields.business_id),
+    task_class: nullish(fields.task_class),
+    applies_to: fields.applies_to ?? 'all',
+    lesson: fields.lesson,
+    evidence: nullish(fields.evidence),
+    confidence: fields.confidence ?? 0.5,
+    status: fields.status ?? 'active',
+    retired_reason: nullish(fields.retired_reason),
+  };
+  db.prepare(
+    `INSERT INTO lessons
+       (id, created_at, source, task_id, business_id, task_class, applies_to, lesson, evidence,
+        confidence, status, retired_reason)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(
+    row.id, row.created_at, row.source, row.task_id, row.business_id, row.task_class, row.applies_to,
+    row.lesson, row.evidence, row.confidence, row.status, row.retired_reason
+  );
+  return row;
+}
+
+export function getLesson(db, id) {
+  return db.prepare('SELECT * FROM lessons WHERE id = ?').get(id) ?? null;
+}
+
+/** listLessons({ taskClass, appliesTo, status }): every filter optional. */
+export function listLessons(db, { taskClass, appliesTo, status } = {}) {
+  const clauses = [];
+  const params = [];
+  if (taskClass !== undefined) {
+    clauses.push('task_class IS ?');
+    params.push(taskClass);
+  }
+  if (appliesTo) {
+    clauses.push('applies_to = ?');
+    params.push(appliesTo);
+  }
+  if (status) {
+    clauses.push('status = ?');
+    params.push(status);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  return db.prepare(`SELECT * FROM lessons ${where} ORDER BY created_at`).all(...params);
+}
+
+export function setLessonStatus(db, id, status, { retiredReason } = {}) {
+  db.prepare('UPDATE lessons SET status = ?, retired_reason = COALESCE(?, retired_reason) WHERE id = ?').run(
+    status,
+    retiredReason ?? null,
+    id
+  );
+  return getLesson(db, id);
+}
+
+// -- policy ----------------------------------------------------------------
+
+export function insertPolicy(db, fields) {
+  const row = {
+    id: newId('po'),
+    applied_at: fields.applied_at ?? nowIso(),
+    proposal_id: nullish(fields.proposal_id),
+    task_class: fields.task_class,
+    agent_overrides_json: fields.agent_overrides_json,
+    applied_by: fields.applied_by,
+    active: fields.active === 0 || fields.active === false ? 0 : 1,
+  };
+  db.prepare(
+    `INSERT INTO policy (id, applied_at, proposal_id, task_class, agent_overrides_json, applied_by, active)
+     VALUES (?,?,?,?,?,?,?)`
+  ).run(row.id, row.applied_at, row.proposal_id, row.task_class, row.agent_overrides_json, row.applied_by, row.active);
+  return row;
+}
+
+export function getPolicy(db, id) {
+  return db.prepare('SELECT * FROM policy WHERE id = ?').get(id) ?? null;
+}
+
+/** listPolicy({ taskClass, active }): both filters optional; active is 0/1. */
+export function listPolicy(db, { taskClass, active } = {}) {
+  const clauses = [];
+  const params = [];
+  if (taskClass) {
+    clauses.push('task_class = ?');
+    params.push(taskClass);
+  }
+  if (active !== undefined) {
+    clauses.push('active = ?');
+    params.push(active ? 1 : 0);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  return db.prepare(`SELECT * FROM policy ${where} ORDER BY applied_at DESC`).all(...params);
+}
+
+export function setPolicyActive(db, id, active) {
+  db.prepare('UPDATE policy SET active = ? WHERE id = ?').run(active ? 1 : 0, id);
+  return getPolicy(db, id);
+}
+
+// -- loop_ticks --------------------------------------------------------------
+
+export function insertLoopTick(db, fields) {
+  const row = {
+    id: newId('lt'),
+    agent: fields.agent,
+    started_at: fields.started_at ?? nowIso(),
+    ended_at: fields.ended_at ?? nowIso(),
+    action: fields.action,
+    task_id: nullish(fields.task_id),
+    proposal_id: nullish(fields.proposal_id),
+    cost_usd: fields.cost_usd ?? 0,
+    note: nullish(fields.note),
+  };
+  db.prepare(
+    `INSERT INTO loop_ticks (id, agent, started_at, ended_at, action, task_id, proposal_id, cost_usd, note)
+     VALUES (?,?,?,?,?,?,?,?,?)`
+  ).run(row.id, row.agent, row.started_at, row.ended_at, row.action, row.task_id, row.proposal_id, row.cost_usd, row.note);
+  return row;
+}
+
+/** listLoopTicks({ agent }): filter optional; newest first. */
+export function listLoopTicks(db, { agent } = {}) {
+  const clauses = [];
+  const params = [];
+  if (agent) {
+    clauses.push('agent = ?');
+    params.push(agent);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  return db.prepare(`SELECT * FROM loop_ticks ${where} ORDER BY started_at DESC`).all(...params);
+}
+
+export function lastLoopTick(db, agent) {
+  return (
+    db
+      .prepare('SELECT * FROM loop_ticks WHERE agent = ? ORDER BY started_at DESC LIMIT 1')
+      .get(agent) ?? null
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic tasks (docs/autonomy.md): `_proposals` (proposal/review model
+// call cost) and `_goals` (human_interventions anchor for goals:set) are both
+// "a tasks row ... created on demand" per business, one per (business, name)
+// pair. Shared here so proposals.mjs and commands/goals.mjs do not each grow
+// their own copy.
+// ---------------------------------------------------------------------------
+
+/**
+ * Find or create the synthetic tasks row for (businessId, name) - e.g.
+ * name '_proposals' or '_goals'. repo is the business id (or 'ledger' when
+ * there is none), task_class is `name`, kind 'ops', arm 'control', status
+ * 'working'. Idempotent: a second call with the same (businessId, name)
+ * returns the existing row rather than inserting a duplicate.
+ */
+export function ensureSyntheticTask(db, { businessId, name, owner } = {}) {
+  const repo = businessId ?? 'ledger';
+  const existing = db
+    .prepare("SELECT * FROM tasks WHERE repo = ? AND task_class = ? AND kind = 'ops' ORDER BY created_at LIMIT 1")
+    .get(repo, name);
+  if (existing) return existing;
+  return insertTask(db, {
+    repo,
+    title: `synthetic task ${name} for ${repo}`,
+    task_class: name,
+    arm: 'control',
+    kind: 'ops',
+    owner: nullish(owner),
+    status: 'working',
+    notes: 'synthetic',
+  });
+}

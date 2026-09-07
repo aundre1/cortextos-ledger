@@ -5,7 +5,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { schemaVersion, pendingMigrations } from './db.mjs';
-import { getTask, listEscalations, countRuns, sumCost, listQuota } from './ledger.mjs';
+import { getTask, listEscalations, countRuns, sumCost, listQuota, lastLoopTick } from './ledger.mjs';
 import { rollQuota, windowEndsAt } from './quota.mjs';
 import { deriveNextAction, computeLimits } from './packet.mjs';
 import { redact } from './adapters/credential-boundary.mjs';
@@ -200,6 +200,26 @@ function diagnoseAll(db, config, now) {
       findings.push({
         level: 'warn',
         text: `quota ${q.provider} ${q.model ?? '*'} ${q.window_kind} at ${Math.round(Math.max(pctRequests, pctUsd) * 100)}% (resets ${windowEndsAt(q)})`,
+      });
+    }
+  }
+
+  // Autonomy (docs/autonomy.md "The loop"): every agent named in
+  // config.agents plus every agent that has ever ticked, so a stalled
+  // heartbeat (an agent in config.agents with no recent tick) is visible
+  // too, not only agents that happen to have ticked at least once.
+  const tickedAgents = db.prepare('SELECT DISTINCT agent FROM loop_ticks').all().map((r) => r.agent);
+  const configuredAgents = Object.keys(config.agents ?? {});
+  const agents = [...new Set([...configuredAgents, ...tickedAgents])].sort();
+  for (const agent of agents) {
+    const last = lastLoopTick(db, agent);
+    if (!last) {
+      findings.push({ level: 'info', text: `loop ${agent}: no tick recorded yet` });
+    } else {
+      const ageS = Math.round((now.getTime() - Date.parse(last.ended_at ?? last.started_at)) / 1000);
+      findings.push({
+        level: 'info',
+        text: `loop ${agent}: last tick ${last.action} ${ageS}s ago, cost $${(last.cost_usd ?? 0).toFixed(4)}`,
       });
     }
   }

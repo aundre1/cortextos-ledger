@@ -30,6 +30,24 @@ export const DEFAULTS = {
     },
     nvidia: { windows: [{ kind: 'minute', limit_requests: 40 }], public_only: true },
   },
+  // docs/autonomy.md "Goals contract": path to the private goals file. Never
+  // shipped populated - examples/cortex-goals.example.json is the template.
+  goals: './cortex-goals.json',
+  // docs/autonomy.md "The autonomy dial", verbatim.
+  autonomy: {
+    enabled: false,
+    propose: true,
+    review_proposals: true,
+    auto_approve_below_usd: 0,
+    auto_approve_kinds: ['task'],
+    min_reviews: 1,
+    max_open_proposals_per_agent: 3,
+    proposal_ttl_days: 14,
+    lessons_per_packet: 5,
+    default_arm: 'tri',
+    default_owner: 'founder',
+    interval_s: 900,
+  },
 };
 
 const LIMIT_KEYS = [
@@ -57,11 +75,13 @@ function readJsonFile(path) {
 
 function mergeConfig(defaults, override) {
   const merged = { ...defaults, ...override };
-  // `limits` is deep merged one level so a partial override does not drop
-  // the other default limits. Everything else (db, runs, test_patterns,
-  // providers) is replaced wholesale when the override supplies it, since
-  // the docs do not describe a per key merge for those.
+  // `limits` and `autonomy` are deep merged one level so a partial override
+  // does not drop the other default limits/dial settings. Everything else
+  // (db, runs, test_patterns, providers) is replaced wholesale when the
+  // override supplies it, since the docs do not describe a per key merge
+  // for those.
   merged.limits = { ...defaults.limits, ...(override.limits || {}) };
+  merged.autonomy = { ...defaults.autonomy, ...(override.autonomy || {}) };
   return merged;
 }
 
@@ -71,6 +91,39 @@ function validateLimits(limits) {
     if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
       throw new Error(`limits.${key} must be a positive number, got ${JSON.stringify(value)}`);
     }
+  }
+}
+
+const AUTONOMY_BOOLEAN_KEYS = ['enabled', 'propose', 'review_proposals'];
+const AUTONOMY_NONNEGATIVE_NUMBER_KEYS = [
+  'auto_approve_below_usd',
+  'min_reviews',
+  'max_open_proposals_per_agent',
+  'proposal_ttl_days',
+  'lessons_per_packet',
+  'interval_s',
+];
+
+function validateAutonomy(autonomy) {
+  for (const key of AUTONOMY_BOOLEAN_KEYS) {
+    if (typeof autonomy[key] !== 'boolean') {
+      throw new Error(`autonomy.${key} must be a boolean, got ${JSON.stringify(autonomy[key])}`);
+    }
+  }
+  for (const key of AUTONOMY_NONNEGATIVE_NUMBER_KEYS) {
+    const value = autonomy[key];
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      throw new Error(`autonomy.${key} must be a non-negative number, got ${JSON.stringify(value)}`);
+    }
+  }
+  if (!Array.isArray(autonomy.auto_approve_kinds) || !autonomy.auto_approve_kinds.every((k) => typeof k === 'string')) {
+    throw new Error('autonomy.auto_approve_kinds must be an array of strings');
+  }
+  if (typeof autonomy.default_arm !== 'string' || !['tri', 'control'].includes(autonomy.default_arm)) {
+    throw new Error(`autonomy.default_arm must be 'tri' or 'control', got ${JSON.stringify(autonomy.default_arm)}`);
+  }
+  if (typeof autonomy.default_owner !== 'string' || autonomy.default_owner.length === 0) {
+    throw new Error('autonomy.default_owner must be a non-empty string');
   }
 }
 
@@ -105,6 +158,7 @@ export function loadConfig({ configPath, dbOverride, cwd = process.cwd() } = {})
 
   merged.db = isAbsolute(merged.db) ? merged.db : resolve(baseDir, merged.db);
   merged.runs = isAbsolute(merged.runs) ? merged.runs : resolve(baseDir, merged.runs);
+  merged.goals = isAbsolute(merged.goals) ? merged.goals : resolve(baseDir, merged.goals);
   merged.configPath = configFilePath;
 
   if (dbOverride) {
@@ -112,5 +166,6 @@ export function loadConfig({ configPath, dbOverride, cwd = process.cwd() } = {})
   }
 
   validateLimits(merged.limits);
+  validateAutonomy(merged.autonomy);
   return merged;
 }
