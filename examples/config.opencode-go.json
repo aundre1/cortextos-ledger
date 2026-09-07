@@ -1,0 +1,60 @@
+{
+  "db": "./.cortex/ledger.db",
+  "runs": "./.cortex/runs",
+  "limits": {
+    "builder_attempts_max": 3,
+    "challenge_cycles_max": 1,
+    "wallclock_s": 5400,
+    "spend_usd": 1.5,
+    "files_touched_max": 10,
+    "stall_s": 900
+  },
+  "providers": {
+    "opencode-go": {
+      "windows": [
+        { "kind": "5h", "limit_usd": 12 },
+        { "kind": "week", "limit_usd": 30 },
+        { "kind": "month", "limit_usd": 60 }
+      ],
+      "_windows_note": "USD-equivalent ceilings for the OpenCode Go subscription (builder and solo only, the two agents below on adapter opencode/provider opencode-go). This block documents the intended shape (docs/architecture.md 'Configuration'); src/limits.mjs's checkQuota reads provider_quota rows, not this JSON block, to enforce anything. Run the three quota:set commands in docs/measurement.md's 'OpenCode Go as the builder lane' section once per ledger so these numbers actually become enforced provider_quota rows."
+    },
+    "google": {
+      "_note": "reviewer's lab: chosen to differ from builder/solo's OpenCode Go lane and from reviewer_b's lab (docs/review-protocol.md 'Roles', provider rule). No window is declared here -- this provider is not USD-equivalent subscription metered the way opencode-go is; add quota:set windows if the operator's own account has a hard cap worth enforcing."
+    },
+    "openai": {
+      "_note": "reviewer_b's lab (PR triage mode only, docs/review-protocol.md): a third lab, different again from builder/solo and from reviewer. No window declared here for the same reason as google above."
+    }
+  },
+  "agents": {
+    "builder": {
+      "adapter": "opencode",
+      "agent": "builder",
+      "provider": "opencode-go",
+      "model": "",
+      "_model_note": "Placeholder. The operator sets this to a model available on their OpenCode Go plan. Must not contain 'anthropic' or 'claude' (src/adapters/opencode.mjs refuses those with exit 1 -- Anthropic subscription OAuth may not be used inside a third party harness)."
+    },
+    "solo": {
+      "adapter": "opencode",
+      "agent": "solo",
+      "provider": "opencode-go",
+      "model": "",
+      "_model_note": "Placeholder, and it must be set to the exact same value as builder.model above. solo is the control arm's build agent standing in for 'no reviewer' (docs/measurement.md: 'agent solo, same provider and model as the builder, its own agent definition'), not a different model -- changing the model here would confound the comparison compare is meant to make."
+    },
+    "reviewer": {
+      "adapter": "opencode",
+      "agent": "reviewer",
+      "provider": "google",
+      "model": "",
+      "read_only": true,
+      "_model_note": "Placeholder. The operator sets this. It must be a different lab from builder/solo's OpenCode Go model, so the review is actually independent, not just a second call to the same model (same convention as community/agents/blind-reviewer/config.json's model placeholder). Reached through the operator's own Google credentials configured in OpenCode, separate from the OpenCode Go subscription."
+    },
+    "reviewer_b": {
+      "adapter": "codex",
+      "agent": null,
+      "provider": "openai",
+      "model": "",
+      "read_only": true,
+      "_model_note": "Placeholder. PR triage mode's second blind reviewer (docs/review-protocol.md). Must be a third lab, different from both builder/solo's OpenCode Go model and reviewer's Google model. Runs through the Codex CLI against the operator's own OpenAI account."
+    }
+  }
+}

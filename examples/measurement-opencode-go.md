@@ -1,0 +1,161 @@
+# Example: measuring PR triage with OpenCode Go as the builder lane
+
+This is the recipe for the 20-task PR-triage measurement run using
+`examples/config.opencode-go.json`: builder and solo on an OpenCode Go
+subscription, `reviewer` and `reviewer_b` on two other labs so the review
+stays independent (`docs/review-protocol.md` "Roles"). It extends
+`examples/pr-triage.md` (read that first for what each command does) with
+the control arm and the OpenCode Go quota setup this config needs.
+
+Every command below exists in `bin/cortexctl.mjs`; nothing here is invented.
+`--config examples/config.opencode-go.json` is shown explicitly throughout --
+in practice, copy the file to `cortex-ledger.json` in the repo root (with
+real model strings filled in, see below) and drop the flag, or point
+`CORTEX_LEDGER_CONFIG` at it.
+
+## 0. Fill in the placeholders, once
+
+`examples/config.opencode-go.json` ships with every `model` field blank plus
+a `_model_note` explaining what belongs there (the same convention
+`community/agents/blind-reviewer/config.json` uses). Before the first run,
+set:
+
+- `agents.builder.model` and `agents.solo.model` to the exact same OpenCode
+  Go model string -- solo is the control arm's build agent standing in for
+  "no reviewer", not a different model (`docs/measurement.md`).
+- `agents.reviewer.model` to a Google model reached through the operator's
+  own OpenCode configuration.
+- `agents.reviewer_b.model` to an OpenAI model, for the Codex adapter.
+
+`agents.builder.model`/`agents.solo.model` must not contain `anthropic` or
+`claude` -- `src/adapters/opencode.mjs` refuses those with exit 1.
+
+## 1. Create the ledger and the OpenCode Go quota windows, once
+
+```bash
+cortexctl init --config examples/config.opencode-go.json
+
+cortexctl quota:set --config examples/config.opencode-go.json \
+  --provider opencode-go --window 5h    --limit-usd 12
+cortexctl quota:set --config examples/config.opencode-go.json \
+  --provider opencode-go --window week  --limit-usd 30
+cortexctl quota:set --config examples/config.opencode-go.json \
+  --provider opencode-go --window month --limit-usd 60
+```
+
+The config file's `providers.opencode-go.windows` block documents this same
+shape, but declaring it in JSON does not by itself enforce anything --
+`run:start`'s quota gate and `ingest` read `provider_quota` rows from the
+database, and only `quota:set` creates those. Skipping this step means the
+measurement can spend past the subscription's own ceiling without the kit
+ever refusing a run.
+
+Check headroom at any point, across all 20 tasks, with:
+
+```bash
+cortexctl quota:show --config examples/config.opencode-go.json
+```
+
+## 2. Per PR: open the control task, one reviewer, no builder
+
+PR triage never runs a builder (`docs/review-protocol.md` "PR triage mode");
+the control arm here isolates one variable -- a single independent reviewer
+-- against the tri arm's two. Repeat this section and the next once per
+measured PR (20 times for the full run).
+
+```bash
+control_task=$(cortexctl task:new --config examples/config.opencode-go.json \
+  --repo owner/name --title "Triage PR #742" --class pr-triage \
+  --arm control --kind pr_review --pr 742)
+
+cortexctl review:brief --config examples/config.opencode-go.json \
+  --task "$control_task" --reviewer reviewer
+control_run=$(cortexctl run:launch --config examples/config.opencode-go.json \
+  --task "$control_task" --agent reviewer --prompt-file ./reviewer/brief.md)
+cortexctl watch --config examples/config.opencode-go.json --run "$control_run"
+
+cortexctl verdict --config examples/config.opencode-go.json \
+  --task "$control_task" --run "$control_run" --reviewer reviewer \
+  --provider google --model "$reviewer_model" \
+  --file ./reviewer/verdict.json
+```
+
+`$reviewer_model` is the value filled into `agents.reviewer.model` in step 0
+above -- `verdict` records the model that actually ran, so pass the real
+string here, not the config file's placeholder.
+
+## 3. Open the tri task, linked to the control task, two reviewers
+
+```bash
+tri_task=$(cortexctl task:new --config examples/config.opencode-go.json \
+  --repo owner/name --title "Triage PR #742" --class pr-triage \
+  --arm tri --kind pr_review --pr 742 --sibling "$control_task")
+
+cortexctl review:brief --config examples/config.opencode-go.json \
+  --task "$tri_task" --reviewer reviewer
+run_a=$(cortexctl run:launch --config examples/config.opencode-go.json \
+  --task "$tri_task" --agent reviewer --prompt-file ./reviewer/brief.md)
+cortexctl watch --config examples/config.opencode-go.json --run "$run_a"
+cortexctl verdict --config examples/config.opencode-go.json \
+  --task "$tri_task" --run "$run_a" --reviewer reviewer \
+  --provider google --model "$reviewer_model" \
+  --file ./reviewer/verdict.json
+
+cortexctl review:brief --config examples/config.opencode-go.json \
+  --task "$tri_task" --reviewer reviewer_b
+run_b=$(cortexctl run:launch --config examples/config.opencode-go.json \
+  --task "$tri_task" --agent reviewer_b --prompt-file ./reviewer_b/brief.md)
+cortexctl watch --config examples/config.opencode-go.json --run "$run_b"
+cortexctl verdict --config examples/config.opencode-go.json \
+  --task "$tri_task" --run "$run_b" --reviewer reviewer_b \
+  --provider openai --model "$reviewer_b_model" \
+  --file ./reviewer_b/verdict.json
+```
+
+`$reviewer_model`/`$reviewer_b_model` are the values filled into
+`agents.reviewer.model`/`agents.reviewer_b.model` in step 0.
+
+`reviewer` and `reviewer_b` must be different labs; this config wires them
+to `google` and `openai` so that picking the same provider for both, which
+would defeat the point, cannot happen by accident.
+
+## 4. A human adjudicates both tasks
+
+```bash
+cortexctl adjudicate --config examples/config.opencode-go.json \
+  --task "$control_task" --real 1 --noise 0 --minutes 5 \
+  --note "single reviewer found the real off-by-one"
+cortexctl adjudicate --config examples/config.opencode-go.json \
+  --task "$tri_task" --real 2 --noise 1 --minutes 10 \
+  --note "reviewer found the same off-by-one, reviewer_b also flagged a missing test; one style nit was noise"
+```
+
+## 5. Triage note and close
+
+```bash
+cortexctl triage:note --config examples/config.opencode-go.json --task "$tri_task"
+
+cortexctl task:close --config examples/config.opencode-go.json \
+  --task "$control_task" --outcome first_pass
+cortexctl task:close --config examples/config.opencode-go.json \
+  --task "$tri_task" --outcome first_pass
+```
+
+## 6. Compare, after all 20 pairs are adjudicated and closed
+
+```bash
+cortexctl compare --config examples/config.opencode-go.json --pr 742
+cortexctl report --config examples/config.opencode-go.json --class pr-triage --reviewers
+```
+
+`report` prints `n < 20, not routing grade` beside any class with fewer than
+20 adjudicated runs -- with exactly 20 measured pairs this is the first
+report worth reading past that caveat. Remember while reading it that
+`google` and `openai` costs are billed per token against the operator's own
+accounts while OpenCode Go's are a USD-equivalent share of a flat monthly
+subscription (`docs/measurement.md` "OpenCode Go as the builder lane") --
+compare cost multiples within a lane, not across them.
+
+`cortexctl export --config examples/config.opencode-go.json --format csv --out ./export --since <date>`
+produces the public datapoints once every pair is adjudicated
+(`docs/measurement.md` "Public datapoints").

@@ -76,3 +76,13 @@ Deterministic adapter for tests. Reads a fixture describing the events to emit, 
 ```
 
 The model strings above are placeholders for the operator to set; the kit ships no default models. One agent binds one provider and one model. Changing the model means a new agent name.
+
+`examples/config.opencode-go.json` is a worked instance of this block for an
+operator on an OpenCode Go subscription: `builder`/`solo` on
+adapter `opencode`/provider `opencode-go`, `reviewer`/`reviewer_b` each on a
+different lab (`google`, `openai`) so review stays independent, every model
+left blank with a `_model_note` per the placeholder convention in
+`community/agents/blind-reviewer/config.json`. See `docs/measurement.md`
+"OpenCode Go as the builder lane" for the quota windows that make the
+subscription's ceiling actually enforced and for why its USD-equivalent cost
+figures are not directly comparable to an API-billed lane's.
