@@ -61,6 +61,7 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
     '002-v01-columns',
     '003-v02-autonomy',
     '004-v02-run-adapter',
+    '005-v02-pr-capture',
   ]);
 
   const applied = await migrate(db);
@@ -70,8 +71,9 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
     '002-v01-columns',
     '003-v02-autonomy',
     '004-v02-run-adapter',
+    '005-v02-pr-capture',
   ]);
-  assert.equal(schemaVersion(db), '004-v02-run-adapter');
+  assert.equal(schemaVersion(db), '005-v02-pr-capture');
   assert.deepEqual(pendingMigrations(db), []);
 
   const tableNames = db
@@ -106,6 +108,11 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
     assert.ok(taskColumns.includes(col), `tasks should have column ${col}`);
   }
 
+  // PR capture columns (task E1-1): pr_repo, base_sha, head_sha.
+  for (const col of ['pr_repo', 'base_sha', 'head_sha']) {
+    assert.ok(taskColumns.includes(col), `tasks should have column ${col}`);
+  }
+
   // task_runs.adapter (review round 1, F4: opencode_serial needs it).
   const runColumns = db.prepare('PRAGMA table_info(task_runs)').all().map((c) => c.name);
   assert.ok(runColumns.includes('adapter'), 'task_runs should have column adapter');
@@ -113,10 +120,10 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
   // Running migrate again is a no-op: nothing pending, no error, same version.
   const secondApplied = await migrate(db);
   assert.deepEqual(secondApplied, []);
-  assert.equal(schemaVersion(db), '004-v02-run-adapter');
+  assert.equal(schemaVersion(db), '005-v02-pr-capture');
 
   const migrationRows = db.prepare('SELECT version FROM schema_migrations').all();
-  assert.equal(migrationRows.length, 5);
+  assert.equal(migrationRows.length, 6);
 
   db.close();
 });

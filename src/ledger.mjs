@@ -22,11 +22,23 @@ const nullish = (v) => (v === undefined ? null : v);
 
 export function insertTask(db, fields) {
   const row = {
-    id: newId('t'),
+    // `fields.id` lets a caller precompute the id before insert (task E1-1's
+    // task:new PR capture: the run dir / pr.diff path needs a task id before
+    // insertTask runs, so the id, run-dir write, and the insert itself can
+    // all key off the same value, with insertTask/insertMessage/insertArtifact
+    // wrapped in one withImmediateTransaction). Every other caller omits it
+    // and gets the usual freshly generated id.
+    id: fields.id ?? newId('t'),
     created_at: nowIso(),
     repo: fields.repo,
     issue_number: nullish(fields.issue_number),
     pr_number: nullish(fields.pr_number),
+    // PR capture (task E1-1, src/schema/005-v02-pr-capture.mjs): the repo a
+    // pr_review task's pull request lives in, and the two commit shas
+    // `gh pr view` reports (baseRefOid/headRefOid) at capture time.
+    pr_repo: nullish(fields.pr_repo),
+    base_sha: nullish(fields.base_sha),
+    head_sha: nullish(fields.head_sha),
     kind: fields.kind ?? 'implement',
     title: fields.title,
     task_class: fields.task_class,
@@ -49,15 +61,15 @@ export function insertTask(db, fields) {
   };
   db.prepare(
     `INSERT INTO tasks
-       (id, created_at, repo, issue_number, pr_number, kind, title, task_class, arm,
-        owner, priority, due_at, parent_id, sibling_id, base_commit, branch, worktree, pr_url,
-        status, outcome, human_edits, defects_escaped, closed_at, notes)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+       (id, created_at, repo, issue_number, pr_number, pr_repo, base_sha, head_sha, kind, title,
+        task_class, arm, owner, priority, due_at, parent_id, sibling_id, base_commit, branch,
+        worktree, pr_url, status, outcome, human_edits, defects_escaped, closed_at, notes)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
-    row.id, row.created_at, row.repo, row.issue_number, row.pr_number, row.kind, row.title,
-    row.task_class, row.arm, row.owner, row.priority, row.due_at, row.parent_id, row.sibling_id,
-    row.base_commit, row.branch, row.worktree, row.pr_url, row.status, row.outcome, row.human_edits,
-    row.defects_escaped, row.closed_at, row.notes
+    row.id, row.created_at, row.repo, row.issue_number, row.pr_number, row.pr_repo, row.base_sha,
+    row.head_sha, row.kind, row.title, row.task_class, row.arm, row.owner, row.priority, row.due_at,
+    row.parent_id, row.sibling_id, row.base_commit, row.branch, row.worktree, row.pr_url, row.status,
+    row.outcome, row.human_edits, row.defects_escaped, row.closed_at, row.notes
   );
   return row;
 }

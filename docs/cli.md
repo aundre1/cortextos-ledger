@@ -24,6 +24,8 @@ Global flags: `--config <path>`, `--db <path>` (overrides config), `--json` (mac
 | `task:reject --task <id> --note ...` | Architect refuses the brief |
 | `board [--owner <id>] [--status <s>]` | Table of open tasks, `input_required` first |
 
+`task:new --kind pr_review --repo owner/name --pr <n>` additionally captures the pull request via `gh` (argv, `shell: false`) before the task row is inserted: `gh pr view <n> --repo owner/name --json number,title,body,baseRefOid,headRefOid,baseRefName,headRefName`, then `gh pr diff <n> --repo owner/name`. On success it stores `pr_number`, `pr_repo`, `base_sha`, `head_sha` on the task (and defaults `base_commit`/`branch` from the PR when `--base`/`--branch` were not given), writes the redacted diff to `<runs>/<task-id>/pr.diff` (an `artifacts` row of kind `pr_review` points at it), and writes the redacted PR title and body into an `agent_messages` row of kind `brief` from `ledger`. A diff over 2,000,000 bytes is still written in full, with a note added to the task and a warning on stderr - never truncated. `gh` missing, not authenticated, the PR not found, or any other non-zero `gh` exit all fail the command before any row is inserted (exit 1, one stderr line `cortexctl: gh_missing: ...` or `cortexctl: gh_failed: ...`) - see docs/state-machine.md's exit code table and this feature's own OPEN QUESTION in the wave log for why code 1 rather than a new code. `--kind pr_review` without `--pr`, or `--pr` with a different `--kind`, is unaffected: it only sets `pr_number`, exactly as before this capture existed.
+
 ## Runs
 
 | Command | Effect |
