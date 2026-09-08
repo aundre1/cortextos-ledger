@@ -138,6 +138,48 @@ test('runner: exit.txt is written only once - a pre-existing 137 (the watchdog\'
   assert.equal(exitCode, '137', "the runner's own close handler must not overwrite an exit.txt that already exists");
 });
 
+// D1 (opencode's credentials.forwarded/credentials.missing bookkeeping):
+// events already known before the harness spawns are seeded into
+// eventsPath right after this run's own fresh-per-run truncation, ahead of
+// anything the harness's own stdout produces.
+test('runner: --initial-events seeds events.jsonl before the child\'s own events, surviving the fresh-per-run truncation', () => {
+  const outDir = makeTempDir();
+  const cwd = makeTempDir();
+  const eventsPath = join(outDir, 'events.jsonl');
+  const seeded = [{ ts: '2026-01-01T00:00:00.000Z', type: 'credentials.forwarded', severity: 'info', providers: ['opencode-go'] }];
+
+  const result = runRunner([
+    '--out', outDir,
+    '--cwd', cwd,
+    '--adapter', 'fake',
+    '--events', eventsPath,
+    '--initial-events', JSON.stringify(seeded),
+    '--',
+    process.execPath, '-e', `console.log(${JSON.stringify(JSON.stringify({ ts: new Date().toISOString(), type: 'session.start', session_id: 's1' }))})`,
+  ]);
+  assert.equal(result.status, 0, result.stderr);
+
+  const lines = readFileSync(eventsPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  assert.equal(lines[0].type, 'credentials.forwarded');
+  assert.deepEqual(lines[0].providers, ['opencode-go']);
+  assert.ok(lines.some((e) => e.type === 'session.start'), 'the child-produced event should still be there too');
+});
+
+test('runner: malformed --initial-events is ignored rather than breaking the launch', () => {
+  const outDir = makeTempDir();
+  const cwd = makeTempDir();
+
+  const result = runRunner([
+    '--out', outDir,
+    '--cwd', cwd,
+    '--initial-events', 'not json',
+    '--',
+    process.execPath, '-e', 'process.exit(0);',
+  ]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(existsSync(join(outDir, 'done.marker')));
+});
+
 test('runner: normal completion (no pre-existing exit.txt) still writes the real exit code', () => {
   const outDir = makeTempDir();
   const cwd = makeTempDir();

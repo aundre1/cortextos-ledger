@@ -391,6 +391,10 @@ export function register(registry) {
           timeoutMs,
           env: process.env,
           detach: !!flags.detach,
+          // D2: harmless for claude/codex/fake, which never read this -
+          // only opencode's run()/buildArgv do (see the non-sync branch
+          // below for the fuller comment).
+          agentDef: config.agents?.[flags.agent] ?? {},
           ...(adapterName === 'fake'
             ? { fixture: fixturePath ? JSON.parse(readFileSync(fixturePath, 'utf8')) : undefined }
             : {}),
@@ -415,7 +419,15 @@ export function register(registry) {
         // `config.tools.<adapterName>` (an operator-supplied argv array)
         // skips resolveCommand entirely; otherwise each adapter's own
         // buildArgv resolves the real command itself.
-        const { cmd, args, env, resolvedFrom } = adapter.buildArgv({
+        //
+        // D2: `agentDef` is this kit's own config.agents[<agent>] block
+        // (opencode.mjs's buildArgv reads `.opencode`/`.template`/
+        // `.read_only` off it to generate an OpenCode `agent.<name>`
+        // definition - see docs/adapters.md "opencode: agent definition and
+        // permission binding"). Harmless to pass to every adapter; only
+        // opencode's buildArgv looks at it.
+        const agentDef = config.agents?.[flags.agent] ?? {};
+        const { cmd, args, env, resolvedFrom, credentialsEvent } = adapter.buildArgv({
           prompt,
           cwd: task.worktree,
           agent: flags.agent,
@@ -425,6 +437,7 @@ export function register(registry) {
           cmd: adapterConfig.cmd,
           argsPrefix: adapterConfig.argsPrefix,
           toolOverride: config.tools?.[adapterName],
+          agentDef,
         });
         if (resolvedFrom === null) {
           err(`cortexctl: warn: ${adapterName} not found on PATH; spawn will fail with ENOENT`);
@@ -436,6 +449,12 @@ export function register(registry) {
           timeoutMs,
           adapter: adapterName,
           eventsPath: join(outDir, 'events.jsonl'),
+          // D1: opencode's own credentials.forwarded/credentials.missing
+          // bookkeeping event, seeded into events.jsonl by runner.mjs before
+          // the harness spawns (see spawn.mjs launchDetached's doc comment).
+          // undefined for every other adapter - buildArgv only returns it
+          // for opencode.
+          initialEvents: credentialsEvent ? [credentialsEvent] : undefined,
         });
 
         // Review round 2, R2-1: doRunStart's insertRun never had a pid to

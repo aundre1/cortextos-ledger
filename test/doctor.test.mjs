@@ -53,6 +53,69 @@ test('doctor: always reports gh command resolution, and one line per distinct re
   assert.ok(commandLines.every((f) => f.level === 'info'), JSON.stringify(commandLines));
 });
 
+// D1: "cortexctl doctor shows whether auth.json was found" (this task's own
+// requirement, examples/config.opencode-go.json's new _note).
+test('doctor: reports opencode auth.json found, with provider count, when config.agents uses adapter opencode', async () => {
+  const { db, config: base } = await migrated();
+  const config = { ...base, agents: { builder: { adapter: 'opencode', model: 'x' } } };
+  const authPath = join('/data', 'opencode', 'auth.json');
+  const result = doctor(db, config, {
+    authEnv: { XDG_DATA_HOME: '/data' },
+    authHomedir: '/home/op',
+    authExistsSync: (p) => p === authPath,
+    authReadFile: () => JSON.stringify({ 'opencode-go': {}, google: {} }),
+  });
+  const line = result.findings.find((f) => f.text.startsWith('opencode auth.json:'));
+  assert.ok(line, JSON.stringify(result.findings));
+  assert.equal(line.level, 'info');
+  assert.match(line.text, /found at .*auth\.json \(2 providers\)/);
+});
+
+test('doctor: reports opencode auth.json not found (warn) when it does not exist', async () => {
+  const { db, config: base } = await migrated();
+  const config = { ...base, agents: { builder: { adapter: 'opencode', model: 'x' } } };
+  const result = doctor(db, config, {
+    authEnv: {},
+    authHomedir: '/home/op',
+    authExistsSync: () => false,
+  });
+  const line = result.findings.find((f) => f.text.startsWith('opencode auth.json:'));
+  assert.ok(line, JSON.stringify(result.findings));
+  assert.equal(line.level, 'warn');
+  assert.match(line.text, /not found/);
+});
+
+test('doctor: no opencode auth.json line at all when no configured agent uses adapter opencode', async () => {
+  const { db, config: base } = await migrated();
+  const config = { ...base, agents: { builder: { adapter: 'codex', model: 'x' } } };
+  const result = doctor(db, config, {});
+  assert.equal(result.findings.some((f) => f.text.startsWith('opencode auth.json:')), false);
+});
+
+// D2: doctor surfaces an agent.fallback event found in a run's events.jsonl
+// as a warn-level finding (opencode.mjs's createStreamParser emits these -
+// see test/adapters.test.mjs "createStreamParser: ... becomes an
+// agent.fallback event").
+test('doctor: surfaces agent.fallback events found in a run\'s events.jsonl as a warn finding', async () => {
+  const { db, config } = await migrated();
+  const task = insertTask(db, { repo: 'o/n', title: 'T', task_class: 'ci', arm: 'control' });
+  const outDir = writeRunDir({
+    events:
+      JSON.stringify({ ts: '2026-01-01T00:00:00Z', type: 'agent.fallback', severity: 'warn', agent: 'blind-reviewer', reason: 'not_found' }) +
+      '\n' +
+      JSON.stringify({ ts: '2026-01-01T00:00:01Z', type: 'session.end', exit_code: 0 }) +
+      '\n',
+    done: true,
+    exit: 0,
+  });
+  const run = insertRun(db, { task_id: task.id, seq: 1, agent: 'blind-reviewer', provider: 'google', model: 'x', out_dir: outDir });
+  const result = doctor(db, config, { runId: run.id });
+  const line = result.findings.find((f) => f.text.startsWith('agent.fallback events:'));
+  assert.ok(line, JSON.stringify(result.findings));
+  assert.equal(line.level, 'warn');
+  assert.match(line.text, /blind-reviewer/);
+});
+
 test('doctor: probable cause "quota" when a quota window is exhausted and the last event is a model call', async () => {
   const { db, config } = await migrated();
   const task = insertTask(db, { repo: 'o/n', title: 'T', task_class: 'ci', arm: 'control' });

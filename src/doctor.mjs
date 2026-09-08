@@ -9,6 +9,7 @@ import { getTask, listEscalations, countRuns, sumCost, listQuota, lastLoopTick }
 import { rollQuota, windowEndsAt } from './quota.mjs';
 import { deriveNextAction, computeLimits } from './packet.mjs';
 import { redact } from './adapters/credential-boundary.mjs';
+import { resolveRealAuthPath, loadOperatorAuth } from './adapters/opencode.mjs';
 // Aliased: this module already has its own local `resolveCommand` variable
 // (the suggested cortexctl invocation for resolving a diagnosed problem,
 // unrelated pre-existing name) inside diagnoseRun/diagnoseTask/doctor below
@@ -41,6 +42,23 @@ function readLastEvent(path) {
   } catch {
     return null;
   }
+}
+
+/** Every parseable line of `path` as an object; malformed lines (a truncated write) are skipped rather than failing the whole read, same as src/ingest.mjs's own events.jsonl parsing. */
+function readAllEvents(path) {
+  if (!existsSync(path)) return [];
+  const text = readFileSync(path, 'utf8');
+  const events = [];
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      events.push(JSON.parse(trimmed));
+    } catch {
+      // skip
+    }
+  }
+  return events;
 }
 
 function processAlive(pid) {
@@ -104,6 +122,30 @@ function diagnoseRun(db, config, run, now) {
     (e) => e.run_id === run.id && (e.reason === 'wallclock' || e.reason === 'stall')
   );
   findings.push({ level: watchdogEscalations.length ? 'warn' : 'info', text: `watchdog escalations: ${watchdogEscalations.length}` });
+
+  // D2 (opencode.mjs's createStreamParser): a run whose events.jsonl
+  // contains one or more `agent.fallback` events means OpenCode never
+  // recognized `--agent <name>` and silently ran with its own default agent
+  // instead - for a reviewer this is a permission downgrade, not merely a
+  // cosmetic warning, so it is surfaced here rather than left buried in
+  // out.txt.
+  const allEvents = readAllEvents(eventsPath);
+  const fallbackEvents = allEvents.filter((e) => e && e.type === 'agent.fallback');
+  if (fallbackEvents.length) {
+    const names = [...new Set(fallbackEvents.map((e) => e.agent).filter(Boolean))];
+    findings.push({
+      level: 'warn',
+      text: `agent.fallback events: ${fallbackEvents.length} (opencode ran its default agent instead of ${names.join(', ') || 'the requested agent'} - permission block NOT applied)`,
+    });
+  }
+
+  // D1 (opencode.mjs's buildCredentialForward): the operator's real
+  // auth.json was not found at launch time - every provider call in this run
+  // almost certainly 401'd.
+  const missingCreds = allEvents.find((e) => e && e.type === 'credentials.missing');
+  if (missingCreds) {
+    findings.push({ level: 'warn', text: `credentials.missing: opencode auth.json not found at ${missingCreds.path}` });
+  }
 
   rollQuota(db, now);
   const quotaRows = listQuota(db, { provider: run.provider });
@@ -281,11 +323,37 @@ function diagnoseCommandResolution(config) {
   return findings;
 }
 
+/**
+ * D1: "opencode auth.json: found at <path> (N providers)" or "not found" -
+ * this task's own required doctor output. Only printed when some agent in
+ * config.agents actually uses adapter opencode (mirrors
+ * diagnoseCommandResolution's own gating - no point reporting on a harness
+ * this operator never configured). `providers` never appears - only the
+ * count (see src/adapters/opencode.mjs's loadOperatorAuth doc comment: it
+ * enumerates provider ids, never token/key/refresh values).
+ */
+function diagnoseOpencodeAuth(config, { authEnv, authHomedir, authReadFile, authExistsSync } = {}) {
+  const usesOpencode = Object.values(config.agents ?? {}).some((def) => def?.adapter === 'opencode');
+  if (!usesOpencode) return [];
+
+  const authPath = resolveRealAuthPath({ env: authEnv, homedir: authHomedir });
+  const auth = loadOperatorAuth({ authPath, readFile: authReadFile, existsFn: authExistsSync });
+  if (!auth.exists) {
+    return [{ level: 'warn', text: `opencode auth.json: not found (checked ${authPath}) - run "opencode auth login" for each provider first` }];
+  }
+  return [
+    {
+      level: 'info',
+      text: `opencode auth.json: found at ${authPath} (${auth.providers.length} provider${auth.providers.length === 1 ? '' : 's'})`,
+    },
+  ];
+}
+
 // ---------------------------------------------------------------------------
 // doctor
 // ---------------------------------------------------------------------------
 
-export function doctor(db, config, { taskId, runId, all, now = new Date() } = {}) {
+export function doctor(db, config, { taskId, runId, all, now = new Date(), authEnv, authHomedir, authReadFile, authExistsSync } = {}) {
   const findings = [];
   let probableCause = null;
   let resolveCommand = null;
@@ -302,6 +370,12 @@ export function doctor(db, config, { taskId, runId, all, now = new Date() } = {}
   });
 
   findings.push(...diagnoseCommandResolution(config));
+  // authEnv/authHomedir/authReadFile/authExistsSync: test-only injection
+  // points for the operator's real environment/homedir/filesystem (same
+  // convention as preflight.mjs's platform/env overrides) - real callers
+  // never pass these, so diagnoseOpencodeAuth reads the operator's actual
+  // auth.json exactly as opencode.mjs's own buildArgv would at launch.
+  findings.push(...diagnoseOpencodeAuth(config, { authEnv, authHomedir, authReadFile, authExistsSync }));
 
   if (runId) {
     const run = db.prepare('SELECT * FROM task_runs WHERE id = ?').get(runId);

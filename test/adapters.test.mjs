@@ -190,6 +190,228 @@ test('opencode buildArgv: omits --agent/--model when absent', () => {
   assert.deepEqual(args, ['run', '--format', 'json', 'go']);
 });
 
+// ---------------------------------------------------------------------------
+// opencode: D1 - credential forwarding into the isolated data dir
+// ---------------------------------------------------------------------------
+
+test('opencode resolveRealOpencodeDataHome: XDG_DATA_HOME wins, on every platform (xdg-basedir is not platform-branched)', () => {
+  assert.equal(
+    opencode.resolveRealOpencodeDataHome({ env: { XDG_DATA_HOME: '/custom/data' }, homedir: '/home/op' }),
+    join('/custom/data', 'opencode')
+  );
+});
+
+test('opencode resolveRealOpencodeDataHome: falls back to <home>/.local/share/opencode when unset, Windows homedir included', () => {
+  assert.equal(
+    opencode.resolveRealOpencodeDataHome({ env: {}, homedir: '/home/op' }),
+    join('/home/op', '.local', 'share', 'opencode')
+  );
+  // os.homedir() on win32 resolves to %USERPROFILE% - the same join logic
+  // applies verbatim, per packages/core/src/global.ts (xdg-basedir is not
+  // platform-branched).
+  assert.equal(
+    opencode.resolveRealOpencodeDataHome({ env: {}, homedir: 'C:\\Users\\op' }),
+    join('C:\\Users\\op', '.local', 'share', 'opencode')
+  );
+});
+
+test('opencode resolveRealAuthPath: <data home>/auth.json', () => {
+  assert.equal(
+    opencode.resolveRealAuthPath({ env: { XDG_DATA_HOME: '/custom/data' }, homedir: '/home/op' }),
+    join('/custom/data', 'opencode', 'auth.json')
+  );
+});
+
+test('opencode loadOperatorAuth: auth.json present - enumerates provider ids only, never values', () => {
+  const authPath = '/fake/auth.json';
+  const result = opencode.loadOperatorAuth({
+    authPath,
+    existsFn: (p) => p === authPath,
+    readFile: () => JSON.stringify({ 'opencode-go': { type: 'oauth', access: 'super-secret-token' }, google: { type: 'api', key: 'also-secret' } }),
+  });
+  assert.equal(result.exists, true);
+  assert.deepEqual(result.providers.sort(), ['google', 'opencode-go']);
+  assert.equal(result.raw.includes('super-secret-token'), true, 'raw text is forwarded verbatim for OPENCODE_AUTH_CONTENT');
+});
+
+test('opencode loadOperatorAuth: auth.json absent', () => {
+  const result = opencode.loadOperatorAuth({ authPath: '/fake/auth.json', existsFn: () => false });
+  assert.deepEqual(result, { exists: false, providers: [], raw: null });
+});
+
+test('opencode buildArgv: dataHome set + real auth.json found -> OPENCODE_AUTH_CONTENT forwarded, credentials.forwarded event', () => {
+  const authPath = join('/data', 'opencode', 'auth.json');
+  const rawAuth = JSON.stringify({ 'opencode-go': { type: 'oauth' } });
+  const { env, credentialsEvent } = opencode.buildArgv({
+    prompt: 'x',
+    cwd: '/work',
+    agent: 'builder',
+    model: 'opencode/deepseek-v4',
+    dataHome: '/isolated',
+    outDir: '/out',
+    authEnv: { XDG_DATA_HOME: '/data' },
+    authHomedir: '/home/op',
+    authExistsSync: (p) => p === authPath,
+    authReadFile: (p) => (p === authPath ? rawAuth : ''),
+  });
+  assert.equal(env.OPENCODE_AUTH_CONTENT, rawAuth);
+  // The isolated XDG_DATA_HOME (sessions/db/snapshots/logs) is untouched by
+  // credential forwarding - it still points at the isolated dir, not at
+  // /data (the operator's real data home used only to find auth.json).
+  assert.equal(env.XDG_DATA_HOME, join('/isolated', 'builder'));
+  assert.equal(credentialsEvent.type, 'credentials.forwarded');
+  assert.deepEqual(credentialsEvent.providers, ['opencode-go']);
+  assert.equal(credentialsEvent.severity, 'info');
+});
+
+test('opencode buildArgv: dataHome set + real auth.json missing -> no OPENCODE_AUTH_CONTENT, credentials.missing event (warn)', () => {
+  const { env, credentialsEvent } = opencode.buildArgv({
+    prompt: 'x',
+    cwd: '/work',
+    agent: 'builder',
+    model: 'opencode/x',
+    dataHome: '/isolated',
+    outDir: '/out',
+    authEnv: {},
+    authHomedir: '/home/op',
+    authExistsSync: () => false,
+  });
+  assert.equal('OPENCODE_AUTH_CONTENT' in env, false);
+  assert.equal(credentialsEvent.type, 'credentials.missing');
+  assert.equal(credentialsEvent.severity, 'warn');
+  assert.equal(credentialsEvent.path, join('/home/op', '.local', 'share', 'opencode', 'auth.json'));
+});
+
+test('opencode buildArgv: no dataHome (no isolation) -> no credential forwarding at all', () => {
+  const { env, credentialsEvent } = opencode.buildArgv({ prompt: 'x', cwd: '/work', agent: 'builder', model: 'opencode/x' });
+  assert.equal('OPENCODE_AUTH_CONTENT' in env, false);
+  assert.equal(credentialsEvent, null);
+});
+
+test('opencode buildArgv: env-provided provider keys (NVIDIA/OPENAI/GOOGLE/GEMINI) still reach the child (docs/security.md rule 1 - only ANTHROPIC_/CLAUDE_/CORTEX_PROXY_ are ever stripped for opencode)', () => {
+  const saved = {};
+  const keys = ['NVIDIA_API_KEY', 'OPENAI_API_KEY', 'GOOGLE_API_KEY', 'GEMINI_API_KEY'];
+  for (const k of keys) saved[k] = process.env[k];
+  try {
+    process.env.NVIDIA_API_KEY = 'nvapi-test';
+    process.env.OPENAI_API_KEY = 'sk-test-openai-key-000000000000';
+    process.env.GOOGLE_API_KEY = 'google-test';
+    process.env.GEMINI_API_KEY = 'gemini-test';
+    const { env } = opencode.buildArgv({ prompt: 'x', cwd: '/work', agent: 'builder', model: 'opencode/x' });
+    assert.equal(env.NVIDIA_API_KEY, 'nvapi-test');
+    assert.equal(env.OPENAI_API_KEY, 'sk-test-openai-key-000000000000');
+    assert.equal(env.GOOGLE_API_KEY, 'google-test');
+    assert.equal(env.GEMINI_API_KEY, 'gemini-test');
+  } finally {
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// opencode: D2 - agent definition and permission binding
+// ---------------------------------------------------------------------------
+
+const BLIND_REVIEWER_TEMPLATE = join(HERE, '..', 'community', 'agents', 'blind-reviewer', 'config.json');
+
+test('opencode buildArgv: no agentDef/template -> minimal {model} definition, still enough to fix "not found"', () => {
+  const { env } = opencode.buildArgv({ prompt: 'x', cwd: '/work', agent: 'builder', model: 'opencode/deepseek-v4' });
+  const generated = JSON.parse(env.OPENCODE_CONFIG_CONTENT);
+  assert.deepEqual(generated, { agent: { builder: { model: 'opencode/deepseek-v4' } } });
+});
+
+test('opencode buildArgv: agentDef.opencode is used verbatim (merged over the resolved model)', () => {
+  const { env } = opencode.buildArgv({
+    prompt: 'x',
+    cwd: '/work',
+    agent: 'architect',
+    model: 'opencode/x',
+    agentDef: { opencode: { temperature: 0.2, mode: 'primary' } },
+  });
+  const generated = JSON.parse(env.OPENCODE_CONFIG_CONTENT);
+  assert.deepEqual(generated.agent.architect, { model: 'opencode/x', temperature: 0.2, mode: 'primary' });
+});
+
+test('opencode buildArgv: --agent blind-reviewer via agentDef.template translates community config into OpenCode schema with byte-correct deny rules', () => {
+  const { env } = opencode.buildArgv({
+    prompt: 'review this',
+    cwd: '/work',
+    agent: 'blind-reviewer',
+    model: 'google/gemini-x',
+    agentDef: { template: BLIND_REVIEWER_TEMPLATE, read_only: true },
+  });
+  const generated = JSON.parse(env.OPENCODE_CONFIG_CONTENT);
+  const def = generated.agent['blind-reviewer'];
+  assert.equal(def.model, 'google/gemini-x');
+  assert.equal(def.mode, 'primary');
+  assert.equal(def.temperature, 0.0);
+  assert.equal(typeof def.prompt, 'string');
+  assert.ok(def.prompt.length > 0, 'prompt text should be the real contents of prompts/reviewer.md, not the {file:...} token');
+  assert.equal(def.prompt.includes('{file:'), false);
+  // The permission block itself, byte-correct against
+  // community/agents/blind-reviewer/config.json (already written in
+  // OpenCode's own schema shape - packages/core/src/v1/config/permission.ts).
+  assert.equal(def.permission.edit, 'deny');
+  assert.equal(def.permission.read, 'allow');
+  assert.deepEqual(def.permission.bash, {
+    '*': 'deny',
+    'git diff*': 'allow',
+    'git show*': 'allow',
+    'git log*': 'allow',
+    'git status*': 'allow',
+  });
+  assert.equal(def.permission.webfetch, 'deny');
+  assert.equal(def.permission.websearch, 'deny');
+});
+
+test('opencode buildArgv: read_only:true with no permission source refuses to launch (exit code 1) rather than run unrestricted', () => {
+  assert.throws(
+    () =>
+      opencode.buildArgv({
+        prompt: 'x',
+        cwd: '/work',
+        agent: 'reviewer',
+        model: 'google/x',
+        agentDef: { read_only: true },
+      }),
+    (e) => e instanceof Error && e.code === 1 && /read_only/.test(e.message)
+  );
+});
+
+test('opencode buildArgv: read_only:true with agentDef.opencode that does deny edit is allowed to launch', () => {
+  assert.doesNotThrow(() =>
+    opencode.buildArgv({
+      prompt: 'x',
+      cwd: '/work',
+      agent: 'reviewer',
+      model: 'google/x',
+      agentDef: { read_only: true, opencode: { permission: { edit: 'deny' } } },
+    })
+  );
+});
+
+test('opencode createStreamParser: "agent not found" fallback text becomes an agent.fallback event, severity warn', () => {
+  const parser = opencode.createStreamParser();
+  const events = parser.push('!  agent "builder" not found. Falling back to default agent');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, 'agent.fallback');
+  assert.equal(events[0].severity, 'warn');
+  assert.equal(events[0].agent, 'builder');
+  assert.equal(events[0].reason, 'not_found');
+});
+
+test('opencode createStreamParser: "subagent, not a primary agent" fallback text becomes an agent.fallback event too', () => {
+  const parser = opencode.createStreamParser();
+  const events = parser.push('!  agent "helper" is a subagent, not a primary agent. Falling back to default agent');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, 'agent.fallback');
+  assert.equal(events[0].severity, 'warn');
+  assert.equal(events[0].agent, 'helper');
+  assert.equal(events[0].reason, 'subagent');
+});
+
 test('opencode parseStream: fixture (already-normalized plugin events) gives expected counts and redacts secrets', () => {
   const events = opencode.parseStream(readFixtureLines('opencode-events.jsonl'));
   const byType = (t) => events.filter((e) => e.type === t);

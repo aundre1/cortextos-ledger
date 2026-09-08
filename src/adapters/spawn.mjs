@@ -35,8 +35,18 @@ const RUNNER_PATH = join(HERE, 'runner.mjs');
  * tee the harness's stdout through its `createStreamParser()`, when it has
  * one, into `eventsPath` live; omit both to get the runner's old behaviour
  * (redacted out.txt only, no events.jsonl of its own).
+ *
+ * `initialEvents` (D1, opencode's `credentials.forwarded`/`credentials.
+ * missing` bookkeeping): normalized events already known before the harness
+ * even spawns, seeded into `eventsPath` immediately after runner.mjs's own
+ * fresh-per-run truncation and before the child starts - the only place that
+ * write can safely land, since runner.mjs always truncates `eventsPath` to
+ * empty at the very start of its own run (out dirs are reused across
+ * retries) and would otherwise silently wipe anything written here first.
+ * Adapter-agnostic: runner.mjs does not know or care why these events
+ * exist, only that they come first.
  */
-export function launchDetached({ argv, cwd, outDir, timeoutMs, adapter, eventsPath }) {
+export function launchDetached({ argv, cwd, outDir, timeoutMs, adapter, eventsPath, initialEvents }) {
   mkdirSync(outDir, { recursive: true });
   const runnerArgs = [
     RUNNER_PATH,
@@ -47,6 +57,7 @@ export function launchDetached({ argv, cwd, outDir, timeoutMs, adapter, eventsPa
     ...(timeoutMs !== undefined ? ['--timeout-ms', String(timeoutMs)] : []),
     ...(adapter ? ['--adapter', adapter] : []),
     ...(eventsPath ? ['--events', eventsPath] : []),
+    ...(initialEvents && initialEvents.length ? ['--initial-events', JSON.stringify(initialEvents)] : []),
     '--',
     argv.cmd,
     ...(argv.args ?? []),

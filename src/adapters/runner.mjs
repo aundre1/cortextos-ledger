@@ -140,10 +140,24 @@ async function main() {
   const timeoutMs = flags['timeout-ms'] !== undefined ? Number(flags['timeout-ms']) : undefined;
   const adapterName = flags.adapter;
   const eventsPath = flags.events;
+  // D1: events already known before the harness spawns (opencode's
+  // `credentials.forwarded`/`credentials.missing`) - see spawn.mjs
+  // launchDetached's `initialEvents` doc comment for why this must be seeded
+  // here, right after this run's own fresh-per-run truncation below, rather
+  // than by whichever caller built argv for this runner.
+  let initialEvents = [];
+  if (flags['initial-events']) {
+    try {
+      const parsed = JSON.parse(flags['initial-events']);
+      if (Array.isArray(parsed)) initialEvents = parsed;
+    } catch {
+      // malformed --initial-events: never let this break the actual launch
+    }
+  }
 
   if (!outDir || !cmd) {
     process.stderr.write(
-      'runner: usage: --out <dir> --cwd <dir> [--timeout-ms <n>] [--adapter <name>] [--events <path>] -- <cmd> [args...]\n'
+      'runner: usage: --out <dir> --cwd <dir> [--timeout-ms <n>] [--adapter <name>] [--events <path>] [--initial-events <json>] -- <cmd> [args...]\n'
     );
     process.exit(1);
   }
@@ -174,6 +188,11 @@ async function main() {
     }
     if (text) appendFileSync(eventsPath, text);
   }
+
+  // Seeded immediately after the truncation above and before the child ever
+  // spawns, so these events are always first in the file regardless of how
+  // quickly the harness starts writing its own.
+  if (initialEvents.length) appendEvents(initialEvents);
 
   const stdoutSplitter = makeLineSplitter((line) => {
     appendOut(line);

@@ -31,14 +31,16 @@
       "agent": "builder",
       "provider": "opencode-go",
       "model": "",
-      "_model_note": "Placeholder. The operator sets this to a model available on their OpenCode Go plan. Must not contain 'anthropic' or 'claude' (src/adapters/opencode.mjs refuses those with exit 1 -- Anthropic subscription OAuth may not be used inside a third party harness)."
+      "_model_note": "Placeholder. The operator sets this to a model available on their OpenCode Go plan. Must not contain 'anthropic' or 'claude' (src/adapters/opencode.mjs refuses those with exit 1 -- Anthropic subscription OAuth may not be used inside a third party harness).",
+      "_note": "Before this agent can run: 'opencode auth login' must already have been completed for the 'opencode' provider on this machine (docs/adapters.md 'opencode: credential forwarding (D1)') -- the kit forwards the operator's real credentials into each isolated run, it does not create them. Run 'cortexctl doctor' first; it prints 'opencode auth.json: found at <path> (N providers)' or 'not found' whenever any agent here uses adapter opencode, so a missing login shows up before a run ever 401s."
     },
     "solo": {
       "adapter": "opencode",
       "agent": "solo",
       "provider": "opencode-go",
       "model": "",
-      "_model_note": "Placeholder, and it must be set to the exact same value as builder.model above. solo is the control arm's build agent standing in for 'no reviewer' (docs/measurement.md: 'agent solo, same provider and model as the builder, its own agent definition'), not a different model -- changing the model here would confound the comparison compare is meant to make."
+      "_model_note": "Placeholder, and it must be set to the exact same value as builder.model above. solo is the control arm's build agent standing in for 'no reviewer' (docs/measurement.md: 'agent solo, same provider and model as the builder, its own agent definition'), not a different model -- changing the model here would confound the comparison compare is meant to make.",
+      "_note": "Same 'opencode auth login' / 'cortexctl doctor' prerequisite as builder._note above -- see there."
     },
     "reviewer": {
       "adapter": "opencode",
