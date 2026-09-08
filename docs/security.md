@@ -25,6 +25,14 @@ Public: everything under `src/`, `bin/`, `plugins/`, `prompts/`, `scripts/`, `co
 
 Never committed: `.cortex/` (database, runs), any `orgs/` content, any file matching the secrets patterns, any `events.jsonl`, any `reasoning.md`. `.gitignore` covers these and `scripts/publish-check` refuses to proceed if they are staged.
 
+### Temporary files at rest
+
+| Path | Contents | Lifetime |
+|---|---|---|
+| `<runs>/.tmp/<taskId>.pr.diff.raw` | An **unredacted** PR diff, streamed straight from `gh pr diff` before `task:new`'s PR capture redacts it (docs/review-protocol.md "PR triage mode") | Deleted immediately after redaction, in a `finally` around the capture so a `gh` failure or an exception during redaction/hashing also cleans it up. If `cortexctl` itself is killed (e.g. SIGKILL) mid-capture, before that `finally` runs, the file can survive on disk transiently -- it is swept (deleted, if older than 60 minutes) at the start of the next `init` or `task:new` call, whichever comes first |
+
+Nothing else the kit writes is ever unredacted at rest even transiently: `out.txt` is redacted line by line as it is written (not only after the run finishes), and every other diff/artifact the ledger records is the already-redacted file.
+
 Community source material: this kit was shaped by problems raised in a private, paid community. The kit describes the failure modes it prevents in general terms. It quotes nobody and names nobody. Pull requests that add quotes or names from community calls are declined.
 
 ## Permissions at the harness layer

@@ -4,6 +4,7 @@
 import { migrate, pendingMigrations, schemaVersion } from '../db.mjs';
 import { upsertQuota, listQuota } from '../ledger.mjs';
 import { tickQuota, rollQuota, windowEndsAt, syncConfigQuota, findQuotaRow, reservedSpend } from '../quota.mjs';
+import { sweepTmpDir } from '../tmp-sweep.mjs';
 
 function fail(errFn, code, reason, detail) {
   errFn(`cortexctl: ${reason}: ${detail}`);
@@ -39,7 +40,15 @@ function quotaRowView(db, config, row) {
 export function register(registry) {
   registry.add('init', {
     description: 'Create the database, apply pending migrations, print schema version',
-    async handler({ db, flags, out }) {
+    async handler({ db, config, flags, out }) {
+      // Blind review NF3: sweep any stale <runs>/.tmp/ leftovers (an
+      // unredacted PR diff from a task:new capture that never finished
+      // because cortexctl itself was killed mid-stream) on every init call,
+      // dry-run included - this is disk cleanup, not part of the "pending
+      // SQL" dry-run reports, and a dry-run caller benefits from the same
+      // guarantee as a real one.
+      sweepTmpDir(config.runs);
+
       if (flags['dry-run']) {
         const pending = pendingMigrations(db);
         if (flags.json) {

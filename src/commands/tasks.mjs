@@ -51,6 +51,7 @@ import {
   listEscalations,
 } from '../ledger.mjs';
 import { filterEnv, redact } from '../adapters/credential-boundary.mjs';
+import { sweepTmpDir } from '../tmp-sweep.mjs';
 
 const VALID_ARMS = new Set(['tri', 'control']);
 const VALID_KINDS = new Set(['implement', 'pr_review', 'research', 'ops']);
@@ -294,6 +295,13 @@ export function register(registry) {
     description:
       'Insert task, status submitted, print id (--kind pr_review --repo <r> --pr <n> also captures the PR via gh)',
     async handler({ db, config, flags, err }) {
+      // Blind review NF3: sweep any stale <runs>/.tmp/ leftovers at the
+      // start of every task:new (not only a PR-capture one - a stale entry
+      // could equally be a previous call's own PR-capture temp file, so
+      // every task:new pays this small readdir-and-stat cost, not only the
+      // ones that will create their own new temp file below).
+      sweepTmpDir(config.runs);
+
       const need = missing(flags, ['repo', 'title', 'class', 'arm']);
       if (need.length) {
         return fail(err, 1, 'usage', `missing required flags: ${need.map((n) => '--' + n).join(', ')}`);
@@ -350,70 +358,75 @@ export function register(registry) {
       let tmpDir;
       let tmpRawDiffPath;
       let tmpRedactedDiffPath;
+      let redactedTitle;
+      let redactedBody;
+      let diffPath;
+      let diffSha256;
+      let diffBytes;
       if (flags.kind === 'pr_review' && pr.value !== undefined) {
         taskId = newId('t');
         tmpDir = join(config.runs, '.tmp');
         mkdirSync(tmpDir, { recursive: true });
         tmpRawDiffPath = join(tmpDir, `${taskId}.pr.diff.raw`);
 
-        const captured = capturePr(flags.repo, pr.value, tmpRawDiffPath);
-        if (!captured.ok) {
-          // gh may have opened (and partially written) the raw temp file
-          // before failing, or never reached it at all (a `gh pr view`
-          // failure) - either way, nothing of this attempt survives on disk.
+        // Blind review NF3(b): the raw temp diff must never survive this
+        // call, on ANY exit path - gh failing, a throw during redaction or
+        // hashing (disk full, permissions, anything), or the ordinary
+        // success path that used to unlink it inline partway through. A
+        // `finally` around the whole capture (rather than a cleanup snippet
+        // duplicated at each individual failure point, as before) is what
+        // makes that true regardless of which path is taken; relying only
+        // on the next `init`/`task:new` sweep (src/tmp-sweep.mjs) to catch a
+        // leftover eventually would still leave an unredacted diff sitting
+        // on disk for up to that sweep's 60 minute age threshold.
+        try {
+          const captured = capturePr(flags.repo, pr.value, tmpRawDiffPath);
+          if (!captured.ok) {
+            return fail(err, captured.code, captured.reason, captured.detail);
+          }
+          capture = captured;
+
+          redactedTitle = redact(capture.meta?.title ?? '');
+          redactedBody = redact(capture.meta?.body ?? '');
+
+          // Review round 2, F6: redact the raw temp diff to a second temp
+          // file line by line via a streaming read (never a whole-file
+          // readFileSync - the raw file can be 70+ MB), reusing the exact
+          // same redact() src/adapters/runner.mjs applies to out.txt.
+          tmpRedactedDiffPath = join(tmpDir, `${taskId}.pr.diff`);
+          await redactFileToFile(tmpRawDiffPath, tmpRedactedDiffPath);
+
+          // fs.statSync (not Buffer.byteLength on a string - the diff is no
+          // longer ever held as one in-memory string) measures the size
+          // guard against the file that will actually become pr.diff; the
+          // sha256 for the artifact row is computed with its own streaming
+          // read.
+          diffBytes = statSync(tmpRedactedDiffPath).size;
+          diffSha256 = await hashFile(tmpRedactedDiffPath);
+          if (diffBytes > MAX_DIFF_BYTES) {
+            // Requirement 7: still write it in full, never truncate - only
+            // note it, on the task and on stderr.
+            notesParts.push(`pr_diff_oversized:${diffBytes}`);
+            err(
+              `cortexctl: warning: pr diff for ${flags.repo}#${pr.value} is ${diffBytes} bytes, ` +
+                `over the ${MAX_DIFF_BYTES} byte guard; written in full to pr.diff`
+            );
+          }
+
+          // The final path the artifact row and the reviewer brief will
+          // name. It does not exist on disk yet - see the rename after the
+          // transaction below (F4) - so insertArtifact is given the
+          // sha256/bytes already computed from the temp file instead of
+          // trying (and failing) to stat a path that isn't there yet.
+          diffPath = join(config.runs, taskId, 'pr.diff');
+        } finally {
           try {
             if (existsSync(tmpRawDiffPath)) unlinkSync(tmpRawDiffPath);
           } catch {
             // best effort - a failed cleanup must not mask the real error
+            // (or, on the success path, the result already returned).
           }
-          return fail(err, captured.code, captured.reason, captured.detail);
         }
-        capture = captured;
-      }
-
-      let redactedTitle;
-      let redactedBody;
-      let diffPath;
-      let diffSha256;
-      let diffBytes;
-      if (capture) {
-        redactedTitle = redact(capture.meta?.title ?? '');
-        redactedBody = redact(capture.meta?.body ?? '');
-
-        // Review round 2, F6: redact the raw temp diff to a second temp
-        // file line by line via a streaming read (never a whole-file
-        // readFileSync - the raw file can be 70+ MB), reusing the exact
-        // same redact() src/adapters/runner.mjs applies to out.txt.
-        tmpRedactedDiffPath = join(tmpDir, `${taskId}.pr.diff`);
-        await redactFileToFile(tmpRawDiffPath, tmpRedactedDiffPath);
-        try {
-          unlinkSync(tmpRawDiffPath);
-        } catch {
-          // best effort - the raw temp file is scratch, not the artifact
-        }
-
-        // fs.statSync (not Buffer.byteLength on a string - the diff is no
-        // longer ever held as one in-memory string) measures the size guard
-        // against the file that will actually become pr.diff; the sha256
-        // for the artifact row is computed with its own streaming read.
-        diffBytes = statSync(tmpRedactedDiffPath).size;
-        diffSha256 = await hashFile(tmpRedactedDiffPath);
-        if (diffBytes > MAX_DIFF_BYTES) {
-          // Requirement 7: still write it in full, never truncate - only
-          // note it, on the task and on stderr.
-          notesParts.push(`pr_diff_oversized:${diffBytes}`);
-          err(
-            `cortexctl: warning: pr diff for ${flags.repo}#${pr.value} is ${diffBytes} bytes, ` +
-              `over the ${MAX_DIFF_BYTES} byte guard; written in full to pr.diff`
-          );
-        }
-
-        // The final path the artifact row and the reviewer brief will name.
-        // It does not exist on disk yet - see the rename after the
-        // transaction below (F4) - so insertArtifact is given the sha256/
-        // bytes already computed from the temp file instead of trying (and
-        // failing) to stat a path that isn't there yet.
-        diffPath = join(config.runs, taskId, 'pr.diff');
       }
 
       const notes = notesParts.length ? notesParts.join('; ') : undefined;
