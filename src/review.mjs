@@ -73,8 +73,20 @@ function latestTestEditEscalation(db, taskId) {
   return rows.length ? rows[rows.length - 1] : null;
 }
 
-function readReviewerPrompt() {
-  const path = join(ROOT, 'prompts', 'reviewer.md');
+// Phase 1a dry run (grandamenium/cortextos PR #1002 and #874): the brief
+// always loaded prompts/reviewer.md, even for a `pr_review` (PR triage) task
+// - prompts/pr-triage-reviewer.md exists, is documented in
+// docs/review-protocol.md and examples/pr-triage.md as the prompt PR triage
+// uses, but nothing ever actually read it. reviewer.md's own "Scope
+// discipline" section tells the model to avoid `builder/` and
+// `reasoning.md`, which do not exist at all in PR triage mode (there is no
+// builder run - see the pr.diff-vs-builder/patch.diff branch above) and so
+// is pure noise in that brief; pr-triage-reviewer.md is written for the
+// no-builder case directly. Mirrors the diff-sourcing branch above: `kind`
+// decides which prompt, same as it already decides which diff.
+function readReviewerPrompt(taskKind) {
+  const filename = taskKind === 'pr_review' ? 'pr-triage-reviewer.md' : 'reviewer.md';
+  const path = join(ROOT, 'prompts', filename);
   if (existsSync(path)) return readFileSync(path, 'utf8');
   return FALLBACK_REVIEWER_PROMPT;
 }
@@ -154,8 +166,20 @@ export function buildReviewerBrief(db, config, { taskId, reviewer, issueFile }) 
     `# Output\n\nWrite your verdict to exactly this absolute path (create it if it does not exist, overwrite it if it does):\n\n\`${verdictPath}\`\n\nDo not write a verdict.json anywhere else.`
   );
 
-  sections.push(`# Verdict schema\n\n${VERDICT_SCHEMA_BLOCK}`);
-  sections.push(`# Reviewer instructions\n\n${readReviewerPrompt().trim()}`);
+  // Phase 1a dry run: three separate real verdicts from this same model
+  // (nvidia/moonshotai/kimi-k3, PR #1002 control, PR #1002 tri, PR #874
+  // control) each came back at 754, 937, and 967 characters - every one
+  // rejected by `cortexctl verdict` (exit 5, "summary must be at most 600
+  // characters") despite the schema block above already saying "no more
+  // than 600 characters" right on the summary field. A one-clause aside
+  // inside a JSON example is not salient enough on its own; this is a
+  // separate, blunt paragraph naming the actual failure mode and a concrete
+  // target length to aim for instead of the hard ceiling (aiming at the
+  // ceiling reliably overshoots it).
+  sections.push(
+    `# Verdict schema\n\n${VERDICT_SCHEMA_BLOCK}\n\n**\`summary\` is strictly enforced at 600 characters.** A verdict with a longer summary is rejected outright (none of its findings are recorded) - this has happened in real runs. Aim for 3-4 sentences, about 400 characters, not the 600-character ceiling; count before you write the file.`
+  );
+  sections.push(`# Reviewer instructions\n\n${readReviewerPrompt(task.kind).trim()}`);
 
   const markdown = sections.join('\n\n');
   const briefPath = join(reviewerDir, 'brief.md');

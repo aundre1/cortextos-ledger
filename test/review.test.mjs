@@ -182,6 +182,36 @@ test('buildReviewerBrief: names the exact absolute verdict.json path (Phase 1a d
   db.close();
 });
 
+test('buildReviewerBrief: warns that the 600-character summary cap is strictly enforced (Phase 1a dry run: 3 real verdicts rejected for exceeding it)', async () => {
+  const { db, config } = await migrated();
+  const task = insertTask(db, { repo: 'o/n', title: 'T', task_class: 'ci', arm: 'tri' });
+
+  const { markdown } = buildReviewerBrief(db, config, { taskId: task.id, reviewer: 'reviewer' });
+  assert.ok(markdown.includes('strictly enforced'));
+  assert.ok(markdown.includes('600 charact'));
+  db.close();
+});
+
+test('buildReviewerBrief: pr_review task gets prompts/pr-triage-reviewer.md, every other task kind gets prompts/reviewer.md', async () => {
+  const { db, config } = await migrated();
+
+  const prTask = insertTask(db, {
+    repo: 'o/n', title: 'Triage PR #7', task_class: 'pr-triage', arm: 'tri', kind: 'pr_review',
+    pr_number: 7, base_commit: 'deadbeef', branch: 'feature/x',
+  });
+  const { markdown: prMarkdown } = buildReviewerBrief(db, config, { taskId: prTask.id, reviewer: 'reviewer' });
+  assert.ok(prMarkdown.includes('Role: PR Triage Reviewer'));
+  assert.ok(!prMarkdown.includes('Role: Blind Reviewer'));
+  assert.ok(!prMarkdown.includes("builder/"), 'PR triage brief must not mention the builder/ directory - no builder run exists in this mode');
+
+  const ciTask = insertTask(db, { repo: 'o/n', title: 'T', task_class: 'ci', arm: 'tri' });
+  const { markdown: ciMarkdown } = buildReviewerBrief(db, config, { taskId: ciTask.id, reviewer: 'reviewer' });
+  assert.ok(ciMarkdown.includes('Role: Blind Reviewer'));
+  assert.ok(!ciMarkdown.includes('Role: PR Triage Reviewer'));
+
+  db.close();
+});
+
 test('buildReviewerBrief: pr_review task reads the diff from <runs>/<task>/pr.diff, never builder/patch.diff (docs/review-protocol.md "PR triage mode")', async () => {
   const { db, config } = await migrated();
   const task = insertTask(db, {
