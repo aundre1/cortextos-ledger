@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import * as claude from '../src/adapters/claude.mjs';
 import * as codex from '../src/adapters/codex.mjs';
 import * as opencode from '../src/adapters/opencode.mjs';
+import { makeTempDir } from './helpers.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = join(HERE, 'fixtures');
@@ -27,6 +28,19 @@ function assertNoEventFieldTooLong(events, field, max = 200) {
 // claude
 // ---------------------------------------------------------------------------
 
+// buildArgv shape tests (cmd and/or args) inject `platform: 'linux'`
+// (`platformOverride` for opencode - see its own buildArgv doc comment)
+// explicitly, so they assert this kit's own argv construction and never the
+// host's real command resolution: resolveCommand is a documented no-op on
+// every non-win32 platform (docs/adapters.md "Windows command resolution"
+// rule 1), so `cmd` stays the bare adapter name and `args` is never
+// prefixed with a resolved `.js`/shim path, regardless of what happens to
+// be sitting on the machine actually running this suite (a real `claude`/
+// `codex`/`opencode` install, or none at all). Windows resolution itself is
+// asserted separately, with `platform: 'win32'`/`platformOverride: 'win32'`
+// and scratch PATH fixtures, in the "Windows command resolution" sections
+// below and in test/resolve-command.test.mjs.
+
 test('claude buildArgv: exact shape per docs/adapters.md', () => {
   const { cmd, args, env } = claude.buildArgv({
     prompt: 'do the thing',
@@ -34,6 +48,7 @@ test('claude buildArgv: exact shape per docs/adapters.md', () => {
     model: 'claude-opus-5',
     allowedTools: ['Read', 'Bash'],
     auth: 'subscription',
+    platform: 'linux',
   });
   assert.equal(cmd, 'claude');
   assert.deepEqual(args, [
@@ -47,8 +62,31 @@ test('claude buildArgv: exact shape per docs/adapters.md', () => {
 });
 
 test('claude buildArgv: omits --model and --allowedTools when absent', () => {
-  const { args } = claude.buildArgv({ prompt: 'hi', cwd: '/work' });
+  const { args } = claude.buildArgv({ prompt: 'hi', cwd: '/work', platform: 'linux' });
   assert.deepEqual(args, ['-p', 'hi', '--output-format', 'stream-json', '--verbose']);
+});
+
+// ---------------------------------------------------------------------------
+// claude: Windows command resolution (docs/adapters.md "Windows command
+// resolution") - proves buildArgv actually wires resolveCommand's result
+// into { cmd, args }, using a scratch PATH fixture rather than any real
+// machine path.
+// ---------------------------------------------------------------------------
+
+test('claude buildArgv: win32 injected - a real claude.exe on PATH resolves into cmd, args unaffected', () => {
+  const dir = makeTempDir();
+  const exePath = join(dir, 'claude.exe');
+  writeFileSync(exePath, '');
+
+  const { cmd, args } = claude.buildArgv({
+    prompt: 'do the thing',
+    cwd: '/work',
+    model: 'claude-opus-5',
+    platform: 'win32',
+    env: { PATH: dir },
+  });
+  assert.equal(cmd, exePath);
+  assert.deepEqual(args, ['-p', 'do the thing', '--output-format', 'stream-json', '--verbose', '--model', 'claude-opus-5']);
 });
 
 test('claude buildArgv: auth "api" keeps ANTHROPIC_API_KEY via the credential boundary', () => {
@@ -99,18 +137,18 @@ test('claude parseStream: fixture gives expected counts, tokens, cost, session i
 // ---------------------------------------------------------------------------
 
 test('codex buildArgv: new run, default sandbox read-only for reviewer roles', () => {
-  const { cmd, args } = codex.buildArgv({ prompt: 'review this', cwd: '/work', readOnly: true, outDir: '/out' });
+  const { cmd, args } = codex.buildArgv({ prompt: 'review this', cwd: '/work', readOnly: true, outDir: '/out', platform: 'linux' });
   assert.equal(cmd, 'codex');
   assert.deepEqual(args, ['exec', '--json', '--sandbox', 'read-only', '--cd', '/work', '-o', join('/out', 'last-message.md'), 'review this']);
 });
 
 test('codex buildArgv: default sandbox workspace-write for builder roles', () => {
-  const { args } = codex.buildArgv({ prompt: 'build this', cwd: '/work', outDir: '/out' });
+  const { args } = codex.buildArgv({ prompt: 'build this', cwd: '/work', outDir: '/out', platform: 'linux' });
   assert.ok(args.includes('workspace-write'));
 });
 
 test('codex buildArgv: resume passes -c sandbox_mode="read-only" and no --sandbox', () => {
-  const { args } = codex.buildArgv({ prompt: 'continue', cwd: '/work', outDir: '/out', resumeThreadId: 'thread_123' });
+  const { args } = codex.buildArgv({ prompt: 'continue', cwd: '/work', outDir: '/out', resumeThreadId: 'thread_123', platform: 'linux' });
   assert.deepEqual(args, [
     'exec', 'resume', 'thread_123',
     '-c', 'sandbox_mode="read-only"',
@@ -122,9 +160,44 @@ test('codex buildArgv: resume passes -c sandbox_mode="read-only" and no --sandbo
 
 test('codex buildArgv: danger-full-access is refused with exit code 1', () => {
   assert.throws(
-    () => codex.buildArgv({ prompt: 'x', cwd: '/work', outDir: '/out', sandbox: 'danger-full-access' }),
+    () => codex.buildArgv({ prompt: 'x', cwd: '/work', outDir: '/out', sandbox: 'danger-full-access', platform: 'linux' }),
     (e) => e instanceof Error && e.code === 1
   );
+});
+
+// ---------------------------------------------------------------------------
+// codex: Windows command resolution (docs/adapters.md "Windows command
+// resolution") - the reference machine's codex.cmd is the node-launcher
+// shape, so both cmd and args change: the real .js path is prepended ahead
+// of codex's own argv, exactly what applyResolvedCommand's prefixArgs are
+// for.
+// ---------------------------------------------------------------------------
+
+test('codex buildArgv: win32 injected - node-launcher npm shim resolves to execPath + codex.js, prepended before codex\'s own args', () => {
+  const dir = makeTempDir();
+  writeFileSync(
+    join(dir, 'codex.cmd'),
+    '"%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n'
+  );
+  const jsPath = join(dir, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+  mkdirSync(dirname(jsPath), { recursive: true });
+  writeFileSync(jsPath, '');
+  const fakeExecPath = 'C:\\fake\\nodejs\\node.exe';
+
+  const { cmd, args } = codex.buildArgv({
+    prompt: 'review this',
+    cwd: '/work',
+    readOnly: true,
+    outDir: '/out',
+    platform: 'win32',
+    env: { PATH: dir },
+    execPath: fakeExecPath,
+  });
+  assert.equal(cmd, fakeExecPath);
+  assert.deepEqual(args, [
+    jsPath,
+    'exec', '--json', '--sandbox', 'read-only', '--cd', '/work', '-o', join('/out', 'last-message.md'), 'review this',
+  ]);
 });
 
 test('codex parseStream: fixture gives expected session id, tool counts, usage', () => {
@@ -178,6 +251,7 @@ test('opencode buildArgv: shape, agent + model flags, data home isolation', () =
     model: 'opencode/deepseek-v4',
     dataHome: '/data',
     outDir: '/out',
+    platformOverride: 'linux',
   });
   assert.equal(cmd, 'opencode');
   assert.deepEqual(args, ['run', '--agent', 'builder', '--model', 'opencode/deepseek-v4', '--format', 'json', 'build the thing']);
@@ -186,8 +260,35 @@ test('opencode buildArgv: shape, agent + model flags, data home isolation', () =
 });
 
 test('opencode buildArgv: omits --agent/--model when absent', () => {
-  const { args } = opencode.buildArgv({ prompt: 'go', cwd: '/work' });
+  const { args } = opencode.buildArgv({ prompt: 'go', cwd: '/work', platformOverride: 'linux' });
   assert.deepEqual(args, ['run', '--format', 'json', 'go']);
+});
+
+// ---------------------------------------------------------------------------
+// opencode: Windows command resolution (docs/adapters.md "Windows command
+// resolution") - the reference machine's opencode.cmd is the direct-exe
+// shape, so only cmd changes; args are untouched (no prefixArgs).
+// ---------------------------------------------------------------------------
+
+test('opencode buildArgv: win32 injected - direct-exe npm shim resolves to the real opencode.exe, args unaffected', () => {
+  const dir = makeTempDir();
+  writeFileSync(join(dir, 'opencode.cmd'), '"%dp0%\\node_modules\\opencode-ai\\bin\\opencode.exe"   %*\r\n');
+  const exePath = join(dir, 'node_modules', 'opencode-ai', 'bin', 'opencode.exe');
+  mkdirSync(dirname(exePath), { recursive: true });
+  writeFileSync(exePath, '');
+
+  const { cmd, args } = opencode.buildArgv({
+    prompt: 'build the thing',
+    cwd: '/work',
+    agent: 'builder',
+    model: 'opencode/deepseek-v4',
+    dataHome: '/data',
+    outDir: '/out',
+    platformOverride: 'win32',
+    env: { PATH: dir },
+  });
+  assert.equal(cmd, exePath);
+  assert.deepEqual(args, ['run', '--agent', 'builder', '--model', 'opencode/deepseek-v4', '--format', 'json', 'build the thing']);
 });
 
 // ---------------------------------------------------------------------------
