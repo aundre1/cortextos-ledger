@@ -31,7 +31,7 @@ export function register(registry) {
           issueFile: flags['issue-file'],
         });
       } catch (e) {
-        return fail(err, 1, 'not_found', e.message);
+        return fail(err, e.code ?? 1, e.reason ?? 'not_found', e.message);
       }
       return { code: 0, stdout: result.path };
     },
@@ -69,7 +69,8 @@ export function register(registry) {
       });
 
       if (result.code !== 0) {
-        return fail(err, result.code, result.code === 5 ? 'verdict_invalid' : 'challenge', result.errors.join('; '));
+        const reason = result.reason ?? (result.code === 5 ? 'verdict_invalid' : 'challenge');
+        return fail(err, result.code, reason, result.errors.join('; '));
       }
       return { code: 0, stdout: result.verdictId };
     },
@@ -90,16 +91,21 @@ export function register(registry) {
       const escaped = flags.escaped !== undefined ? Number(flags.escaped) : undefined;
       const minutes = flags.minutes !== undefined ? Number(flags.minutes) : undefined;
 
-      const result = adjudicate(db, {
-        taskId: flags.task,
-        real,
-        noise,
-        escaped,
-        minutes,
-        note: flags.note,
-        lesson: flags.lesson,
-        appliesTo: flags['applies-to'],
-      });
+      let result;
+      try {
+        result = adjudicate(db, {
+          taskId: flags.task,
+          real,
+          noise,
+          escaped,
+          minutes,
+          note: flags.note,
+          lesson: flags.lesson,
+          appliesTo: flags['applies-to'],
+        });
+      } catch (e) {
+        return fail(err, e.code ?? 1, e.reason ?? 'error', e.message);
+      }
       const stdout = result.lesson ? `${result.intervention.id}\nlesson: ${result.lesson.id}` : result.intervention.id;
       return { code: 0, stdout };
     },

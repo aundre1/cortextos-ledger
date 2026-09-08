@@ -51,6 +51,7 @@ import {
   listTests,
   listEscalations,
 } from '../ledger.mjs';
+import { checkNotArchived } from '../limits.mjs';
 import { filterEnv, redact } from '../adapters/credential-boundary.mjs';
 import { applyResolvedCommand, resolveConfiguredCommand } from '../adapters/resolve-command.mjs';
 import { sweepTmpDir, writePidSidecar, removePidSidecar } from '../tmp-sweep.mjs';
@@ -339,6 +340,29 @@ export function register(registry) {
       if (!issue.ok) return fail(err, 1, 'usage', `--issue must be a number, got ${flags.issue}`);
       if (!pr.ok) return fail(err, 1, 'usage', `--pr must be a number, got ${flags.pr}`);
       if (!priority.ok) return fail(err, 1, 'usage', `--priority must be a number, got ${flags.priority}`);
+
+      // Real Phase 1a defect fix: a new task may not link to an archived one
+      // as its --sibling or --parent (docs/state-machine.md "Archive, never
+      // delete" - "archiving must mean nothing new attaches to the task",
+      // and a fresh link from a brand new task is exactly that, just from
+      // the other direction). Checked before any gh/PR-capture work below so
+      // a refusal never pays for that. A --sibling/--parent naming a task id
+      // that does not exist at all is left exactly as before this fix (no
+      // existence validation is done here) - only an archived one refuses.
+      if (flags.sibling) {
+        const siblingTask = getTask(db, flags.sibling);
+        const notArchivedSibling = checkNotArchived(siblingTask);
+        if (!notArchivedSibling.ok) {
+          return fail(err, 6, 'archived', `--sibling ${flags.sibling}: ${notArchivedSibling.detail}`);
+        }
+      }
+      if (flags.parent) {
+        const parentTask = getTask(db, flags.parent);
+        const notArchivedParent = checkNotArchived(parentTask);
+        if (!notArchivedParent.ok) {
+          return fail(err, 6, 'archived', `--parent ${flags.parent}: ${notArchivedParent.detail}`);
+        }
+      }
 
       // Fable arbitration 2026-09-07 (after A): `sibling_id` is a real column
       // (src/schema/002-v01-columns.mjs) so src/measure.mjs can look up the
@@ -684,6 +708,62 @@ export function register(registry) {
 
       db.prepare('UPDATE tasks SET archived_at = NULL, archive_reason = NULL WHERE id = ?').run(task.id);
       return { code: 0, stdout: 'ok' };
+    },
+  });
+
+  // Fix 2 (the deeper cause behind the Phase 1a defect): the driver that
+  // launched into an archived task had to know to filter `export`'s
+  // `archived` column on its own - nothing forced it to. `task:find` is the
+  // supported lookup path a driver or orchestrator should call instead of
+  // parsing `export`: it excludes archived tasks by default, the same
+  // exclusion `board`/`compare`/`report` already apply, so "is there already
+  // a task for repo X, PR N, arm A" never surfaces set-aside work by
+  // accident. `--include-archived` opts back in for an operator who
+  // deliberately wants to see everything, including what was set aside.
+  registry.add('task:find', {
+    description:
+      'Print matching task ids, one per line (excludes archived tasks unless --include-archived) - the supported lookup path instead of parsing export',
+    handler({ db, flags, err }) {
+      const pr = toNumber(flags.pr);
+      if (!pr.ok) return fail(err, 1, 'usage', `--pr must be a number, got ${flags.pr}`);
+      if (flags.arm !== undefined && !VALID_ARMS.has(flags.arm)) {
+        return fail(err, 1, 'usage', `--arm must be one of ${[...VALID_ARMS].join(', ')}, got ${flags.arm}`);
+      }
+      if (flags.kind !== undefined && !VALID_KINDS.has(flags.kind)) {
+        return fail(err, 1, 'usage', `--kind must be one of ${[...VALID_KINDS].join(', ')}, got ${flags.kind}`);
+      }
+
+      const clauses = [];
+      const params = [];
+      if (flags.repo !== undefined) {
+        clauses.push('repo = ?');
+        params.push(flags.repo);
+      }
+      if (pr.value !== undefined) {
+        clauses.push('pr_number = ?');
+        params.push(pr.value);
+      }
+      if (flags.arm !== undefined) {
+        clauses.push('arm = ?');
+        params.push(flags.arm);
+      }
+      if (flags.kind !== undefined) {
+        clauses.push('kind = ?');
+        params.push(flags.kind);
+      }
+      if (flags.class !== undefined) {
+        clauses.push('task_class = ?');
+        params.push(flags.class);
+      }
+      if (!flags['include-archived']) {
+        clauses.push('archived_at IS NULL');
+      }
+      const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+      const rows = db.prepare(`SELECT id FROM tasks ${where} ORDER BY created_at`).all(...params);
+      // Empty output, exit 0, when nothing matches - a driver greps this
+      // output for a task id and treats "nothing printed" as "no task
+      // exists yet", never as an error.
+      return { code: 0, stdout: rows.map((r) => r.id).join('\n') };
     },
   });
 }

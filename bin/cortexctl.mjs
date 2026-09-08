@@ -48,6 +48,7 @@ const BOOLEAN_FLAGS = new Set([
   'once',
   'force',
   'loop',
+  'include-archived',
 ]);
 
 /** argv -> { command, args, flags }. --flag value and --boolean flags may appear anywhere. */

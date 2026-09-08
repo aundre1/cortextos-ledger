@@ -221,6 +221,44 @@ export function checkOpencodeSerial(db, config, adapterName) {
 }
 
 // ---------------------------------------------------------------------------
+// Archived tasks (docs/state-machine.md "Archive, never delete")
+// ---------------------------------------------------------------------------
+
+/**
+ * Real Phase 1a defect: a driver read `export --table tasks`, found an
+ * ARCHIVED task for the PR/arm it was looking for, and launched into it.
+ * `run:launch` happened to refuse (exit 6, `task_state`, "N open halt
+ * escalation(s)") only because that particular archived task also carried
+ * halt escalations - an archived task with none would have silently
+ * accepted the run, reviving work the operator had deliberately set aside.
+ * Archiving must mean nothing new attaches to the task, independent of
+ * whatever escalations happen to be open.
+ *
+ * Every command that would add to or advance a task calls this FIRST -
+ * before its own state/gate checks - so the refusal names the real cause.
+ * Exit code 6 is docs/state-machine.md's existing "task is in a state that
+ * does not allow the command" code (the same code `task_state`/
+ * `not_archived`/`close_gate` already use for other state refusals on this
+ * kit); reason `archived` is a new, distinct value in that same family so a
+ * driver can tell "this was set aside on purpose" from "this is blocked by
+ * open escalations" - the exact distinction the Phase 1a defect blurred.
+ * `task:unarchive` is always the way back: every caller of this function
+ * works again immediately once `archived_at` is cleared.
+ */
+export function checkNotArchived(task) {
+  if (task && task.archived_at) {
+    return {
+      ok: false,
+      detail:
+        `task ${task.id} is archived (at ${task.archived_at}` +
+        `${task.archive_reason ? `, reason: ${task.archive_reason}` : ''}` +
+        `); run task:unarchive first`,
+    };
+  }
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
 // Task state machine (docs/state-machine.md "Task states")
 // ---------------------------------------------------------------------------
 

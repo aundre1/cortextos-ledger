@@ -15,7 +15,7 @@ import {
   insertVerdict,
   insertIntervention,
 } from './ledger.mjs';
-import { escalate } from './limits.mjs';
+import { escalate, checkNotArchived } from './limits.mjs';
 import { selectForPacket, add as addLesson } from './lessons.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -109,6 +109,19 @@ function readReviewerPrompt(taskKind) {
 export function buildReviewerBrief(db, config, { taskId, reviewer, issueFile }) {
   const task = getTask(db, taskId);
   if (!task) throw new Error(`no such task: ${taskId}`);
+  // Real Phase 1a defect fix: archived, checked before anything else
+  // (docs/state-machine.md "Archive, never delete") - a brief is the first
+  // thing that "attaches" to a review, so it must not be generated for a
+  // task the operator set aside. `.code`/`.reason` let the command handler
+  // (src/commands/review.mjs) report exit 6, reason `archived` instead of
+  // the generic `not_found` it uses for every other thrown Error here.
+  const notArchived = checkNotArchived(task);
+  if (!notArchived.ok) {
+    const e = new Error(notArchived.detail);
+    e.code = 6;
+    e.reason = 'archived';
+    throw e;
+  }
 
   const reviewerDir = join(config.runs, taskId, reviewer ?? 'reviewer');
   mkdirSync(reviewerDir, { recursive: true });
@@ -346,6 +359,17 @@ export function storeVerdict(db, config, { taskId, runId, reviewer, provider, mo
   const task = getTask(db, taskId);
   if (!task) return { code: 1, verdictId: null, errors: [`no such task: ${taskId}`] };
 
+  // Real Phase 1a defect fix: archived, checked before schema validation and
+  // before the blind/challenge gates (docs/state-machine.md "Archive, never
+  // delete") - storing a verdict is exactly the kind of "attach something
+  // new" this fix closes. `reason: 'archived'` lets the command handler
+  // (src/commands/review.mjs) report exit 6 with the distinct reason instead
+  // of falling into its existing 5-vs-"challenge" branching.
+  const notArchived = checkNotArchived(task);
+  if (!notArchived.ok) {
+    return { code: 6, verdictId: null, errors: [notArchived.detail], reason: 'archived' };
+  }
+
   const testsTouchedExpected = listEscalations(db, taskId).some((e) => e.reason === 'test_edit');
   const { ok, errors } = validateVerdict(verdictObj, { testsTouchedExpected });
   if (!ok) {
@@ -468,6 +492,20 @@ export function storeVerdict(db, config, { taskId, runId, reviewer, provider, mo
  * instead defined by the absence of this human_interventions row.
  */
 export function adjudicate(db, { taskId, real, noise, escaped, minutes, note, lesson, appliesTo }) {
+  // Real Phase 1a defect fix: archived, checked before anything else
+  // (docs/state-machine.md "Archive, never delete") - adjudication writes
+  // findings_real/findings_noise/defects_escaped and a human_interventions
+  // row, all "attaching" to the task. `getTask` is looked up once here and
+  // reused below (the pre-existing lesson branch used to look it up again).
+  const task = getTask(db, taskId);
+  const notArchived = checkNotArchived(task);
+  if (!notArchived.ok) {
+    const e = new Error(notArchived.detail);
+    e.code = 6;
+    e.reason = 'archived';
+    throw e;
+  }
+
   const verdicts = listVerdicts(db, taskId);
   const latest = verdicts.length ? verdicts[verdicts.length - 1] : null;
 
@@ -492,7 +530,6 @@ export function adjudicate(db, { taskId, real, noise, escaped, minutes, note, le
 
   let lessonRow = null;
   if (lesson) {
-    const task = getTask(db, taskId);
     lessonRow = addLesson(db, {
       source: 'adjudication',
       taskId,

@@ -25,6 +25,7 @@ import {
   checkSpend,
   checkQuota,
   checkOpencodeSerial,
+  checkNotArchived,
   transition,
   escalate,
   resolveEscalations,
@@ -220,6 +221,15 @@ async function doRunStart({ db, config, flags, err, platform, env }, runStartOpt
 
   const task = getTask(db, flags.task);
   if (!task) return { result: fail(err, 1, 'not_found', `no such task: ${flags.task}`) };
+
+  // Real Phase 1a defect fix: archived, checked before every other state
+  // check (docs/state-machine.md "Archive, never delete") - see
+  // checkNotArchived's own doc comment (src/limits.mjs) for why this must
+  // come first and why it is its own reason rather than task_state.
+  const notArchived = checkNotArchived(task);
+  if (!notArchived.ok) {
+    return { result: fail(err, 6, 'archived', notArchived.detail) };
+  }
 
   if (!START_ALLOWED_STATUSES.has(task.status)) {
     return {
@@ -809,6 +819,8 @@ export function register(registry) {
       }
       const task = getTask(db, flags.task);
       if (!task) return fail(err, 1, 'not_found', `no such task: ${flags.task}`);
+      const notArchivedMsg = checkNotArchived(task);
+      if (!notArchivedMsg.ok) return fail(err, 6, 'archived', notArchivedMsg.detail);
 
       let body = flags.body;
       if (existsSync(body)) {
@@ -840,6 +852,8 @@ export function register(registry) {
       }
       const task = getTask(db, flags.task);
       if (!task) return fail(err, 1, 'not_found', `no such task: ${flags.task}`);
+      const notArchivedArtifact = checkNotArchived(task);
+      if (!notArchivedArtifact.ok) return fail(err, 6, 'archived', notArchivedArtifact.detail);
       const artifact = insertArtifact(db, {
         task_id: task.id,
         run_id: flags.run,
@@ -862,6 +876,8 @@ export function register(registry) {
       }
       const task = getTask(db, flags.task);
       if (!task) return fail(err, 1, 'not_found', `no such task: ${flags.task}`);
+      const notArchivedTest = checkNotArchived(task);
+      if (!notArchivedTest.ok) return fail(err, 6, 'archived', notArchivedTest.detail);
 
       const row = insertTest(db, {
         task_id: task.id,
@@ -895,6 +911,8 @@ export function register(registry) {
       }
       const task = getTask(db, flags.task);
       if (!task) return fail(err, 1, 'not_found', `no such task: ${flags.task}`);
+      const notArchivedIntervene = checkNotArchived(task);
+      if (!notArchivedIntervene.ok) return fail(err, 6, 'archived', notArchivedIntervene.detail);
 
       const row = insertIntervention(db, {
         task_id: task.id,
@@ -919,6 +937,8 @@ export function register(registry) {
       }
       const task = getTask(db, flags.task);
       if (!task) return fail(err, 1, 'not_found', `no such task: ${flags.task}`);
+      const notArchivedClose = checkNotArchived(task);
+      if (!notArchivedClose.ok) return fail(err, 6, 'archived', notArchivedClose.detail);
 
       if (task.kind === 'implement') {
         const tests = listTests(db, task.id);
@@ -980,6 +1000,8 @@ export function register(registry) {
       }
       const task = getTask(db, flags.task);
       if (!task) return fail(err, 1, 'not_found', `no such task: ${flags.task}`);
+      const notArchivedResolve = checkNotArchived(task);
+      if (!notArchivedResolve.ok) return fail(err, 6, 'archived', notArchivedResolve.detail);
       try {
         const result = resolveEscalations(db, task.id, {
           note: flags.note,
@@ -1001,6 +1023,8 @@ export function register(registry) {
       }
       const task = getTask(db, flags.task);
       if (!task) return fail(err, 1, 'not_found', `no such task: ${flags.task}`);
+      const notArchivedReject = checkNotArchived(task);
+      if (!notArchivedReject.ok) return fail(err, 6, 'archived', notArchivedReject.detail);
       try {
         transition(db, task.id, 'rejected', { note: flags.note });
       } catch (e) {
