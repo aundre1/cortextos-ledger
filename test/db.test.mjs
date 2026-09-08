@@ -62,6 +62,7 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
     '003-v02-autonomy',
     '004-v02-run-adapter',
     '005-v02-pr-capture',
+    '006-v02-quota-reserve',
   ]);
 
   const applied = await migrate(db);
@@ -72,8 +73,9 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
     '003-v02-autonomy',
     '004-v02-run-adapter',
     '005-v02-pr-capture',
+    '006-v02-quota-reserve',
   ]);
-  assert.equal(schemaVersion(db), '005-v02-pr-capture');
+  assert.equal(schemaVersion(db), '006-v02-quota-reserve');
   assert.deepEqual(pendingMigrations(db), []);
 
   const tableNames = db
@@ -117,13 +119,16 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
   const runColumns = db.prepare('PRAGMA table_info(task_runs)').all().map((c) => c.name);
   assert.ok(runColumns.includes('adapter'), 'task_runs should have column adapter');
 
+  // task_runs.quota_reserved (review round 3, F1(c)).
+  assert.ok(runColumns.includes('quota_reserved'), 'task_runs should have column quota_reserved');
+
   // Running migrate again is a no-op: nothing pending, no error, same version.
   const secondApplied = await migrate(db);
   assert.deepEqual(secondApplied, []);
-  assert.equal(schemaVersion(db), '005-v02-pr-capture');
+  assert.equal(schemaVersion(db), '006-v02-quota-reserve');
 
   const migrationRows = db.prepare('SELECT version FROM schema_migrations').all();
-  assert.equal(migrationRows.length, 6);
+  assert.equal(migrationRows.length, 7);
 
   db.close();
 });

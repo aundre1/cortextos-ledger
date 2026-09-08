@@ -76,7 +76,7 @@ test('migration: legacy status rewrite matches docs/ledger.md exactly', async ()
   assert.equal(row.defects_escaped, 0);
 
   const versions = db.prepare('SELECT version FROM schema_migrations ORDER BY version').all().map((r) => r.version);
-  assert.deepEqual(versions, ['000-base', '001-v01-tables', '002-v01-columns', '003-v02-autonomy', '004-v02-run-adapter', '005-v02-pr-capture']);
+  assert.deepEqual(versions, ['000-base', '001-v01-tables', '002-v01-columns', '003-v02-autonomy', '004-v02-run-adapter', '005-v02-pr-capture', '006-v02-quota-reserve']);
 
   db.close();
 });
@@ -87,7 +87,7 @@ test('migration: running migrate twice on a migrated legacy db is a no-op', asyn
   insertLegacyTask(db, { id: 'b', status: 'halted' });
 
   const firstApplied = await migrate(db);
-  assert.deepEqual(firstApplied, ['000-base', '001-v01-tables', '002-v01-columns', '003-v02-autonomy', '004-v02-run-adapter', '005-v02-pr-capture']);
+  assert.deepEqual(firstApplied, ['000-base', '001-v01-tables', '002-v01-columns', '003-v02-autonomy', '004-v02-run-adapter', '005-v02-pr-capture', '006-v02-quota-reserve']);
 
   const statusesAfterFirst = db.prepare('SELECT id, status FROM tasks ORDER BY id').all();
 
@@ -98,7 +98,7 @@ test('migration: running migrate twice on a migrated legacy db is a no-op', asyn
   assert.deepEqual(statusesAfterSecond, statusesAfterFirst, 'statuses must not change on a re-run');
 
   const migrationRowCount = db.prepare('SELECT COUNT(*) AS c FROM schema_migrations').get().c;
-  assert.equal(migrationRowCount, 6);
+  assert.equal(migrationRowCount, 7);
 
   db.close();
 });

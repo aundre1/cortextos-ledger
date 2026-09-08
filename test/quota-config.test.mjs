@@ -209,6 +209,6 @@ test('quota:show prints the effective ceiling and its origin for both a config-o
   // Human readable form also carries the origin, not only --json.
   const showHuman = cli(['quota:show'], ctx);
   assert.equal(showHuman.code, 0, showHuman.stderr);
-  assert.match(showHuman.stdout, /configquota-test \* day\s+usd 0\.00\/1\.00\s+resets .*\s+origin config/);
+  assert.match(showHuman.stdout, /configquota-test \* day\s+usd 0\.00\/1\.00 \(reserved 0\.00\)\s+resets .*\s+origin config/);
   assert.match(showHuman.stdout, /other-configquota-test \* minute\s+requests 0\/2\s+resets .*\s+origin quota:set/);
 });
