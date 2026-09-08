@@ -40,7 +40,7 @@ Migration 001 must handle an existing database created by the original `schema.s
 
 ### task_runs
 
-Adds `worktree TEXT`, `out_dir TEXT`, `exit_code INTEGER`, `files_touched INTEGER`, `wallclock_limit_s INTEGER`, `halted_reason TEXT`, `pid INTEGER`. `status` values: `running`, `ok`, `fail`, `halted`, `stalled`. `agent` values are free text but the kit ships `architect`, `builder`, `reviewer`, `reviewer_b`, `second-opinion`, `solo`.
+Adds `worktree TEXT`, `out_dir TEXT`, `exit_code INTEGER`, `files_touched INTEGER`, `wallclock_limit_s INTEGER`, `halted_reason TEXT`, `pid INTEGER`, `quota_reserved INTEGER NOT NULL DEFAULT 0` (set to 1 by `run:start` when it reserved one request against this run's provider/model quota window(s) at admission; `ingest` reads it so it never adds a second request for the same run -- see `provider_quota` below and `docs/guards.md` "Reserved spend and requests"). `status` values: `running`, `ok`, `fail`, `halted`, `stalled`. `agent` values are free text but the kit ships `architect`, `builder`, `reviewer`, `reviewer_b`, `second-opinion`, `solo`.
 
 ### agent_messages
 

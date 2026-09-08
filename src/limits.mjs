@@ -147,9 +147,20 @@ export function checkQuota(db, config, provider, model, projectedCost = 0, { isP
   // unknown until a run ends, so `reservedSpend` adds a pessimistic
   // reservation: every OTHER run currently running for this provider is
   // assumed to cost up to config.limits.spend_usd (the per-task budget cap
-  // checkSpend also enforces), on top of `projectedCost` (this call's own
-  // median-based projection, unchanged).
+  // checkSpend also enforces).
+  //
+  // Arbitration (2026-09-08): the admitting call's OWN share must be
+  // reserved pessimistically too, not just projected. With no run history
+  // yet, `projectedCost` (the median of past runs) is 0, so a plain
+  // `reserved + projectedCost` under-reserves this call by one full run --
+  // e.g. limit_usd 10, spend_usd 4, two runs already running would admit a
+  // third (reserved 8 + projectedCost 0 = 8 <= 10) even though that third
+  // run could itself spend up to 4, for 12 of potential exposure against a
+  // limit of 10. Its own share is therefore
+  // `max(projectedCost, config.limits.spend_usd ?? 0)`: whichever is the
+  // larger worst case, the historical median or the per-task budget cap.
   const reserved = reservedSpend(db, config, provider);
+  const ownShare = Math.max(projectedCost, config.limits?.spend_usd ?? 0);
 
   for (const row of rows) {
     if (row.limit_requests != null && row.used_requests + 1 > row.limit_requests) {
@@ -160,7 +171,7 @@ export function checkQuota(db, config, provider, model, projectedCost = 0, { isP
       };
     }
     if (row.limit_usd != null) {
-      const committed = row.used_usd + reserved + projectedCost;
+      const committed = row.used_usd + reserved + ownShare;
       if (committed > row.limit_usd) {
         return {
           ok: false,

@@ -68,13 +68,27 @@ changes close this:
   already reserved -- `ingest` still records the run's actual `cost_usd` in
   full, it just never double-counts the request `run:start` already spent.
 - **usd ceilings reserve pessimistically for every run currently in
-  flight.** A `running` run's real cost is unknown until it ends, so
-  `checkQuota` adds a `reserved` amount to the usd check: the number of
-  other runs currently `running` for the same provider, times
-  `config.limits.spend_usd` (the same per-task budget cap `checkSpend`
-  already enforces) -- the worst case if every one of them spent all the way
-  up to its own budget. `quota:show` prints this as a `reserved_usd` column
-  per window. Zero when `config.limits.spend_usd` is not set.
+  flight, including the one being admitted.** A `running` run's real cost
+  is unknown until it ends, so `checkQuota` adds a `reserved` amount to the
+  usd check: the number of *other* runs currently `running` for the same
+  provider, times `config.limits.spend_usd` (the same per-task budget cap
+  `checkSpend` already enforces) -- the worst case if every one of them
+  spent all the way up to its own budget. `quota:show` prints this as a
+  `reserved_usd` column per window. Zero when `config.limits.spend_usd` is
+  not set.
+
+  The call being admitted must reserve its own worst case too, not just
+  the others': its share is `max(projectedCost, config.limits.spend_usd ??
+  0)`, whichever is larger -- the historical median cost for that
+  provider/model, or the per-task budget cap. Reserving only
+  `projectedCost` for the admitting call under-counts it when there is no
+  run history yet (`projectedCost` is then 0), letting one more run in than
+  the ceiling allows: `limit_usd 10`, `spend_usd 4`, two runs already
+  running reserves `8` for them, and `0 + 8 + 0 <= 10` would admit a third
+  -- three runs each capable of spending up to `4` is `12` of potential
+  exposure against a ceiling of `10`. With the admitting call's own share
+  counted, that third call reserves `8 + 4 = 12 > 10` and is refused, as it
+  must be (arbitration 2026-09-08).
 
 ### Removing a window from config
 

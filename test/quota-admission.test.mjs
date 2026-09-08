@@ -202,33 +202,39 @@ test('F1(b) reservation, real CLI: limits.spend_usd 4, window limit_usd 10 - wit
   assert.equal(cli(['init'], ctx).code, 0);
   const taskId = newTask(ctx);
 
-  // Real (already-ingested) usage of $3 against the window, well under the
+  // Real (already-ingested) usage of $1 against the window, well under the
   // $10 ceiling on its own.
-  assert.equal(cli(['quota:tick', '--provider', 'resvusd-test', '--usd', '3'], ctx).code, 0);
+  assert.equal(cli(['quota:tick', '--provider', 'resvusd-test', '--usd', '1'], ctx).code, 0);
 
   const start = () =>
     cli(['run:start', '--task', taskId, '--agent', 'solo', '--provider', 'resvusd-test', '--model', 'm1'], ctx);
 
   // Two runs admitted and left `running` (never ended) - each is now a
-  // pessimistic $4 reservation against the window.
+  // pessimistic $4 reservation against the window (arbitration 2026-09-08:
+  // the admitting call's own share is reserved too, at max(projectedCost,
+  // spend_usd), so the *first* call already commits used_usd + its own $4).
   const first = start();
   assert.equal(first.code, 0, first.stderr);
   const second = start();
   assert.equal(second.code, 0, second.stderr);
 
-  // $3 real usage + 2 running runs x $4 reserved each = $11, over the $10
-  // ceiling, even though real recorded usage alone ($3) is nowhere near it.
+  // $1 real usage + this (third) call's own $4 reservation + 2 already
+  // running runs x $4 reserved each = $13, over the $10 ceiling. Before the
+  // arbitration fix, the admitting call's own share was not reserved at
+  // all (only `reserved` for OTHER running runs), so this same setup would
+  // have admitted a third run: $1 + $8 = $9 <= $10, three runs in flight
+  // with $12 of potential exposure against a $10 ceiling.
   const third = start();
   assert.equal(third.code, 4, `expected the third run to be refused by reserved spend: ${third.stderr}`);
   assert.match(third.stderr, /^cortexctl: quota: /);
-  assert.match(third.stderr, /reserved 8\.0000/, `refusal detail should show the $8 in-flight reservation: ${third.stderr}`);
+  assert.match(third.stderr, /reserved 8\.0000/, `refusal detail should show the $8 in-flight reservation from the two other running runs: ${third.stderr}`);
 
   const show = cli(['quota:show', '--json'], ctx);
   assert.equal(show.code, 0, show.stderr);
   const row = JSON.parse(show.stdout).find((r) => r.provider === 'resvusd-test');
   assert.ok(row, show.stdout);
   assert.equal(row.reserved_usd, 8, 'quota:show should print the same $8 reservation (2 running x $4)');
-  assert.equal(row.used_usd, 3, 'real recorded usage is unaffected by the reservation');
+  assert.equal(row.used_usd, 1, 'real recorded usage is unaffected by the reservation');
 });
 
 test('F1(b) reservation, unit level: checkQuota adds no reservation when config.limits.spend_usd is unset', async () => {

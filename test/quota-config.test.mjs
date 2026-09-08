@@ -90,13 +90,23 @@ function taskShowEscalations(ctx, taskId) {
 // ---------------------------------------------------------------------------
 
 test('a config-only provider window (no quota:set ever called) is enforced: run:start refuses at exit 4 with escalation reason quota', () => {
+  // limit_usd is 6, not 1: arbitration 2026-09-08 made checkQuota reserve
+  // the ADMITTING call's own share pessimistically too, at
+  // max(projectedCost, spend_usd) - here spend_usd is 5.0 (see setup()'s
+  // comment), so every run:start against a limit_usd window now commits at
+  // least $5 against it on its own, before any real spend is ever
+  // recorded. A $1 ceiling would refuse the very first run:start on
+  // reservation alone and never exercise this test's actual point: that
+  // real spend recorded by `ingest` (never `quota:set`/`quota:tick`) is
+  // what pushes a config-only ceiling over on a later call.
   const ctx = setup({
-    'configquota-test': { windows: [{ kind: 'day', limit_usd: 1 }] },
+    'configquota-test': { windows: [{ kind: 'day', limit_usd: 6 }] },
   });
   assert.equal(cli(['init'], ctx).code, 0);
   const taskId = newTask(ctx);
 
-  // First run: cheap ($0.10), well under the $1/day config ceiling. Passes.
+  // First run: reserves its own $5 share (0 real usage + 0 other running +
+  // $5 own share = $5 <= $6). Passes.
   const first = startRun(ctx, taskId);
   assert.equal(first.code, 0, first.stderr);
   const runId = first.stdout.trim();
@@ -104,7 +114,9 @@ test('a config-only provider window (no quota:set ever called) is enforced: run:
 
   // Record real spend through the real `ingest` command (never `quota:set`,
   // never `quota:tick`) that pushes this provider's usage past the config's
-  // own $1/day ceiling.
+  // own $6/day ceiling once a second call's own $5 reservation is added.
+  // ingest's session.end event (exit_code 0) also moves the first run out
+  // of 'running', so it no longer contributes to the *other-runs* term.
   const eventsPath = writeEventsFile(ctx.homeDir, 2.5);
   const ingestResult = cli(['ingest', '--events', eventsPath, '--task', taskId, '--run', runId], ctx);
   assert.equal(ingestResult.code, 0, ingestResult.stderr);
@@ -117,12 +129,12 @@ test('a config-only provider window (no quota:set ever called) is enforced: run:
   assert.match(show.stdout, /configquota-test/);
   assert.match(show.stdout, /origin config/);
 
-  // Second run:start on the same task, same provider: the config ceiling
-  // ($1) has now been exceeded by real recorded spend ($2.50) with no
-  // quota:set row ever having been written. This is the exact defect this
-  // task fixes -- before the fix, checkQuota never looked at config at all
-  // and this refusal never fired (exit 0, task allowed to keep spending
-  // past its documented ceiling).
+  // Second run:start on the same task, same provider: $2.50 real usage + 0
+  // other running runs + this call's own $5 reservation = $7.50, over the
+  // $6 ceiling, with no quota:set row ever having been written. This is the
+  // exact defect this task fixes -- before the fix, checkQuota never looked
+  // at config at all and this refusal never fired (exit 0, task allowed to
+  // keep spending past its documented ceiling).
   const second = startRun(ctx, taskId);
   assert.equal(second.code, 4, second.stderr);
   assert.match(second.stderr, /^cortexctl: quota: /);
