@@ -247,6 +247,7 @@ async function doRunStart({ db, config, flags, err }) {
       allowDirty: !!flags['allow-dirty'],
       strict: !!flags.strict,
       taskId: task.id,
+      adapterName,
     });
     if (!pf.ok) {
       return { result: fail(err, pf.code, pf.reason, pf.detail ?? '') };
@@ -320,6 +321,11 @@ export function register(registry) {
         allowDirty: !!flags['allow-dirty'],
         strict: !!flags.strict,
         taskId: flags.task,
+        // Optional: docs/adapters.md "Windows command resolution" - lets an
+        // operator check "will run:launch even find this harness on PATH"
+        // ahead of a real run:start/run:launch, which always pass their own
+        // resolved adapterName through automatically.
+        adapterName: flags.adapter ?? null,
       });
       if (!result.ok) return fail(err, result.code, result.reason, result.detail ?? '');
       return { code: 0, stdout: 'ok' };
@@ -403,7 +409,13 @@ export function register(registry) {
           dataHome = join(config.runs, '.opencode-data');
           mkdirSync(join(dataHome, flags.agent), { recursive: true });
         }
-        const { cmd, args, env } = adapter.buildArgv({
+        // Windows command resolution (docs/adapters.md "Windows command
+        // resolution"): `adapterConfig.cmd` (the review round 1 F2 test
+        // harness override) still wins outright when set; otherwise
+        // `config.tools.<adapterName>` (an operator-supplied argv array)
+        // skips resolveCommand entirely; otherwise each adapter's own
+        // buildArgv resolves the real command itself.
+        const { cmd, args, env, resolvedFrom } = adapter.buildArgv({
           prompt,
           cwd: task.worktree,
           agent: flags.agent,
@@ -412,7 +424,11 @@ export function register(registry) {
           dataHome,
           cmd: adapterConfig.cmd,
           argsPrefix: adapterConfig.argsPrefix,
+          toolOverride: config.tools?.[adapterName],
         });
+        if (resolvedFrom === null) {
+          err(`cortexctl: warn: ${adapterName} not found on PATH; spawn will fail with ENOENT`);
+        }
         launchDetached({
           argv: { cmd, args, env },
           cwd: task.worktree,

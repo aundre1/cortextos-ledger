@@ -33,6 +33,26 @@ test('doctor: reports node version and schema version / pending migrations', asy
   assert.ok(result.findings.some((f) => f.text.includes('schema version')));
 });
 
+test('doctor: always reports gh command resolution, and one line per distinct real adapter in config.agents (never fake)', async () => {
+  const { db, config: base } = await migrated();
+  const config = {
+    ...base,
+    agents: {
+      builder: { adapter: 'opencode', model: 'x' },
+      solo: { adapter: 'opencode', model: 'x' }, // same adapter as builder - one line, not two
+      reviewer_b: { adapter: 'codex', model: 'y' },
+      local_test: { adapter: 'fake' },
+    },
+  };
+  const result = doctor(db, config, {});
+  const commandLines = result.findings.filter((f) => f.text.startsWith('command '));
+  const names = commandLines.map((f) => f.text.split(':')[0]);
+  assert.deepEqual(new Set(names), new Set(['command opencode', 'command codex', 'command gh']));
+  // Every real adapter resolves trivially on this (non-win32) test host -
+  // resolveCommand's rule 1 is a pure no-op there - so every line is 'info'.
+  assert.ok(commandLines.every((f) => f.level === 'info'), JSON.stringify(commandLines));
+});
+
 test('doctor: probable cause "quota" when a quota window is exhausted and the last event is a model call', async () => {
   const { db, config } = await migrated();
   const task = insertTask(db, { repo: 'o/n', title: 'T', task_class: 'ci', arm: 'control' });

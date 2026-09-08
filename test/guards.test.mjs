@@ -207,6 +207,71 @@ test('preflight: quota exhaustion refuses with exit 4 and escalation reason quot
 });
 
 // ---------------------------------------------------------------------------
+// preflight: command resolution (docs/adapters.md "Windows command
+// resolution", docs/guards.md "Command resolution")
+// ---------------------------------------------------------------------------
+
+test('preflight: no --adapter given -> command resolution is skipped entirely', async () => {
+  const db = await freshDb();
+  const { dir } = makeTempGitRepo();
+  const result = await preflight(db, CONFIG, { worktree: dir, provider: 'openai', model: 'gpt-x' });
+  assert.equal(result.ok, true, JSON.stringify(result));
+});
+
+test('preflight: adapter "fake" is never checked, even injected as win32 with an empty PATH', async () => {
+  const db = await freshDb();
+  const { dir } = makeTempGitRepo();
+  const result = await preflight(db, CONFIG, {
+    worktree: dir, provider: 'openai', model: 'gpt-x', adapterName: 'fake',
+    platform: 'win32', env: { PATH: '' },
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+});
+
+test('preflight: a real adapter on a platform where resolution always succeeds (posix) -> ok', async () => {
+  const db = await freshDb();
+  const { dir } = makeTempGitRepo();
+  const result = await preflight(db, CONFIG, {
+    worktree: dir, provider: 'openai', model: 'gpt-x', adapterName: 'claude', platform: 'linux',
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+});
+
+test('preflight: injected win32 with nothing on PATH -> refuses exit 1, reason command_not_found, no escalation row', async () => {
+  const db = await freshDb();
+  const { dir } = makeTempGitRepo();
+  const task = insertTask(db, { repo: 'o/n', title: 't', task_class: 'ci', arm: 'control' });
+  transition(db, task.id, 'working');
+
+  const result = await preflight(db, CONFIG, {
+    worktree: dir, provider: 'openai', model: 'gpt-x', taskId: task.id,
+    adapterName: 'opencode', platform: 'win32', env: { PATH: '' },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 1);
+  assert.equal(result.reason, 'command_not_found');
+  assert.match(result.detail, /opencode/);
+
+  // No escalation row: docs/ledger.md's escalations.reason enum has no
+  // command_not_found slot, matching the node_version precedent.
+  assert.deepEqual(listEscalations(db, task.id), []);
+  db.close();
+});
+
+test('preflight: config.tools.<adapter> override bypasses PATH resolution entirely, even on injected win32 with an empty PATH', async () => {
+  const db = await freshDb();
+  const { dir } = makeTempGitRepo();
+  const config = { ...CONFIG, tools: { opencode: ['C:/tools/opencode.exe'] } };
+
+  const result = await preflight(db, config, {
+    worktree: dir, provider: 'openai', model: 'gpt-x',
+    adapterName: 'opencode', platform: 'win32', env: { PATH: '' },
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
 // postrun
 // ---------------------------------------------------------------------------
 

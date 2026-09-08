@@ -93,6 +93,24 @@ function mergeConfig(defaults, override) {
   return merged;
 }
 
+// docs/adapters.md "Windows command resolution": per-tool argv-array
+// overrides that skip resolveCommand entirely (cmd = override[0], prefixArgs
+// = override.slice(1)) - e.g. `"tools": { "gh": ["C:/tools/gh.exe"] }`. Keyed
+// by tool name (`gh`, `claude`, `codex`, `opencode`, `npm`, ...); not
+// restricted to a fixed allowlist here since an operator's own PATH quirks
+// are exactly what this escape hatch exists for.
+function validateTools(tools) {
+  if (tools === undefined) return;
+  if (typeof tools !== 'object' || tools === null || Array.isArray(tools)) {
+    throw new Error(`tools must be an object, got ${JSON.stringify(tools)}`);
+  }
+  for (const [name, override] of Object.entries(tools)) {
+    if (!Array.isArray(override) || override.length === 0 || !override.every((v) => typeof v === 'string' && v.length > 0)) {
+      throw new Error(`tools.${name} must be a non-empty array of non-empty strings, got ${JSON.stringify(override)}`);
+    }
+  }
+}
+
 function validateLimits(limits) {
   for (const key of LIMIT_KEYS) {
     const value = limits[key];
@@ -175,5 +193,6 @@ export function loadConfig({ configPath, dbOverride, cwd = process.cwd() } = {})
 
   validateLimits(merged.limits);
   validateAutonomy(merged.autonomy);
+  validateTools(merged.tools);
   return merged;
 }

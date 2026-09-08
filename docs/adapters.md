@@ -61,6 +61,34 @@ Deterministic adapter for tests. Reads a fixture describing the events to emit, 
 
 `spawn.mjs` creates the child in a new process group (`detached: true` on POSIX, `CREATE_NEW_PROCESS_GROUP` semantics on Windows through `windowsHide` plus `detached`), writes `pid.txt`, redirects stdout and stderr to `out.txt`, and writes `exit.txt`, `elapsed_ms.txt`, and `done.marker` on close. `credential-boundary.mjs` is applied to every spawn (see `security.md`).
 
+## Windows command resolution
+
+Every harness this kit spawns (`claude`, `codex`, `opencode`) plus `gh` (task capture) and `npm` (the packaging scripts) is invoked by bare name with `shell: false`, always. On POSIX that is exactly right -- `spawn`'s own PATH search finds the real executable. On Windows, a harness installed the normal way (`npm i -g`) exists on PATH only as `<name>.cmd`/`<name>.ps1` (npm's own shim convention): Node's `spawn` with `shell: false` performs PATHEXT-aware resolution, but that covers `.exe`/`.com`/`.bat` -- never `.cmd` -- and, since the CVE-2024-27980 fix, spawning a `.cmd`/`.bat` directly without `shell: true` throws `EINVAL` rather than doing the wrong thing silently.
+
+`resolveCommand(name, opts)` (`src/adapters/resolve-command.mjs`, re-exported from `spawn.mjs`) finds the real target behind a `.cmd` shim so every spawn always has something it can actually exec, with `shell: false` unchanged. `opts` overrides `platform`/`env`/`execPath`/`readFile` (each defaulting to the real thing) so the whole rule set is unit-testable on any host. The rules, in order:
+
+1. **Not Windows.** `{ cmd: name, prefixArgs: [] }`, unchanged -- this is a pure no-op everywhere except win32.
+2. **Already explicit.** `name` containing a path separator, or already ending in `.exe`/`.com`, is used exactly as given. A name already ending in `.cmd`/`.bat` still goes through rule 5's shim parser (an operator who points `config.tools` straight at a `.cmd` file gets it parsed, not blindly executed).
+3. **Every PATH entry's `<name>.exe` then `<name>.com`, first hit wins.** This whole pass runs across *every* PATH entry before rule 4 ever looks at a `.cmd` -- an `.exe` anywhere on PATH beats a `.cmd` shim earlier on PATH (the reference machine's `claude.exe` ahead of an npm `claude.cmd` shim is exactly this case).
+4. **The first `<name>.cmd` on PATH, parsed as an npm shim.** npm's shim generator (cmd-shim) emits exactly two shapes: a *direct-exe* shim (`"%dp0%\node_modules\<pkgpath>\<file>.exe"   %*` -- the reference machine's `opencode.cmd`) resolves to that `.exe` directly; a *node-launcher* shim (`"%_prog%"  "%dp0%\node_modules\<pkgpath>\<file>.js" %*`, or the older `"%dp0%\node.exe" ...` form -- the reference machine's `codex.cmd`, and `npm.cmd` itself) resolves to `{ cmd: execPath, prefixArgs: [<the .js path>] }`. Either way the target is verified with `fs.existsSync` before it is trusted; a target that does not exist falls through to rule 5.
+5. **Unparseable (or missing-target) `.cmd`/`.bat`: the `cmd.exe` fallback.** `{ cmd: env.ComSpec ?? 'cmd.exe', prefixArgs: ['/d', '/s', '/c', <escaped shim path>], escapeArgs: true }`. `escapeArgs: true` tells the caller (`applyResolvedCommand`) to run every argument it appends through the same escaping function (`escapeCmdArg`, ported from cross-spawn's algorithm rather than adding a dependency -- see `security.md`). This is the one path where the kit still ends up executing through a shell-like program; it is a last resort, not the common case.
+6. **Nothing found anywhere on PATH.** `{ cmd: name, prefixArgs: [], resolvedFrom: null }` -- the caller spawns `name` itself and gets the platform's own `ENOENT`. `preflight` refuses outright (exit 1, reason `command_not_found`) rather than let a launch reach this silently; `doctor` prints it as `NOT FOUND` for every configured adapter and for `gh`.
+
+`resolvedFrom` on the result is a short human string naming which rule fired (`posix`, `given`, `exe on PATH`, `com on PATH`, `npm shim -> exe`, `npm shim -> node + js`, `cmd.exe fallback`, or `null`) -- `doctor` and `preflight` print it verbatim (see `guards.md` and `cli.md`).
+
+### `config.tools`: manual overrides
+
+`config.tools` is an optional object of `{ "<name>": [<cmd>, ...args] }` argv arrays that skip resolution entirely for that tool: `cmd = override[0]`, `prefixArgs = override.slice(1)`. This is the escape hatch for a PATH an operator cannot fix (a harness installed somewhere resolution does not look, a wrapper script, a version pin):
+
+```json
+"tools": {
+  "gh": ["C:/tools/gh.exe"],
+  "opencode": ["C:/tools/opencode/node_modules/opencode-ai/bin/opencode.exe"]
+}
+```
+
+**Precedence** (highest wins): an adapter-level `cmd` (the review round 1 test-harness override, `config.adapters.<name>.cmd`) wins outright over everything, since that already exists specifically to stand a stub in for the real CLI; then `config.tools.<name>`; then `resolveCommand(name, ...)`. `run:start`/`run:launch` pass the resolved adapter's name through automatically; `task:new`'s `gh` capture reads `config.tools.gh` the same way. Every adapter's own `buildArgv` documents this precedence again at the point it applies it.
+
 ## Adapter selection
 
 `cortexctl run:start --adapter <claude|codex|opencode|fake>` or from the agent definition in config:

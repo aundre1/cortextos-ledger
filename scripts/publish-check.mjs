@@ -37,6 +37,8 @@ import { existsSync, readFileSync as readFile } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PATTERNS as SCAN_PATTERNS } from '../src/guards/secrets-scan.mjs';
+import { resolveNpmCommand } from '../src/adapters/resolve-npm.mjs';
+import { applyResolvedCommand } from '../src/adapters/resolve-command.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(HERE, '..');
@@ -257,10 +259,20 @@ function checkPackedPath(pkgPath, findings) {
 function checkPackedTarball(findings) {
   let out;
   try {
-    out = execFileSync('npm', ['pack', '--dry-run', '--json'], {
+    // docs/adapters.md "Windows command resolution": bare `npm` with
+    // shell:false throws EINVAL on Windows (npm ships only as npm.cmd
+    // there). resolveNpmCommand runs the exact npm bundled next to this
+    // process's own `node`/`node.exe` (node_modules/npm/bin/npm-cli.js),
+    // which sidesteps PATH/shim resolution entirely and needs no shell on
+    // any platform - falling back to resolveCommand('npm', ...) only if a
+    // Node install somehow ships without a bundled npm.
+    const resolution = resolveNpmCommand();
+    const { cmd, args } = applyResolvedCommand(resolution, ['pack', '--dry-run', '--json']);
+    out = execFileSync(cmd, args, {
       cwd: REPO_ROOT,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
+      shell: false,
     });
   } catch (e) {
     findings.push(`BLOCKED npm pack --dry-run (failed to run: ${e.message})`);

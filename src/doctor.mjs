@@ -9,6 +9,12 @@ import { getTask, listEscalations, countRuns, sumCost, listQuota, lastLoopTick }
 import { rollQuota, windowEndsAt } from './quota.mjs';
 import { deriveNextAction, computeLimits } from './packet.mjs';
 import { redact } from './adapters/credential-boundary.mjs';
+// Aliased: this module already has its own local `resolveCommand` variable
+// (the suggested cortexctl invocation for resolving a diagnosed problem,
+// unrelated pre-existing name) inside diagnoseRun/diagnoseTask/doctor below
+// - importing the Windows command-resolution helper under its own name would
+// shadow that.
+import { resolveConfiguredCommand as resolveToolCommand } from './adapters/resolve-command.mjs';
 
 const MIN_NODE_MAJOR = 22;
 const MIN_NODE_MINOR = 5;
@@ -229,6 +235,53 @@ function diagnoseAll(db, config, now) {
 }
 
 // ---------------------------------------------------------------------------
+// Command resolution (docs/adapters.md "Windows command resolution")
+// ---------------------------------------------------------------------------
+
+/** 'NOT FOUND' for resolvedFrom === null (nothing on PATH matched); the resolvedFrom string itself otherwise (e.g. 'exe on PATH', 'npm shim -> exe', 'npm shim -> node + js', 'cmd.exe fallback', 'config.tools', 'override', 'posix'). */
+function describeResolution(resolvedFrom) {
+  return resolvedFrom === null ? 'NOT FOUND' : resolvedFrom;
+}
+
+/**
+ * One finding per distinct real adapter (`claude`/`codex`/`opencode` -
+ * never `fake`, which spawns a fixed in-repo node script and has nothing to
+ * resolve) named by any agent in `config.agents`, plus one for `gh` always
+ * (a `pr_review` task's `task:new` needs it, and printing it unconditionally
+ * costs nothing and never surprises an operator who forgot they have one).
+ * Each line names the resolved command's path and how it got there,
+ * `warn`-level with `command_not_found` when nothing on PATH matched at all
+ * - the same condition preflight refuses a run over (see preflight.mjs).
+ */
+function diagnoseCommandResolution(config) {
+  const findings = [];
+  const seen = new Set();
+
+  for (const def of Object.values(config.agents ?? {})) {
+    const adapterName = def?.adapter;
+    if (!adapterName || adapterName === 'fake' || seen.has(adapterName)) continue;
+    seen.add(adapterName);
+    const adapterConfig = config.adapters?.[adapterName] ?? {};
+    const resolution = resolveToolCommand(adapterName, {
+      cmd: adapterConfig.cmd,
+      toolOverride: config.tools?.[adapterName],
+    });
+    findings.push({
+      level: resolution.resolvedFrom === null ? 'warn' : 'info',
+      text: `command ${adapterName}: ${describeResolution(resolution.resolvedFrom)} (${resolution.cmd})`,
+    });
+  }
+
+  const gh = resolveToolCommand('gh', { toolOverride: config.tools?.gh });
+  findings.push({
+    level: gh.resolvedFrom === null ? 'warn' : 'info',
+    text: `command gh: ${describeResolution(gh.resolvedFrom)} (${gh.cmd})`,
+  });
+
+  return findings;
+}
+
+// ---------------------------------------------------------------------------
 // doctor
 // ---------------------------------------------------------------------------
 
@@ -247,6 +300,8 @@ export function doctor(db, config, { taskId, runId, all, now = new Date() } = {}
     level: pending.length ? 'warn' : 'info',
     text: `schema version ${schemaVersion(db) ?? '(none applied)'}, pending migrations: ${pending.length}`,
   });
+
+  findings.push(...diagnoseCommandResolution(config));
 
   if (runId) {
     const run = db.prepare('SELECT * FROM task_runs WHERE id = ?').get(runId);

@@ -15,33 +15,39 @@
 //
 // Portable per this repo's coding rules (see "Coding rules" in the wave
 // todo, and docs/security.md): no `/tmp` literals (uses node:os tmpdir()),
-// no chmod, no shell pipes, spawn with shell: false except where Windows
-// requires a shell to invoke the npm.cmd shim.
+// no chmod, no shell pipes, spawn with shell: false everywhere, including
+// npm itself on Windows (see runNpm's own comment and
+// src/adapters/resolve-npm.mjs).
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveNpmCommand } from '../src/adapters/resolve-npm.mjs';
+import { applyResolvedCommand } from '../src/adapters/resolve-command.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..');
-const IS_WIN = process.platform === 'win32';
 
 function log(line) {
   process.stdout.write(`[smoke] ${line}\n`);
 }
 
-// npm itself ships as `npm.cmd` on Windows, which Node refuses to spawn
-// with shell:false (EINVAL) - shell:true is required there and is safe
-// since every argument below is a fixed, hardcoded literal, never
-// untrusted input. On POSIX, npm is a regular executable and shell stays
-// false, matching the project's "spawn with shell: false" rule.
+// docs/adapters.md "Windows command resolution": npm itself ships as
+// `npm.cmd` on Windows, which Node refuses to spawn with shell:false
+// (EINVAL - CVE-2024-27980). Rather than falling back to shell:true (which
+// this project's coding rules avoid everywhere else), resolveNpmCommand
+// runs the exact npm bundled next to this process's own `node`/`node.exe`
+// (node_modules/npm/bin/npm-cli.js) directly with `execPath` - the same npm
+// `npm.cmd`'s own shim would have run, with no PATH/shim resolution and no
+// shell involved on any platform.
 function runNpm(args, cwd) {
-  return execFileSync(IS_WIN ? 'npm.cmd' : 'npm', args, {
+  const { cmd, args: finalArgs } = applyResolvedCommand(resolveNpmCommand(), args);
+  return execFileSync(cmd, finalArgs, {
     cwd,
     encoding: 'utf8',
-    shell: IS_WIN,
+    shell: false,
   });
 }
 

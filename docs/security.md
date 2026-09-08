@@ -35,6 +35,10 @@ Nothing else the kit writes is ever unredacted at rest even transiently: `out.tx
 
 Community source material: this kit was shaped by problems raised in a private, paid community. The kit describes the failure modes it prevents in general terms. It quotes nobody and names nobody. Pull requests that add quotes or names from community calls are declined.
 
+## Windows command-line fallback
+
+Every spawn in this kit uses `shell: false`. The one exception -- and it is a fallback, not a default -- is `resolveCommand`'s last resort for a Windows `.cmd`/`.bat` shim it cannot parse into a real executable (`src/adapters/resolve-command.mjs`, `docs/adapters.md` "Windows command resolution" rule 5): it spawns `cmd.exe` itself (`/d /s /c <shim path>`) with the shim path and every argument passed through `escapeCmdArg` -- cross-spawn's escaping algorithm, ported here rather than adding a dependency: escape a literal `"` as `\"` (doubling any backslashes immediately before it, and any trailing backslashes so they cannot escape the closing quote), wrap the whole argument in quotes, then escape `cmd.exe`'s own metacharacters `()%!^"<>&|` with a leading `^` so `cmd.exe`'s parser does not act on them. This path is taken only when a `.cmd`/`.bat` shim exists on PATH and matches neither of npm's own two shim shapes (or its parsed target is missing on disk) -- it never runs for a plain `.exe`, and it never interprets a prompt or any other kit-controlled string as shell syntax, only the fixed argv the adapter itself built. `doctor` reports this path as `cmd.exe fallback` so an operator can see when it fires and set `config.tools.<name>` to bypass it.
+
 ## Permissions at the harness layer
 
 Builder agents may edit and run commands but are denied `git push`, `git merge`, `git reset --hard`, `git branch -D`, `git checkout .`, and `gh pr merge`. Reviewer agents are read only. These live in the harness agent definitions shipped under `community/` and `examples/`, and the adapters refuse to launch a reviewer with write permissions when the config says `read_only: true`.

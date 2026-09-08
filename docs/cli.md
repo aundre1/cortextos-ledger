@@ -31,7 +31,7 @@ Global flags: `--config <path>`, `--db <path>` (overrides config), `--json` (mac
 
 | Command | Effect |
 |---|---|
-| `preflight --worktree <p> --provider <p> [--model <m>] [--public] [--allow-dirty] [--strict]` | Guards, exit 2 or 4 on refusal |
+| `preflight --worktree <p> --provider <p> [--model <m>] [--adapter <x>] [--public] [--allow-dirty] [--strict]` | Guards, exit 1/2/4 on refusal. `--adapter` (optional here; `run:start`/`run:launch` always pass their own resolved adapter through) additionally checks Windows command resolution -- see `docs/guards.md` "Command resolution" and `docs/adapters.md` "Windows command resolution" |
 | `run:start --task <id> --agent <a> [--adapter <x>] [--provider <p>] [--model <m>] [--public] [--no-preflight]` | Limit and quota gates, insert run, print run id |
 | `run:launch --task <id> --agent <a> --prompt-file <f> [--detach]` | `run:start` plus adapter spawn plus watchdog; the one command an orchestrator needs |
 | `run:end --run <id> [--exit <code>] [--tokens-in <n>] [--tokens-out <n>] [--cost <x>] [--summary ...]` | Post run guards, files touched, status |
@@ -75,9 +75,10 @@ Global flags: `--config <path>`, `--db <path>` (overrides config), `--json` (mac
 
 1. Node version and `node:sqlite` availability.
 2. Database present, schema version, pending migrations.
-3. For a run: `pid.txt` present and process alive; `done.marker` present; `exit.txt` value; `events.jsonl` last event type and age; `out.txt` last non empty line with secrets redacted; watchdog escalation rows; quota windows for the run's provider and whether any is exhausted; elapsed against `wallclock_s`.
-4. For a task: attempts used, spend used, open escalations, the derived `next_action`.
-5. For `--all`: every `running` run older than `stall_s` with no recent event, every `input_required` task, every quota window at or above 90 percent.
+3. Command resolution (`docs/adapters.md` "Windows command resolution"): one line per distinct real adapter (`claude`/`codex`/`opencode`, never `fake`) named by any agent in `config.agents`, plus one for `gh` always -- each names the resolved command's path and how it got there (`exe on PATH`, `npm shim -> exe`, `npm shim -> node + js`, `cmd.exe fallback`, `NOT FOUND`), `warn`-level when nothing on PATH matched at all.
+4. For a run: `pid.txt` present and process alive; `done.marker` present; `exit.txt` value; `events.jsonl` last event type and age; `out.txt` last non empty line with secrets redacted; watchdog escalation rows; quota windows for the run's provider and whether any is exhausted; elapsed against `wallclock_s`.
+5. For a task: attempts used, spend used, open escalations, the derived `next_action`.
+6. For `--all`: every `running` run older than `stall_s` with no recent event, every `input_required` task, every quota window at or above 90 percent.
 
 Probable cause is chosen by rule: quota exhausted and last event is a model call → `quota`; process dead, no `done.marker`, no `exit.txt` → `killed externally or machine slept`; last event is a tool call with no result → `tool hang`; elapsed past the wall clock with no escalation → `watchdog missing`. Output ends with the exact `cortexctl` command that resolves the state when one exists.
 

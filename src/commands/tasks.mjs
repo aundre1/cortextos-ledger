@@ -51,6 +51,7 @@ import {
   listEscalations,
 } from '../ledger.mjs';
 import { filterEnv, redact } from '../adapters/credential-boundary.mjs';
+import { applyResolvedCommand, resolveConfiguredCommand } from '../adapters/resolve-command.mjs';
 import { sweepTmpDir, writePidSidecar, removePidSidecar } from '../tmp-sweep.mjs';
 
 const VALID_ARMS = new Set(['tri', 'control']);
@@ -94,11 +95,23 @@ function fail(errFn, code, reason, detail) {
  * Node exceeded even this function's old 64 MiB ceiling on some platforms
  * (ENOBUFS) well before the 2,000,000 byte size guard ever got a chance to
  * apply.
+ *
+ * `opts.toolOverride` (`config.tools.gh`, docs/adapters.md "Windows command
+ * resolution") skips PATH resolution entirely when set; otherwise `gh` is
+ * resolved via `resolveConfiguredCommand` - on POSIX this is still exactly
+ * the plain `spawnSync('gh', ...)` PATH search this comment used to
+ * describe, unchanged; on win32 it finds the real `gh.exe` behind a
+ * `gh.cmd` shim (or uses `gh.exe` directly when that is what is on PATH -
+ * the reference Windows machine's `gh` is a real `.exe`, so this is a no-op
+ * there today, but the resolution runs the same way regardless of what a
+ * given operator's PATH happens to contain).
  */
-function runGh(args) {
+function runGh(args, opts = {}) {
+  const resolution = resolveConfiguredCommand('gh', { toolOverride: opts.toolOverride });
+  const { cmd, args: finalArgs } = applyResolvedCommand(resolution, args);
   let result;
   try {
-    result = spawnSync('gh', args, {
+    result = spawnSync(cmd, finalArgs, {
       shell: false,
       encoding: 'utf8',
       maxBuffer: 64 * 1024 * 1024,
@@ -135,16 +148,18 @@ function runGh(args) {
  * Same return shape as runGh: `{ ok: true }` or `{ ok: false, code, reason,
  * detail }`. Never throws.
  */
-function runGhDiffToFile(args, destPath) {
+function runGhDiffToFile(args, destPath, opts = {}) {
   let fd;
   try {
     fd = openSync(destPath, 'w');
   } catch (e) {
     return { ok: false, code: 1, reason: 'gh_failed', detail: `could not open ${destPath}: ${e.message}` };
   }
+  const resolution = resolveConfiguredCommand('gh', { toolOverride: opts.toolOverride });
+  const { cmd, args: finalArgs } = applyResolvedCommand(resolution, args);
   let result;
   try {
-    result = spawnSync('gh', args, {
+    result = spawnSync(cmd, finalArgs, {
       shell: false,
       stdio: ['ignore', fd, 'pipe'],
       encoding: 'utf8',
@@ -243,12 +258,11 @@ function hashFile(path) {
  * with no computed merge base yet) - every read of `meta` downstream uses
  * `?.` for exactly this reason.
  */
-function capturePr(repo, pr, tmpRawDiffPath) {
-  const view = runGh([
-    'pr', 'view', String(pr),
-    '--repo', repo,
-    '--json', 'number,title,body,baseRefOid,headRefOid,baseRefName,headRefName',
-  ]);
+function capturePr(repo, pr, tmpRawDiffPath, opts = {}) {
+  const view = runGh(
+    ['pr', 'view', String(pr), '--repo', repo, '--json', 'number,title,body,baseRefOid,headRefOid,baseRefName,headRefName'],
+    opts
+  );
   if (!view.ok) return view;
 
   let meta;
@@ -258,7 +272,7 @@ function capturePr(repo, pr, tmpRawDiffPath) {
     return { ok: false, code: 1, reason: 'gh_failed', detail: `gh pr view returned invalid JSON: ${e.message}` };
   }
 
-  const diff = runGhDiffToFile(['pr', 'diff', String(pr), '--repo', repo], tmpRawDiffPath);
+  const diff = runGhDiffToFile(['pr', 'diff', String(pr), '--repo', repo], tmpRawDiffPath, opts);
   if (!diff.ok) return diff;
 
   return { ok: true, meta };
@@ -391,7 +405,7 @@ export function register(registry) {
         // sidecar written above is removed here too (NF5), in the same
         // `finally`, so it never outlives the raw file it guards.
         try {
-          const captured = capturePr(flags.repo, pr.value, tmpRawDiffPath);
+          const captured = capturePr(flags.repo, pr.value, tmpRawDiffPath, { toolOverride: config.tools?.gh });
           if (!captured.ok) {
             return fail(err, captured.code, captured.reason, captured.detail);
           }

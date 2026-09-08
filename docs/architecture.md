@@ -79,6 +79,14 @@ Resolution order: `--config <path>`, then `CORTEX_LEDGER_CONFIG`, then `./cortex
 
 Each entry in a provider's `windows` array is itself an enforced ceiling, not documentation: `run:start`'s quota gate, `ingest`, `quota:tick`, and `quota:show` all read it directly (via `provider_quota` rows seeded and kept in sync from the config, `src/quota.mjs`'s `syncConfigQuota`) with no `quota:set` call required. `quota:set` remains the way to override one of these windows for a single deployment -- once set, its row wins over the config for that (provider, model, window kind) permanently, until `quota:set` is used again; see `docs/guards.md` "Provider quota ceilings: config vs. `quota:set`" for the exact precedence rule.
 
+An optional `"tools"` object overrides how a harness or `gh`/`npm` binary is found on Windows, where an npm-installed harness resolves only to a `.cmd` shim that `shell: false` cannot exec directly:
+
+```json
+"tools": { "gh": ["C:/tools/gh.exe"] }
+```
+
+See `docs/adapters.md` "Windows command resolution" for the full resolution rule set and precedence; this key is validated (a non-empty array of non-empty strings per tool) but otherwise optional and empty by default.
+
 ## Portability
 
 Node 22.5 or later, because the ledger uses `node:sqlite` with zero dependencies. Windows is the first class target (PowerShell scripts alongside POSIX shell scripts). CI runs on `windows-latest` and `ubuntu-latest`. Process tree kill uses `taskkill /T /F` on Windows and process group signals elsewhere.

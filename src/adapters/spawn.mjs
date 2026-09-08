@@ -11,6 +11,16 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// Windows command resolution (docs/adapters.md "Windows command
+// resolution"): re-exported from here so every caller that already imports
+// spawn helpers from this module can reach it without a second import path.
+export {
+  resolveCommand,
+  resolveConfiguredCommand,
+  applyResolvedCommand,
+  escapeCmdArg,
+} from './resolve-command.mjs';
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 const RUNNER_PATH = join(HERE, 'runner.mjs');
 

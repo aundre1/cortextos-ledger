@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { platform } from 'node:process';
 import { filterEnv, rejectAnthropicModel, redact } from './credential-boundary.mjs';
+import { applyResolvedCommand, resolveConfiguredCommand } from './resolve-command.mjs';
 
 const ARGS_SUMMARY_MAX = 200;
 const NORMALIZED_TYPES = new Set(['session.start', 'tool.call', 'tool.result', 'message', 'session.end']);
@@ -22,21 +23,32 @@ function capText(value) {
 
 /**
  * buildArgv({ prompt, cwd, agent, model, dataHome, outDir, auth, cmd,
- * argsPrefix }) -> { cmd, args, cwd, env }. `dataHome` is joined with `agent`
- * to isolate each agent's OpenCode data directory (docs/adapters.md
- * "Concurrency note": two OpenCode processes sharing one data directory have
- * deadlocked on OpenCode's own database), exported as `XDG_DATA_HOME` and,
- * on win32, also `LOCALAPPDATA` per this wave's task card. `outDir` (not
- * part of the task card's literal buildArgv signature, but required to
- * compute it - see this executor's final report) sets `CORTEX_EVENTS_PATH`
- * to `<outDir>/events.jsonl` for the plugin. `rejectAnthropicModel` runs
- * before anything else: Anthropic subscription OAuth may not be used inside
- * a third party harness. `cmd`/`argsPrefix` (review round 1, F2 test
- * harness) override the executable and prepend extra argv - default cmd is
- * `opencode` - so a stub binary (`config.adapters.opencode.cmd`/
- * `argsPrefix`) can stand in for the real CLI in tests.
+ * argsPrefix, toolOverride }) -> { cmd, args, cwd, env, resolvedFrom }.
+ * `dataHome` is joined with `agent` to isolate each agent's OpenCode data
+ * directory (docs/adapters.md "Concurrency note": two OpenCode processes
+ * sharing one data directory have deadlocked on OpenCode's own database),
+ * exported as `XDG_DATA_HOME` and, on win32, also `LOCALAPPDATA` per this
+ * wave's task card. `outDir` (not part of the task card's literal buildArgv
+ * signature, but required to compute it - see this executor's final report)
+ * sets `CORTEX_EVENTS_PATH` to `<outDir>/events.jsonl` for the plugin.
+ * `rejectAnthropicModel` runs before anything else: Anthropic subscription
+ * OAuth may not be used inside a third party harness.
+ *
+ * Command resolution (docs/adapters.md "Windows command resolution"), in
+ * precedence order: an explicit `cmd` (review round 1, F2 test harness -
+ * `config.adapters.opencode.cmd`/`argsPrefix` stand a stub binary in for the
+ * real CLI in tests) wins outright; then `toolOverride`
+ * (`config.tools.opencode`, an operator-supplied argv array that skips
+ * resolution entirely); then `resolveCommand('opencode', ...)`, which on
+ * win32 finds the real target behind an npm `opencode.cmd` shim (the
+ * reference Windows machine's `opencode.cmd` is the direct-exe shape:
+ * `cmd` becomes the real `.../opencode-ai/bin/opencode.exe`) and on every
+ * other platform is `cmd: 'opencode'` unchanged. The `platformOverride`
+ * param (distinct from the module-level `platform` import used for the
+ * `LOCALAPPDATA` decision above) lets tests inject `'win32'` for command
+ * resolution without needing to fake `node:process`'s own platform.
  */
-export function buildArgv({ prompt, cwd, agent, model, dataHome, outDir, auth, cmd, argsPrefix }) {
+export function buildArgv({ prompt, cwd, agent, model, dataHome, outDir, auth, cmd, argsPrefix, toolOverride, platformOverride, env: envOverride, execPath, readFile }) {
   rejectAnthropicModel(model);
 
   const env = filterEnv(process.env, { adapter: 'opencode', auth });
@@ -49,17 +61,28 @@ export function buildArgv({ prompt, cwd, agent, model, dataHome, outDir, auth, c
     env.CORTEX_EVENTS_PATH = path.join(outDir, 'events.jsonl');
   }
 
+  const resolution = resolveConfiguredCommand('opencode', {
+    cmd,
+    toolOverride,
+    platform: platformOverride,
+    env: envOverride,
+    execPath,
+    readFile,
+  });
+  const ownArgs = [
+    'run',
+    ...(agent ? ['--agent', agent] : []),
+    ...(model ? ['--model', model] : []),
+    '--format', 'json', prompt,
+  ];
+  const built = applyResolvedCommand(resolution, [...(argsPrefix ?? []), ...ownArgs]);
+
   return {
-    cmd: cmd ?? 'opencode',
-    args: [
-      ...(argsPrefix ?? []),
-      'run',
-      ...(agent ? ['--agent', agent] : []),
-      ...(model ? ['--model', model] : []),
-      '--format', 'json', prompt,
-    ],
+    cmd: built.cmd,
+    args: built.args,
     cwd,
     env,
+    resolvedFrom: resolution.resolvedFrom,
   };
 }
 

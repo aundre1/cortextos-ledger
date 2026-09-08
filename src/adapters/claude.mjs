@@ -8,33 +8,45 @@ import { spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { filterEnv, redact } from './credential-boundary.mjs';
+import { applyResolvedCommand, resolveConfiguredCommand } from './resolve-command.mjs';
 
 const ARGS_SUMMARY_MAX = 200;
 
 /**
- * buildArgv({ prompt, cwd, model, allowedTools, auth, cmd, argsPrefix }) ->
- * { cmd, args, cwd, env } per docs/adapters.md: prompt is always an
- * argument, never stdin. Permission flags come from config's
- * `allowedTools`; this kit never passes `--dangerously-skip-permissions`
- * (docs/adapters.md "Permissions"). `cmd`/`argsPrefix` (review round 1, F2
- * test harness) override the executable and prepend extra argv - default
- * cmd is `claude`, argsPrefix defaults to none - so a stub binary
- * (`config.adapters.claude.cmd`/`argsPrefix`) can stand in for the real CLI
- * in tests without this function otherwise changing shape.
+ * buildArgv({ prompt, cwd, model, allowedTools, auth, cmd, argsPrefix,
+ * toolOverride }) -> { cmd, args, cwd, env, resolvedFrom } per
+ * docs/adapters.md: prompt is always an argument, never stdin. Permission
+ * flags come from config's `allowedTools`; this kit never passes
+ * `--dangerously-skip-permissions` (docs/adapters.md "Permissions").
+ *
+ * Command resolution (docs/adapters.md "Windows command resolution"), in
+ * precedence order: an explicit `cmd` (review round 1, F2 test harness -
+ * `config.adapters.claude.cmd`/`argsPrefix` stand a stub binary in for the
+ * real CLI in tests) wins outright; then `toolOverride`
+ * (`config.tools.claude`, an operator-supplied argv array that skips
+ * resolution entirely); then `resolveCommand('claude', ...)`, which on
+ * win32 finds the real target behind an npm `claude.cmd` shim (or an
+ * `claude.exe` that already resolves via `spawn`'s own PATHEXT search - see
+ * resolve-command.mjs) and on every other platform is `cmd: 'claude'`
+ * unchanged.
  */
-export function buildArgv({ prompt, cwd, model, allowedTools, auth, cmd, argsPrefix }) {
+export function buildArgv({ prompt, cwd, model, allowedTools, auth, cmd, argsPrefix, toolOverride, platform, env, execPath, readFile }) {
+  const ownArgs = [
+    '-p', prompt,
+    '--output-format', 'stream-json',
+    '--verbose',
+    ...(model ? ['--model', model] : []),
+    ...(allowedTools && allowedTools.length ? ['--allowedTools', allowedTools.join(',')] : []),
+  ];
+  const resolution = resolveConfiguredCommand('claude', { cmd, toolOverride, platform, env, execPath, readFile });
+  const { cmd: resolvedCmd, args } = applyResolvedCommand(resolution, [...(argsPrefix ?? []), ...ownArgs]);
+
   return {
-    cmd: cmd ?? 'claude',
-    args: [
-      ...(argsPrefix ?? []),
-      '-p', prompt,
-      '--output-format', 'stream-json',
-      '--verbose',
-      ...(model ? ['--model', model] : []),
-      ...(allowedTools && allowedTools.length ? ['--allowedTools', allowedTools.join(',')] : []),
-    ],
+    cmd: resolvedCmd,
+    args,
     cwd,
     env: filterEnv(process.env, { adapter: 'claude', auth }),
+    resolvedFrom: resolution.resolvedFrom,
   };
 }
 

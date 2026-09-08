@@ -25,6 +25,13 @@ only what `cortexctl` needs to run (`bin/`, `src/`, `prompts/`, `plugins/`,
 `node bin/cortexctl.mjs`, so once installed via npm use `cortexctl` in its
 place.
 
+On Windows, a harness installed the normal way often resolves only to an npm
+`.cmd` shim rather than a real `.exe`; `cortexctl doctor` prints exactly what
+each configured harness (and `gh`) resolved to and how, so a resolution
+problem is visible before a run ever tries to launch one (see
+`docs/adapters.md` "Windows command resolution" for the full rules and the
+`config.tools` override).
+
 ## What it prevents
 
 - Uncommitted work destroyed by an unattended agent.

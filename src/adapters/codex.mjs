@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { filterEnv, redact } from './credential-boundary.mjs';
+import { applyResolvedCommand, resolveConfiguredCommand } from './resolve-command.mjs';
 
 const ARGS_SUMMARY_MAX = 200;
 const TOOL_ITEM_TYPES = new Set(['command_execution', 'file_change', 'mcp_tool_call']);
@@ -17,28 +18,39 @@ function capSummary(value) {
 
 /**
  * buildArgv({ prompt, cwd, sandbox, readOnly, outDir, resumeThreadId, auth,
- * cmd, argsPrefix }) per docs/adapters.md: stdin is always closed by run()
- * (an open stdin hangs the process); `--sandbox` defaults to `read-only` for
- * reviewer roles (`readOnly: true`) and `workspace-write` otherwise;
- * `danger-full-access` is refused outright, whether it arrived as an
- * explicit `sandbox` or as a default (there is no default that resolves to
- * it). A resumed thread never accepts `--sandbox` (Codex would otherwise
+ * cmd, argsPrefix, toolOverride }) per docs/adapters.md: stdin is always
+ * closed by run() (an open stdin hangs the process); `--sandbox` defaults to
+ * `read-only` for reviewer roles (`readOnly: true`) and `workspace-write`
+ * otherwise; `danger-full-access` is refused outright, whether it arrived as
+ * an explicit `sandbox` or as a default (there is no default that resolves
+ * to it). A resumed thread never accepts `--sandbox` (Codex would otherwise
  * inherit `~/.codex/config.toml`), so it force-sets
- * `-c sandbox_mode="read-only"` instead. `cmd`/`argsPrefix` (review round 1,
- * F2 test harness) override the executable and prepend extra argv - default
- * cmd is `codex` - so a stub binary (`config.adapters.codex.cmd`/
- * `argsPrefix`) can stand in for the real CLI in tests.
+ * `-c sandbox_mode="read-only"` instead.
+ *
+ * Command resolution (docs/adapters.md "Windows command resolution"), in
+ * precedence order: an explicit `cmd` (review round 1, F2 test harness -
+ * `config.adapters.codex.cmd`/`argsPrefix` stand a stub binary in for the
+ * real CLI in tests) wins outright; then `toolOverride` (`config.tools.codex`,
+ * an operator-supplied argv array that skips resolution entirely); then
+ * `resolveCommand('codex', ...)`, which on win32 finds the real target
+ * behind an npm `codex.cmd` shim (the reference Windows machine's `codex.cmd`
+ * is the node-launcher shape: `cmd: execPath`, args prefixed with the real
+ * `.../@openai/codex/bin/codex.js`) and on every other platform is
+ * `cmd: 'codex'` unchanged.
  */
-export function buildArgv({ prompt, cwd, sandbox, readOnly, outDir, resumeThreadId, auth, cmd, argsPrefix }) {
+export function buildArgv({ prompt, cwd, sandbox, readOnly, outDir, resumeThreadId, auth, cmd, argsPrefix, toolOverride, platform, env, execPath, readFile }) {
   const lastMessagePath = join(outDir, 'last-message.md');
-  const prefix = argsPrefix ?? [];
+  const resolution = resolveConfiguredCommand('codex', { cmd, toolOverride, platform, env, execPath, readFile });
 
   if (resumeThreadId) {
+    const ownArgs = ['exec', 'resume', resumeThreadId, '-c', 'sandbox_mode="read-only"', '--json', '-o', lastMessagePath, prompt];
+    const built = applyResolvedCommand(resolution, [...(argsPrefix ?? []), ...ownArgs]);
     return {
-      cmd: cmd ?? 'codex',
-      args: [...prefix, 'exec', 'resume', resumeThreadId, '-c', 'sandbox_mode="read-only"', '--json', '-o', lastMessagePath, prompt],
+      cmd: built.cmd,
+      args: built.args,
       cwd,
       env: filterEnv(process.env, { adapter: 'codex', auth }),
+      resolvedFrom: resolution.resolvedFrom,
     };
   }
 
@@ -49,11 +61,14 @@ export function buildArgv({ prompt, cwd, sandbox, readOnly, outDir, resumeThread
     throw err;
   }
 
+  const ownArgs = ['exec', '--json', '--sandbox', chosenSandbox, '--cd', cwd, '-o', lastMessagePath, prompt];
+  const built = applyResolvedCommand(resolution, [...(argsPrefix ?? []), ...ownArgs]);
   return {
-    cmd: cmd ?? 'codex',
-    args: [...prefix, 'exec', '--json', '--sandbox', chosenSandbox, '--cd', cwd, '-o', lastMessagePath, prompt],
+    cmd: built.cmd,
+    args: built.args,
     cwd,
     env: filterEnv(process.env, { adapter: 'codex', auth }),
+    resolvedFrom: resolution.resolvedFrom,
   };
 }
 

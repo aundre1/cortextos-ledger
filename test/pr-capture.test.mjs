@@ -9,9 +9,17 @@
 //
 // Windows note: a portable stub here needs a `.exe`/`.cmd`/`.bat` (Node
 // cannot exec a bare, no-extension file with a shebang on Windows the way
-// POSIX does), which this test does not attempt - it skips cleanly on
-// win32. The Linux/POSIX path below genuinely writes an executable file
-// named `gh`, chmod 0o755, and executes it.
+// POSIX does), so real PATH resolution of a bare-named `gh` stub isn't
+// possible there. On win32 this suite instead points `config.tools.gh`
+// (docs/adapters.md "Windows command resolution") straight at
+// `[process.execPath, gh-stub.mjs]` - an argv pair that runs identically on
+// every platform because it never depends on OS-level executable
+// resolution at all, so the exact same stub script drives every test below
+// on both platforms; only *how* task:new's `gh` call finds it differs. The
+// Linux/POSIX path still additionally writes an executable file named
+// `gh`, chmod 0o755, and puts it on PATH, so real PATH resolution
+// (`spawnSync('gh', ...)` finding a bare-named file with no config
+// override at all) keeps being exercised there too.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -54,14 +62,33 @@ function makeStubBinDir() {
 
 /**
  * A fresh { workDir, dbPath, cli } trio. cli(args, extraEnv) runs cortexctl
- * with the gh stub's directory first on PATH and no --config, so
- * config.runs resolves to <workDir>/.cortex/runs (src/config.mjs's default,
- * relative to cwd when no config file is found) - the same runs-root
- * resolution every other command in the kit already uses.
+ * against a config that makes task:new's `gh` calls reach the stub - see the
+ * module comment above for why POSIX and win32 each need a different
+ * mechanism to do that. config.runs resolves to <workDir>/.cortex/runs
+ * either way: on POSIX there is no --config at all (src/config.mjs's
+ * default, relative to cwd); on win32 the config file this writes lives
+ * directly in workDir, so its own directory (config.runs's base dir) is
+ * still workDir.
  */
 function makeHarness() {
   const workDir = makeTempDir();
   const dbPath = makeTempDb();
+
+  if (IS_WIN32) {
+    // config.tools.gh (docs/adapters.md "Windows command resolution") skips
+    // PATH/shim resolution entirely - [execPath, STUB_SOURCE] runs the same
+    // stub script every POSIX test below uses, with no OS-level executable
+    // resolution involved at all.
+    const configPath = join(workDir, 'cortex-ledger.json');
+    writeFileSync(configPath, JSON.stringify({ tools: { gh: [process.execPath, STUB_SOURCE] } }));
+    const cli = (args, extraEnv = {}) =>
+      runCli(['--db', dbPath, '--config', configPath, ...args], {
+        cwd: workDir,
+        env: { ...process.env, ...extraEnv },
+      });
+    return { workDir, dbPath, cli };
+  }
+
   const binDir = makeStubBinDir();
   const cli = (args, extraEnv = {}) =>
     runCli(['--db', dbPath, ...args], {
@@ -168,9 +195,7 @@ const newTaskArgs = (extra = []) => [
   ...extra,
 ];
 
-if (IS_WIN32) {
-  test('pr-capture: skipped on win32 (no portable no-extension gh stub)', { skip: true }, () => {});
-} else {
+{
   test('task:new --kind pr_review --repo --pr: happy path captures pr_number/pr_repo/base_sha/head_sha, pr.diff, brief, artifact', () => {
     const { workDir, dbPath, cli } = makeHarness();
     assert.equal(cli(['init']).code, 0);
@@ -246,19 +271,33 @@ if (IS_WIN32) {
   });
 
   test('task:new --kind pr_review: gh binary missing fails cleanly instead of hanging or crashing', () => {
-    // An empty stub dir on PATH (still prepended ahead of the real PATH, but
-    // this test's PATH omits it) - simulate "gh not installed" by pointing
-    // PATH at a directory with nothing in it, ahead of the real PATH so any
-    // system-installed `gh` is still masked for this one call.
     const { workDir, dbPath, cli } = makeHarness();
     assert.equal(cli(['init']).code, 0);
     const before = taskCount(dbPath);
 
-    const emptyDir = join(workDir, 'empty-path');
-    const result = runCli(['--db', dbPath, ...newTaskArgs()], {
-      cwd: workDir,
-      env: { ...process.env, PATH: emptyDir },
-    });
+    let result;
+    if (IS_WIN32) {
+      // config.tools.gh (docs/adapters.md "Windows command resolution")
+      // pointed at a path that does not exist on disk at all - an explicit
+      // override skips resolveCommand's PATH search entirely, so this
+      // reaches spawnSync exactly the way a genuinely uninstalled `gh`
+      // would: an immediate ENOENT.
+      const missingConfigPath = join(workDir, 'cortex-ledger-missing-gh.json');
+      writeFileSync(missingConfigPath, JSON.stringify({ tools: { gh: [join(workDir, 'definitely-does-not-exist-gh.exe')] } }));
+      result = runCli(['--db', dbPath, '--config', missingConfigPath, ...newTaskArgs()], {
+        cwd: workDir,
+        env: { ...process.env },
+      });
+    } else {
+      // An empty (never created) dir on PATH, ahead of the real PATH -
+      // simulate "gh not installed" via real PATH resolution finding
+      // nothing at all, masking any system-installed `gh` for this one call.
+      const emptyDir = join(workDir, 'empty-path');
+      result = runCli(['--db', dbPath, ...newTaskArgs()], {
+        cwd: workDir,
+        env: { ...process.env, PATH: emptyDir },
+      });
+    }
     assert.notEqual(result.code, 0);
     assert.match(result.stderr, /cortexctl: gh_missing:/);
     assert.equal(taskCount(dbPath), before, 'no task row should have been inserted');
