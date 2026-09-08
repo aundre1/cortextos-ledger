@@ -10,6 +10,7 @@ import { insertTask, insertRun, listQuota, upsertQuota, listEscalations, getTask
 import { DEFAULTS } from '../src/config.mjs';
 import { ingest } from '../src/ingest.mjs';
 import { parseStream as parseClaudeStream } from '../src/adapters/claude.mjs';
+import { parseStream as parseOpencodeStream } from '../src/adapters/opencode.mjs';
 
 // ingest reads only the normalized events.jsonl format (docs/adapters.md),
 // never a harness's native stream - so the raw claude-stream.jsonl fixture
@@ -83,6 +84,34 @@ test('ingest: fills task_runs, cost_usage (with requests), and artifacts from a 
 
   const artifactRows = db.prepare('SELECT kind FROM artifacts WHERE run_id = ?').all(run.id).map((r) => r.kind);
   assert.deepEqual(artifactRows.sort(), ['diff', 'stdout']);
+});
+
+test('ingest: E2-3 real opencode run --format json fixture - one cost_usage row with the exact reported totals', async () => {
+  const db = await freshDb();
+  const { task, run, outDir } = makeTaskAndRun(db, { provider: 'nvidia', model: 'nvidia/moonshotai/kimi-k3' });
+
+  // Same pattern the claude case above uses: run the raw fixture through the
+  // adapter's own parseStream (what run() would do before writing
+  // events.jsonl) rather than hand-writing normalized events.
+  const eventsPath = join(outDir, 'events.jsonl');
+  const events = parseOpencodeStream(readFileSync(join(FIXTURES, 'opencode-run.real.jsonl'), 'utf8').split('\n'));
+  writeFileSync(eventsPath, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
+
+  const result = ingest(db, config(), { eventsPath, taskId: task.id, runId: run.id });
+
+  assert.equal(result.tokens_in, 58646);
+  assert.equal(result.tokens_out, 145);
+  assert.equal(result.cost_usd, 0);
+  assert.equal(result.session_id, 'ses_f80e1b494ffeeIFRT1L2arjhAx');
+  assert.equal(result.tool_calls, 1);
+
+  const costRows = db.prepare("SELECT * FROM cost_usage WHERE run_id = ? AND source = 'plugin'").all(run.id);
+  assert.equal(costRows.length, 1);
+  assert.equal(costRows[0].tokens_in, 58646);
+  assert.equal(costRows[0].tokens_out, 145);
+  assert.equal(costRows[0].cost_usd, 0);
+  assert.equal(costRows[0].provider, 'nvidia');
+  assert.equal(costRows[0].model, 'nvidia/moonshotai/kimi-k3');
 });
 
 test('ingest: rolls and ticks provider_quota for the run\'s provider and model', async () => {

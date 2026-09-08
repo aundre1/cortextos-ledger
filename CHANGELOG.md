@@ -295,6 +295,52 @@ function:
   `plugins/` imports either `.ps1` file.
 - `test/e2e.test.mjs` added (see Test counts above).
 
+### E2-3: parse the real `opencode run --format json` stream (executor V)
+
+A real Windows run (`opencode run --format json --agent builder --model
+nvidia/moonshotai/kimi-k3`, OpenCode 1.18.27, exit 0, 46s) exposed that
+`opencode.mjs`'s `createStreamParser()` only ever understood its own
+already-normalized `events.jsonl` shape: every real raw line carries a
+`sessionID`, so the parser's fallback branch turned all six of them into a
+duplicate `session.start` and produced no token, cost, or tool data at all
+for a run that spent about 59k input tokens. `createStreamParser()` now
+translates the real raw shapes too (`step_start`, `tool_use`, `step_finish`,
+`text`, `error` - verified from `sst/opencode` tag `v1.18.27`,
+`packages/opencode/src/cli/cmd/run.ts`'s `emit()` and
+`packages/schema/src/v1/session.ts`'s `Part` schemas; see docs/adapters.md
+"opencode: parsing the real run --format json stream (E2-3)" for the full
+citation trail): exactly one `session.start` (deduped across every raw
+line's `sessionID`, not one per line); `step_finish` becomes a `message`
+event with `tokens_in`/`tokens_out`/`tokens_reasoning`/`cache_read`/
+`cache_write`/`cost_usd` (`0` recorded as a real reported value, `usage_source:
+'reported'`, never coerced to null); a completed or errored `tool_use`
+becomes both `tool.call` and `tool.result` (tool name, `call_id`, `ms` from
+`state.time.start/end`, no raw input/output body, mirroring `claude.mjs`'s
+own tool-result summarization); a new `error` event type (`severity: 'halt'`,
+`statusCode`, redacted `message`) for the two real error shapes observed (a
+410 Gone for a retired model, a 401 Unauthorized) - informational only, the
+run's actual exit code stays authoritative; any other raw type is dropped
+but counted as `unparsed_lines` on a synthesized `session.end` (`flush()`
+now sums `tokens_in`/`tokens_out`/`cost_usd` across every `step_finish` seen,
+since this raw stream never reports its own totals - the reason the plugin
+exists at all). `run()` patches the synthesized `session.end`'s
+`exit_code`/`elapsed_ms` (both `null` from the parser alone) from the real
+spawned process, the same pattern `codex.mjs` already uses for its own
+NDJSON `session.end`. The plugin-authoritative, already-normalized path (D1/
+D2's `agent.fallback`, and the pre-existing `opencode-events.jsonl` fixture)
+is untouched. New fixture: `test/fixtures/opencode-run.real.jsonl` (the real
+capture, every absolute path replaced with `<worktree>` - session ids,
+timestamps, and token numbers are byte-identical to the real run). Tests: 9
+new in `test/adapters.test.mjs` (session.start dedupe, the two `message`
+events' exact token/cost numbers, the `read` tool's `tool.call`/`tool.result`
+pair and its `ms`, the synthesized `session.end`'s totals and
+`unparsed_lines`, the 410/401 `error` events, an unknown-type counter case,
+and D2's fallback text still working alongside the new JSON path); 1 new in
+`test/ingest.test.mjs` (the real fixture parsed end to end and ingested,
+asserting one `cost_usage` row with `tokens_in` 58646, `tokens_out` 145,
+`cost_usd` 0). `npm test`: 351/351. `node scripts/check-syntax.mjs`: 100
+files, 0 failures. `node scripts/publish-check.mjs`: clean.
+
 ### Known limitations (open questions carried forward)
 
 Everything below is a wave log `OPEN QUESTION` that is still open after the

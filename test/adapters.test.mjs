@@ -412,6 +412,130 @@ test('opencode createStreamParser: "subagent, not a primary agent" fallback text
   assert.equal(events[0].reason, 'subagent');
 });
 
+// ---------------------------------------------------------------------------
+// opencode: E2-3 - the real `opencode run --format json` stream
+// ---------------------------------------------------------------------------
+//
+// test/fixtures/opencode-run.real.jsonl is a real `opencode run --format
+// json --agent builder --model nvidia/moonshotai/kimi-k3` capture (OpenCode
+// 1.18.27, Windows, exit 0, 46s) with every absolute path replaced by
+// `<worktree>` - see docs/adapters.md "opencode: parsing the real run
+// --format json stream" for the citation trail. Session id, timestamps, and
+// token numbers are byte-identical to the real run.
+
+test('opencode parseStream: real run --format json fixture - exactly one session.start, deduped', () => {
+  const events = opencode.parseStream(readFixtureLines('opencode-run.real.jsonl'));
+  const starts = events.filter((e) => e.type === 'session.start');
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].session_id, 'ses_f80e1b494ffeeIFRT1L2arjhAx');
+});
+
+test('opencode parseStream: real fixture - two step_finish events become two message (token) events with the exact reported numbers', () => {
+  const events = opencode.parseStream(readFixtureLines('opencode-run.real.jsonl'));
+  const messages = events.filter((e) => e.type === 'message');
+  assert.equal(messages.length, 2);
+
+  assert.equal(messages[0].tokens_in, 29241);
+  assert.equal(messages[0].tokens_out, 81);
+  assert.equal(messages[0].cost_usd, 0);
+  assert.equal(messages[0].usage_source, 'reported');
+
+  assert.equal(messages[1].tokens_in, 29405);
+  assert.equal(messages[1].tokens_out, 64);
+  assert.equal(messages[1].cost_usd, 0);
+  assert.equal(messages[1].usage_source, 'reported');
+});
+
+test('opencode parseStream: real fixture - the completed tool_use becomes one tool.call and one tool.result for "read"', () => {
+  const events = opencode.parseStream(readFixtureLines('opencode-run.real.jsonl'));
+  const calls = events.filter((e) => e.type === 'tool.call');
+  const results = events.filter((e) => e.type === 'tool.result');
+  assert.equal(calls.length, 1);
+  assert.equal(results.length, 1);
+  assert.equal(calls[0].tool, 'read');
+  assert.equal(calls[0].call_id, 'read:0');
+  assert.equal(results[0].tool, 'read');
+  assert.equal(results[0].call_id, 'read:0');
+  assert.equal(results[0].ok, true);
+  assert.equal(results[0].ms, 4);
+  // No raw tool input/output body ever leaves the parser (docs/adapters.md
+  // "Never log tool arguments in full") - only a capped summary on the call.
+  assert.ok(calls[0].args_summary.length <= 200);
+  assert.equal(JSON.stringify(events).includes('<entries>'), false, 'the tool_use output body must never leak into events.jsonl');
+});
+
+test('opencode parseStream: real fixture - synthesized session.end totals and unparsed_lines', () => {
+  const events = opencode.parseStream(readFixtureLines('opencode-run.real.jsonl'));
+  const ends = events.filter((e) => e.type === 'session.end');
+  assert.equal(ends.length, 1);
+  const end = ends[0];
+  assert.equal(end.session_id, 'ses_f80e1b494ffeeIFRT1L2arjhAx');
+  assert.equal(end.tokens_in, 58646);
+  assert.equal(end.tokens_out, 145);
+  assert.equal(end.cost_usd, 0);
+  assert.equal(end.requests, 2);
+  assert.equal(end.unparsed_lines, 0);
+  // This stream never reports its own exit code or elapsed time - run()
+  // patches both from the real spawned process; a bare parseStream() over
+  // the raw fixture (no process to patch from) must not fabricate either.
+  assert.equal(end.exit_code, null);
+  assert.equal(end.elapsed_ms, null);
+});
+
+test('opencode createStreamParser: a 410 Gone error line becomes a halt error event with statusCode and a capped message, exit code left untouched', () => {
+  const parser = opencode.createStreamParser();
+  const line = JSON.stringify({
+    type: 'error',
+    timestamp: 1788839200000,
+    sessionID: 'ses_eol_model_test',
+    error: { name: 'APIError', data: { message: 'The model `nvidia/some-eol-model` has been retired and is no longer available.', statusCode: 410 } },
+  });
+  const events = parser.push(line);
+  const errorEvent = events.find((e) => e.type === 'error');
+  assert.ok(errorEvent);
+  assert.equal(errorEvent.severity, 'halt');
+  assert.equal(errorEvent.statusCode, 410);
+  assert.equal(errorEvent.name, 'APIError');
+  assert.ok(errorEvent.message.includes('retired'));
+  assert.equal('exit_code' in errorEvent, false, 'an error event never sets an exit code itself - the process exit code stays authoritative');
+
+  const end = parser.flush().find((e) => e.type === 'session.end');
+  assert.equal(end.exit_code, null);
+});
+
+test('opencode createStreamParser: a 401 Unauthorized error line becomes a halt error event too', () => {
+  const parser = opencode.createStreamParser();
+  const line = JSON.stringify({
+    type: 'error',
+    timestamp: 1788839200000,
+    sessionID: 'ses_unauthorized_test',
+    error: { name: 'APIError', data: { message: 'Unauthorized: invalid or missing API key for provider nvidia.', statusCode: 401 } },
+  });
+  const events = parser.push(line);
+  const errorEvent = events.find((e) => e.type === 'error');
+  assert.ok(errorEvent);
+  assert.equal(errorEvent.severity, 'halt');
+  assert.equal(errorEvent.statusCode, 401);
+  assert.ok(errorEvent.message.includes('Unauthorized'));
+});
+
+test('opencode createStreamParser: unknown raw JSON type is ignored but counted in session.end.unparsed_lines', () => {
+  const parser = opencode.createStreamParser();
+  parser.push(JSON.stringify({ type: 'step_start', sessionID: 'ses_x' }));
+  const events = parser.push(JSON.stringify({ type: 'some_future_part_type', sessionID: 'ses_x', part: {} }));
+  assert.deepEqual(events, []);
+  const end = parser.flush().find((e) => e.type === 'session.end');
+  assert.equal(end.unparsed_lines, 1);
+});
+
+test('opencode createStreamParser: the "agent not found" fallback text still works alongside the real JSON stream (D2 unaffected by E2-3)', () => {
+  const parser = opencode.createStreamParser();
+  parser.push(JSON.stringify({ type: 'step_start', sessionID: 'ses_x' }));
+  const events = parser.push('!  agent "builder" not found. Falling back to default agent');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, 'agent.fallback');
+});
+
 test('opencode parseStream: fixture (already-normalized plugin events) gives expected counts and redacts secrets', () => {
   const events = opencode.parseStream(readFixtureLines('opencode-events.jsonl'));
   const byType = (t) => events.filter((e) => e.type === t);

@@ -15,6 +15,21 @@ import { applyResolvedCommand, resolveConfiguredCommand } from './resolve-comman
 
 const ARGS_SUMMARY_MAX = 200;
 const NORMALIZED_TYPES = new Set(['session.start', 'tool.call', 'tool.result', 'message', 'session.end']);
+// The `opencode run --format json` raw stdout shapes this parser translates
+// (sst/opencode v1.18.27, packages/opencode/src/session/message-v2.ts's
+// `Part` union and packages/opencode/src/cli/cmd/run.ts's JSON printer -
+// see docs/adapters.md "opencode: parsing the real run --format json
+// stream" for the full citation trail and a real captured example,
+// test/fixtures/opencode-run.real.jsonl). `error`'s raw shape
+// (`{"type":"error",...,"error":{"name":...,"data":{"message":...,
+// "statusCode":...}}}`) is intentionally kept out of NORMALIZED_TYPES above
+// - this kit has no prior normalized-and-passed-through `error` event, so
+// there is no ambiguity to resolve between "already normalized" and "raw
+// OpenCode shape" for this one type; every `type: 'error'` line reaching
+// this parser is the raw shape. Any other top-level `type` is counted as an
+// unparsed line (session.end's `unparsed_lines`) rather than silently
+// dropped with no trace.
+const RAW_STREAM_TYPES = new Set(['step_start', 'tool_use', 'step_finish', 'text', 'error']);
 
 // This module's own directory is src/adapters/, two levels under the repo
 // root - used only to resolve a community agent template's `{file:...}`
@@ -396,75 +411,266 @@ export function buildArgv({
 }
 
 /**
+ * `part.state.time.{start,end}` (both epoch ms, when present - a real
+ * capture, test/fixtures/opencode-run.real.jsonl, has this nested under
+ * `state` alongside `status`/`input`/`output`, not as a sibling of `state`)
+ * -> integer ms, or `null` when either bound is missing (per this task's own
+ * instruction: "ms derived from part.time.start/end if present else null" -
+ * `time` is read off `part.state` here since that is where OpenCode 1.18.27
+ * actually places it).
+ */
+function toolMs(part) {
+  const time = part?.state?.time;
+  if (time && typeof time.start === 'number' && typeof time.end === 'number') {
+    return time.end - time.start;
+  }
+  return null;
+}
+
+/**
  * createStreamParser() -> { push(line) -> events[], flush() -> events[] }
- * (review round 1, F2), best effort (docs/adapters.md "opencode") and
- * genuinely stateless per line - unlike claude's/codex's parsers this one
- * needs no closure state at all, so `push` is the same pure function either
- * way and `flush()` never has anything to add. A line that already carries a
- * recognized normalized `type` (this is what the plugin's events.jsonl - and
- * this fixture format - looks like) is passed through, but its free text
- * fields are re-redacted and re-capped rather than trusted blindly. Anything
- * else is treated as OpenCode's own raw `run --format json` stdout and
- * translated on a best-effort basis; that stream is not authoritative (see
- * the module comment above), so unrecognized shapes are simply skipped -
- * except D2's own fallback warning (`agent "x" not found. Falling back to
- * default agent`, plain text, never JSON), which is turned into an
- * `agent.fallback` event, severity `warn`, so a silent permission downgrade
- * is never silent again.
+ * (review round 1, F2; rewritten for E2-3 to handle the *real*
+ * `opencode run --format json` stream, not only already-normalized events).
+ * Two input shapes are handled:
+ *
+ * 1. A line that already carries a recognized normalized `type` (this is
+ *    what the plugin's events.jsonl - and the pre-existing
+ *    `opencode-events.jsonl` fixture - looks like) is passed through, but
+ *    its free text fields are re-redacted and re-capped rather than trusted
+ *    blindly. This path is untouched by this task.
+ *
+ * 2. OpenCode's own raw `run --format json` stdout (docs/adapters.md
+ *    "opencode: parsing the real run --format json stream", cites
+ *    packages/opencode/src/session/message-v2.ts and
+ *    packages/opencode/src/cli/cmd/run.ts; real capture in
+ *    test/fixtures/opencode-run.real.jsonl):
+ *      - the *first* raw line carrying a top-level `sessionID` (`step_start`
+ *        in the real capture, but this is deliberately type-agnostic -
+ *        `tool_use`/`step_finish`/`text`/`error` all carry the same field)
+ *        emits exactly one `session.start`; every later line's `sessionID`
+ *        is dedup'd against it and never emits a second one.
+ *      - `tool_use` with `part.state.status` `"completed"` or `"error"`
+ *        emits both `tool.call` and `tool.result` (OpenCode's JSON mode
+ *        reports a tool call already resolved, never as two separate
+ *        before/after lines the way the plugin does) - `ok` follows the
+ *        status, `ms` from `part.state.time.start/end`, and (mirroring how
+ *        claude.mjs's `tool_result` translation works: no input/output body
+ *        ever leaves this function, only a capped+redacted summary) an
+ *        `error` field on the result only when `ok` is false. Any other
+ *        `state.status` (still in progress) is skipped, not counted as
+ *        unparsed.
+ *      - `step_finish` -> a `message` event (the same normalized type
+ *        claude.mjs and codex.mjs already use for turn/step usage) carrying
+ *        `part.tokens.{input,output,reasoning,cache.read,cache.write}` and
+ *        `cost_usd` from `part.cost` - `0` is a real reported value (a free
+ *        or subscription lane), recorded as `0` with `usage_source:
+ *        'reported'`, never coerced to null or skipped. Running totals feed
+ *        the synthesized `session.end` below.
+ *      - `text` carries the assistant's final answer but no usage of its
+ *        own; docs/adapters.md's vocabulary has no plain-text assistant
+ *        event, so it is skipped with no event and no unparsed-line count
+ *        (this is a known, expected shape, not a hole in this parser).
+ *      - `error` (a real top-level `{"type":"error",...}` line - a 410 Gone
+ *        for an EOL model and a 401 Unauthorized are the two observed
+ *        shapes) emits a normalized `error` event, `severity: 'halt'`,
+ *        `statusCode`/`message` read from `error.data.{statusCode,message}`
+ *        (falling back to `error.{statusCode,message}`), message
+ *        capped+redacted. This event is informational only: it never sets
+ *        an exit code anywhere - the spawned process's own real exit code
+ *        stays authoritative (see `run()` below and docs/adapters.md).
+ *      - any other top-level `type` (a raw shape this parser does not yet
+ *        know) is ignored, but counted - see `unparsed_lines` below - so a
+ *        format change upstream is visible in the ledger instead of
+ *        silently swallowed.
+ *      - `flush()` synthesizes exactly one `session.end` for this raw-stream
+ *        case (never when a normalized `session.end` already passed
+ *        through - the plugin/already-normalized path keeps behaving
+ *        exactly as before), carrying `session_id`, the running
+ *        `tokens_in`/`tokens_out`/`cost_usd` totals summed across every
+ *        `step_finish` seen, `requests` (the `step_finish` count),
+ *        `unparsed_lines`, and `exit_code`/`elapsed_ms` both `null` - this
+ *        stream never reports either, so `run()` below patches them from
+ *        the real spawned process afterward (mirroring codex.mjs's own
+ *        `endEvent.exit_code === undefined` patch), and a caller that only
+ *        has the raw batch (no process to patch from - e.g. a unit test
+ *        parsing the fixture directly) sees `null`, not a fabricated 0.
+ *
+ * D2's own fallback warning (`agent "x" not found. Falling back to default
+ * agent`, plain text, never JSON) keeps working exactly as before - it is
+ * matched in the `JSON.parse` catch branch, ahead of anything above.
  */
 export function createStreamParser() {
+  let sessionId = null;
+  let sessionEmitted = false;
+  let sawNormalizedSessionEnd = false;
+  let tokensIn = 0;
+  let tokensOut = 0;
+  let costUsd = 0;
+  let stepFinishCount = 0;
+  let unparsedLines = 0;
+  let flushed = false;
+
+  function maybeSessionStart(obj) {
+    const sid = obj.sessionID ?? obj.sessionId ?? null;
+    if (!sid) return [];
+    if (!sessionId) sessionId = sid;
+    if (sessionEmitted) return [];
+    sessionEmitted = true;
+    return [{ ts: new Date().toISOString(), type: 'session.start', session_id: sid }];
+  }
+
+  function pushLine(raw) {
+    const text = typeof raw === 'string' ? raw.trim() : '';
+    if (!text) return [];
+    let obj;
+    try {
+      obj = JSON.parse(text);
+    } catch {
+      const notFound = text.match(AGENT_NOT_FOUND_RE);
+      if (notFound) {
+        return [
+          {
+            ts: new Date().toISOString(),
+            type: 'agent.fallback',
+            severity: 'warn',
+            agent: notFound[1],
+            reason: 'not_found',
+            detail: capText(text),
+          },
+        ];
+      }
+      const subagent = text.match(AGENT_SUBAGENT_RE);
+      if (subagent) {
+        return [
+          {
+            ts: new Date().toISOString(),
+            type: 'agent.fallback',
+            severity: 'warn',
+            agent: subagent[1],
+            reason: 'subagent',
+            detail: capText(text),
+          },
+        ];
+      }
+      return [];
+    }
+
+    if (NORMALIZED_TYPES.has(obj.type)) {
+      const event = { ...obj };
+      if (typeof event.args_summary === 'string') event.args_summary = capText(event.args_summary);
+      if (typeof event.error === 'string') event.error = capText(event.error);
+      if (typeof event.message === 'string') event.message = capText(event.message);
+      if (event.type === 'session.end') sawNormalizedSessionEnd = true;
+      return [event];
+    }
+
+    if (!RAW_STREAM_TYPES.has(obj.type)) {
+      unparsedLines++;
+      return [];
+    }
+
+    const events = maybeSessionStart(obj);
+    const ts = new Date().toISOString();
+
+    switch (obj.type) {
+      case 'step_start':
+      case 'text':
+        // step_start only carries the session id (handled above); text
+        // carries the assistant's answer but no usage of its own - neither
+        // has a normalized event of its own (see the doc comment above).
+        break;
+
+      case 'tool_use': {
+        const part = obj.part ?? {};
+        const status = part.state?.status;
+        if (status === 'completed' || status === 'error') {
+          const ok = status === 'completed';
+          events.push({
+            ts,
+            type: 'tool.call',
+            tool: part.tool ?? null,
+            call_id: part.callID ?? null,
+            args_summary: capText(part.state?.input ?? {}),
+          });
+          const resultEvent = { ts, type: 'tool.result', tool: part.tool ?? null, call_id: part.callID ?? null, ok, ms: toolMs(part) };
+          if (!ok) resultEvent.error = capText(part.state?.error ?? part.state?.output ?? '');
+          events.push(resultEvent);
+        }
+        // Any other status (still running) is a known, expected shape for
+        // an in-flight tool call - not counted as unparsed.
+        break;
+      }
+
+      case 'step_finish': {
+        const part = obj.part ?? {};
+        const tokens = part.tokens ?? {};
+        const tokensInVal = tokens.input ?? 0;
+        const tokensOutVal = tokens.output ?? 0;
+        const cost = typeof part.cost === 'number' ? part.cost : 0;
+        tokensIn += tokensInVal;
+        tokensOut += tokensOutVal;
+        costUsd += cost;
+        stepFinishCount++;
+        events.push({
+          ts,
+          type: 'message',
+          role: 'assistant',
+          session_id: sessionId,
+          tokens_in: tokensInVal,
+          tokens_out: tokensOutVal,
+          tokens_reasoning: tokens.reasoning ?? 0,
+          cache_read: tokens.cache?.read ?? 0,
+          cache_write: tokens.cache?.write ?? 0,
+          cost_usd: cost,
+          usage_source: 'reported',
+        });
+        break;
+      }
+
+      case 'error': {
+        const err = obj.error ?? {};
+        const data = err.data ?? {};
+        events.push({
+          ts,
+          type: 'error',
+          severity: 'halt',
+          name: err.name ?? null,
+          statusCode: data.statusCode ?? err.statusCode ?? null,
+          message: capText(data.message ?? err.message ?? ''),
+        });
+        break;
+      }
+
+      default:
+        break;
+    }
+
+    return events;
+  }
+
   return {
-    push(raw) {
-      const text = typeof raw === 'string' ? raw.trim() : '';
-      if (!text) return [];
-      let obj;
-      try {
-        obj = JSON.parse(text);
-      } catch {
-        const notFound = text.match(AGENT_NOT_FOUND_RE);
-        if (notFound) {
-          return [
-            {
-              ts: new Date().toISOString(),
-              type: 'agent.fallback',
-              severity: 'warn',
-              agent: notFound[1],
-              reason: 'not_found',
-              detail: capText(text),
-            },
-          ];
-        }
-        const subagent = text.match(AGENT_SUBAGENT_RE);
-        if (subagent) {
-          return [
-            {
-              ts: new Date().toISOString(),
-              type: 'agent.fallback',
-              severity: 'warn',
-              agent: subagent[1],
-              reason: 'subagent',
-              detail: capText(text),
-            },
-          ];
-        }
-        return [];
-      }
-
-      if (NORMALIZED_TYPES.has(obj.type)) {
-        const event = { ...obj };
-        if (typeof event.args_summary === 'string') event.args_summary = capText(event.args_summary);
-        if (typeof event.error === 'string') event.error = capText(event.error);
-        return [event];
-      }
-
-      const sessionId = obj.sessionID ?? obj.sessionId ?? null;
-      if (sessionId) {
-        return [{ ts: new Date().toISOString(), type: 'session.start', session_id: sessionId }];
-      }
-      return [];
-    },
+    push: pushLine,
     flush() {
-      return [];
+      if (flushed) return [];
+      flushed = true;
+      // Only the raw-stream case needs a synthesized session.end - a
+      // stream that already carried a normalized one (the plugin/
+      // already-normalized-fixture path) must not get a second one.
+      if (!sessionEmitted || sawNormalizedSessionEnd) return [];
+      return [
+        {
+          ts: new Date().toISOString(),
+          type: 'session.end',
+          session_id: sessionId,
+          exit_code: null,
+          elapsed_ms: null,
+          tokens_in: tokensIn,
+          tokens_out: tokensOut,
+          cost_usd: costUsd,
+          requests: stepFinishCount,
+          unparsed_lines: unparsedLines,
+        },
+      ];
     },
   };
 }
@@ -536,6 +742,16 @@ export async function run(opts) {
   const elapsedMs = Date.now() - start;
 
   const parsedEvents = parseStream(stdout.split('\n'));
+  // The raw-stream `session.end` createStreamParser() synthesizes in
+  // flush() reports `exit_code`/`elapsed_ms` as `null` - that stream never
+  // carries either - patched here from the real spawned process, the same
+  // pattern codex.mjs uses for its own NDJSON session.end (docs/adapters.md
+  // "keep the run's exit code authoritative": a 410/401 `error` event never
+  // sets this itself). Never touches an already-normalized session.end from
+  // a fixture/plugin path, which already carries its own real value.
+  const ownEndEvent = [...parsedEvents].reverse().find((e) => e.type === 'session.end');
+  if (ownEndEvent && (ownEndEvent.exit_code === null || ownEndEvent.exit_code === undefined)) ownEndEvent.exit_code = exitCode;
+  if (ownEndEvent && (ownEndEvent.elapsed_ms === null || ownEndEvent.elapsed_ms === undefined)) ownEndEvent.elapsed_ms = elapsedMs;
   for (const event of parsedEvents) onEvent?.(event);
   const ownEvents = [...earlyEvents, ...parsedEvents];
 
