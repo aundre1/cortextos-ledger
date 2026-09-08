@@ -358,6 +358,38 @@ function diagnoseOpencodeAuth(config, { authEnv, authHomedir, authReadFile, auth
   ];
 }
 
+/**
+ * Phase 1a real-batch fix F1 ("doctor reports, per provider seen in the
+ * ledger, how many runs in the last 24 hours ended provider_unavailable, so
+ * an operator can see a lane is throttled"): one finding per distinct
+ * `task_runs.provider` value ever seen in the ledger (not only providers
+ * currently configured in `config.agents` - a provider an operator stopped
+ * using yesterday should still show 0, not disappear), `warn`-level when
+ * the 24 hour count is nonzero so a throttled lane stands out from the
+ * routine `info` noise the rest of `doctor`'s unconditional output already
+ * produces.
+ */
+function diagnoseProviderHealth(db, now) {
+  const providers = db
+    .prepare("SELECT DISTINCT provider FROM task_runs WHERE provider IS NOT NULL ORDER BY provider")
+    .all()
+    .map((r) => r.provider);
+  if (!providers.length) return [];
+
+  const sinceIso = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+  return providers.map((provider) => {
+    const row = db
+      .prepare(
+        "SELECT COUNT(*) AS c FROM task_runs WHERE provider = ? AND failure_class = 'provider_unavailable' AND started_at >= ?"
+      )
+      .get(provider, sinceIso);
+    return {
+      level: row.c > 0 ? 'warn' : 'info',
+      text: `provider ${provider}: ${row.c} run(s) provider_unavailable in the last 24h`,
+    };
+  });
+}
+
 // ---------------------------------------------------------------------------
 // doctor
 // ---------------------------------------------------------------------------
@@ -385,6 +417,7 @@ export function doctor(db, config, { taskId, runId, all, now = new Date(), authE
   // never pass these, so diagnoseOpencodeAuth reads the operator's actual
   // auth.json exactly as opencode.mjs's own buildArgv would at launch.
   findings.push(...diagnoseOpencodeAuth(config, { authEnv, authHomedir, authReadFile, authExistsSync }));
+  findings.push(...diagnoseProviderHealth(db, now));
 
   if (runId) {
     const run = db.prepare('SELECT * FROM task_runs WHERE id = ?').get(runId);

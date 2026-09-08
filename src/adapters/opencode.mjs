@@ -12,6 +12,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { filterEnv, rejectAnthropicModel, redact, relativizeToCwd } from './credential-boundary.mjs';
 import { applyResolvedCommand, resolveConfiguredCommand } from './resolve-command.mjs';
+import { normalizeExitCode } from '../exit-code.mjs';
 
 const ARGS_SUMMARY_MAX = 200;
 const NORMALIZED_TYPES = new Set(['session.start', 'tool.call', 'tool.result', 'message', 'session.end']);
@@ -508,8 +509,10 @@ function toolMs(part) {
  *      - `error` (a real top-level `{"type":"error",...}` line - a 410 Gone
  *        for an EOL model and a 401 Unauthorized are the two observed
  *        shapes) emits a normalized `error` event, `severity: 'halt'`,
- *        `statusCode`/`message` read from `error.data.{statusCode,message}`
- *        (falling back to `error.{statusCode,message}`), message
+ *        `status_code`/`retryable`/`message` read from
+ *        `error.data.{statusCode,isRetryable,message}` (falling back to
+ *        `error.{statusCode,isRetryable,message}` - OpenCode's own
+ *        harness-level classification, used as-is), message
  *        capped+redacted. This event is informational only: it never sets
  *        an exit code anywhere - the spawned process's own real exit code
  *        stays authoritative (see `run()` below and docs/adapters.md).
@@ -663,14 +666,29 @@ export function createStreamParser({ cwd } = {}) {
       }
 
       case 'error': {
+        // Phase 1a real-batch fix F1 (the real evidence this fix is built
+        // from: 12 of 16 runs in the live batch failed on exactly this
+        // shape, a 429 "Too Many Requests" from nvidia's API). `status_code`
+        // (snake_case, matching every other field in this kit's normalized
+        // event vocabulary - `statusCode` was the one camelCase outlier)
+        // and `retryable` are read directly off OpenCode's own
+        // `error.data.{statusCode,isRetryable}` (falling back to
+        // `error.{statusCode,isRetryable}`) - OpenCode's own harness-level
+        // classification, used as-is, not re-derived from a status
+        // whitelist the way claude.mjs/codex.mjs must (see
+        // src/adapters/error-event.mjs's doc comment: those two harnesses
+        // report no such flag at all).
         const err = obj.error ?? {};
         const data = err.data ?? {};
+        const statusCode = data.statusCode ?? err.statusCode ?? null;
+        const retryable = data.isRetryable === true || err.isRetryable === true;
         events.push({
           ts,
           type: 'error',
           severity: 'halt',
           name: err.name ?? null,
-          statusCode: data.statusCode ?? err.statusCode ?? null,
+          status_code: statusCode,
+          retryable,
           message: capText(data.message ?? err.message ?? '', cwd),
         });
         break;
@@ -772,10 +790,12 @@ export async function run(opts) {
     stderr += d.toString();
   });
 
-  const exitCode = await new Promise((resolve) => {
-    child.on('close', (code) => resolve(timedOut ? 137 : code ?? 1));
-    child.on('error', () => resolve(1));
-  });
+  const exitCode = normalizeExitCode(
+    await new Promise((resolve) => {
+      child.on('close', (code) => resolve(timedOut ? 137 : code ?? 1));
+      child.on('error', () => resolve(1));
+    })
+  );
   if (timer) clearTimeout(timer);
   const elapsedMs = Date.now() - start;
 

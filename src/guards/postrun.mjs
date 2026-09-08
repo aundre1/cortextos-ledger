@@ -149,6 +149,56 @@ export function scopeMarker(outDir) {
 }
 
 /**
+ * docs/state-machine.md "Attempt counting" / docs/guards.md "Post run"
+ * (Phase 1a real-batch fix F1): a run is classified `failure_class =
+ * 'provider_unavailable'` when its events.jsonl stream ended on a terminal
+ * retryable `error` event (docs/adapters.md's normalized event vocabulary -
+ * `retryable: true`) with no successful completion anywhere in the file.
+ * "No successful completion" is any `session.end` event carrying
+ * `exit_code === 0` - if one exists anywhere in the stream, this run is not
+ * provider_unavailable regardless of what else happened. "Terminal" means
+ * the very last event in the file is that retryable error - real production
+ * evidence (12 of 16 runs in the live Phase 1a batch) shows the stream
+ * simply stopping there, nothing after it. A missing/empty/unparseable
+ * events.jsonl (or one with no retryable error at all) classifies as `null`
+ * - never guessed. The caller (run:end, src/commands/runs.mjs) decides
+ * whether to apply this at all (only once every other, more specific
+ * failure reason - files_touched, a scope marker, no_patch - has already
+ * been ruled out) and never writes an escalation here; see
+ * src/limits.mjs's `checkAttempts` for where this column is read back.
+ */
+export function classifyFailureClass(eventsPath) {
+  if (!existsSync(eventsPath)) return { failureClass: null };
+  let lines;
+  try {
+    lines = readFileSync(eventsPath, 'utf8').split('\n').filter(Boolean);
+  } catch {
+    return { failureClass: null };
+  }
+  const events = [];
+  for (const line of lines) {
+    try {
+      events.push(JSON.parse(line));
+    } catch {
+      // a truncated write from a killed process, most likely: skip it,
+      // same tolerance src/ingest.mjs already applies to this same file.
+    }
+  }
+  if (!events.length) return { failureClass: null };
+
+  const hadSuccessfulCompletion = events.some(
+    (e) => e && e.type === 'session.end' && typeof e.exit_code === 'number' && e.exit_code === 0
+  );
+  if (hadSuccessfulCompletion) return { failureClass: null };
+
+  const last = events[events.length - 1];
+  if (last && last.type === 'error' && last.retryable === true) {
+    return { failureClass: 'provider_unavailable', statusCode: last.status_code ?? null, message: last.message ?? null };
+  }
+  return { failureClass: null };
+}
+
+/**
  * docs/guards.md "Missing artifacts": for `agent = builder|solo` with exit
  * 0, patch.diff must exist and be non-empty. Returns true when it is
  * missing or empty (the "no_patch" case).

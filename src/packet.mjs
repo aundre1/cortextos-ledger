@@ -124,7 +124,12 @@ function sortedFindings(verdictRow) {
 // ---------------------------------------------------------------------------
 
 export function computeLimits(db, config, task) {
-  const attemptsUsed = countRuns(db, task.id, ['builder', 'solo']);
+  // Mirrors checkAttempts's own exclusion (src/limits.mjs, docs/state-machine.md
+  // "Attempt counting"): a run the provider never actually answered
+  // (failure_class 'provider_unavailable') is not an attempt, so the packet
+  // and doctor must show the same count run:start's own gate uses - not a
+  // higher one that would confuse an architect reading the packet.
+  const attemptsUsed = countRuns(db, task.id, ['builder', 'solo'], { excludeFailureClass: ['provider_unavailable'] });
   const attemptsMax = config.limits.builder_attempts_max + retryAuthorizedCount(db, task.id);
   const challengesUsed = db
     .prepare('SELECT COUNT(*) AS c FROM review_verdicts WHERE task_id = ? AND challenge_seq > 0')

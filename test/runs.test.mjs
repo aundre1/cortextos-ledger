@@ -347,6 +347,79 @@ test('run:end: builder exit 0 without a non-empty patch.diff fails with halted_r
 });
 
 // ---------------------------------------------------------------------------
+// run:launch --retry / provider_unavailable (Phase 1a real-batch fix F1)
+// ---------------------------------------------------------------------------
+
+// The real evidence this fix is built from: 12 of 16 runs in the live
+// Phase 1a batch failed with the run's out.txt containing exactly one line,
+// this exact normalized `error` event shape (statusCode 429, isRetryable
+// true), and no successful completion.
+function providerUnavailableFixture() {
+  return {
+    exitCode: 1,
+    events: [
+      { ts: '2026-09-07T00:00:00.000Z', type: 'session.start' },
+      {
+        ts: '2026-09-07T00:00:05.000Z',
+        type: 'error',
+        severity: 'halt',
+        status_code: 429,
+        retryable: true,
+        message: 'Too Many Requests',
+      },
+    ],
+  };
+}
+
+test('run:launch --retry: exhausted retries writes exactly one warn escalation, exits 7, and none of the runs count as a builder attempt', () => {
+  const ctx = setup({ builder_attempts_max: 1 });
+  assert.equal(cli(['init'], ctx).code, 0);
+  const taskId = newTask(ctx);
+
+  const launch = launchWithFixture(ctx, taskId, providerUnavailableFixture(), ['--retry', '2', '--retry-backoff-s', '0']);
+  assert.equal(launch.code, 7, launch.stderr);
+  assert.match(launch.stderr, /provider_unavailable/);
+  // computeBackoffMs logging: one wait line per retry (2 retries here), not
+  // one per give-up.
+  assert.equal((launch.stderr.match(/waiting \d+s before retry attempt/g) ?? []).length, 2);
+
+  const view = taskShow(ctx, taskId);
+  assert.equal(view.runs.length, 3, 'the original attempt plus 2 retries');
+  for (const run of view.runs) assert.equal(run.failure_class, 'provider_unavailable');
+
+  const puEscalations = view.escalations.filter((e) => e.reason === 'provider_unavailable');
+  assert.equal(puEscalations.length, 1, 'exactly one row on give-up, never one per retry');
+  assert.equal(puEscalations[0].severity, 'warn');
+  assert.match(puEscalations[0].detail, /3 attempt\(s\)/);
+
+  // docs/state-machine.md "Attempt counting": none of the three
+  // provider_unavailable runs above counted against builder_attempts_max
+  // (set to 1 here) - a genuine builder run:start must still be admitted.
+  const start = cli(['run:start', '--task', taskId, '--agent', 'builder', '--provider', 'fake', '--model', 'fake-model'], ctx);
+  assert.equal(start.code, 0, start.stderr);
+});
+
+test('run:launch --retry: an immediate success never waits or writes a provider_unavailable escalation', () => {
+  const ctx = setup();
+  assert.equal(cli(['init'], ctx).code, 0);
+  const taskId = newTask(ctx);
+
+  const launch = launchWithFixture(
+    ctx,
+    taskId,
+    { exitCode: 0, files: { 'patch.diff': 'diff --git a/x b/x\n+hello\n' } },
+    ['--retry', '3', '--retry-backoff-s', '5']
+  );
+  assert.equal(launch.code, 0, launch.stderr);
+  assert.equal(launch.stderr, '');
+
+  const view = taskShow(ctx, taskId);
+  assert.equal(view.runs.length, 1, 'no retry was ever needed');
+  assert.equal(view.runs[0].failure_class, null);
+  assert.equal(view.escalations.filter((e) => e.reason === 'provider_unavailable').length, 0);
+});
+
+// ---------------------------------------------------------------------------
 // command resolution: run:start admits, run:launch refuses (docs/guards.md
 // "Command resolution", docs/cli.md's run:start/run:launch rows)
 // ---------------------------------------------------------------------------

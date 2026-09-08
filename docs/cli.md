@@ -33,9 +33,11 @@ Global flags: `--config <path>`, `--db <path>` (overrides config), `--json` (mac
 |---|---|
 | `preflight --worktree <p> --provider <p> [--model <m>] [--adapter <x>] [--public] [--allow-dirty] [--strict]` | Guards, exit 1/2/4 on refusal. `--adapter` additionally checks Windows command resolution for that adapter -- omit it and this check is skipped, same as `run:start` -- see `docs/guards.md` "Command resolution" and `docs/adapters.md` "Windows command resolution" |
 | `run:start --task <id> --agent <a> [--adapter <x>] [--provider <p>] [--model <m>] [--public] [--no-preflight]` | Limit and quota gates, insert run, print run id. Never spawns anything, so it never checks command resolution -- it still admits a run on a host where the resolved adapter's harness is not installed at all |
-| `run:launch --task <id> --agent <a> --prompt-file <f> [--detach]` | `run:start` plus adapter spawn plus watchdog; the one command an orchestrator needs. Unlike `run:start`, it always passes its resolved adapter to preflight's command resolution check (`docs/guards.md` "Command resolution") since it is about to spawn that adapter's harness -- exit 1 with reason `command_not_found` if that harness cannot be found anywhere on PATH |
+| `run:launch --task <id> --agent <a> --prompt-file <f> [--detach] [--retry <n>] [--retry-backoff-s <seconds>]` | `run:start` plus adapter spawn plus watchdog; the one command an orchestrator needs. Unlike `run:start`, it always passes its resolved adapter to preflight's command resolution check (`docs/guards.md` "Command resolution") since it is about to spawn that adapter's harness -- exit 1 with reason `command_not_found` if that harness cannot be found anywhere on PATH |
 | `run:end --run <id> [--exit <code>] [--tokens-in <n>] [--tokens-out <n>] [--cost <x>] [--summary ...]` | Post run guards, files touched, status |
 | `watch --run <id>` | Watchdog process, started by `run:launch` |
+
+`--retry <n>` (default `0`) and `--retry-backoff-s <seconds>` (default `30`) opt `run:launch` into waiting for its own run to finish and relaunching it when the run ends `provider_unavailable` (`docs/state-machine.md` "Provider unavailable") -- omitting `--retry` entirely keeps the original fire-and-forget behaviour (returns immediately after spawn, no waiting, no retrying). With `--retry` given, each `provider_unavailable` outcome sleeps `backoff × 2^(attempt-1)` with full jitter, capped at 15 minutes, logs the wait to stderr, and relaunches the same task as a new run, up to `n` extra attempts. Exit 0 on any attempt that is not `provider_unavailable`. Exit 7 (`docs/state-machine.md`'s exit code table) with exactly one `warn` escalation, reason `provider_unavailable`, if every attempt (the first plus all `n` retries) ends `provider_unavailable` -- the escalation's detail names the attempt count; nothing is written per retry.
 | `ingest --events <file> --task <id> --run <id>` | Replay normalized events into the ledger and quota |
 | `msg --task <id> --kind <k> --from <a> --to <b> --body <file\|text>` | Insert agent message |
 | `artifact --task <id> [--run <id>] --kind <k> --path <p>` | Insert artifact with sha256 and bytes |
@@ -45,7 +47,7 @@ Global flags: `--config <path>`, `--db <path>` (overrides config), `--json` (mac
 | Command | Effect |
 |---|---|
 | `review:brief --task <id> --reviewer <agent> [--issue-file <f>]` | Write the blind reviewer brief |
-| `verdict --task <id> --run <id> --reviewer <agent> --provider <p> --model <m> --file <verdict.json> [--challenge]` | Validate and store, exit 5 on schema failure, exit 3 on challenge limit |
+| `verdict --task <id> --run <id> --reviewer <agent> --provider <p> --model <m> --file <verdict.json> [--challenge]` | Validate and store, exit 5 on a semantic validation failure (nothing stored), exit 3 on challenge limit. An over-600-character `summary` is truncated at a word boundary and stored, not rejected -- `review_verdicts.summary_truncated_from` records the original length and a `warn` escalation (`verdict_truncated`) is written; see `docs/review-protocol.md`'s validation paragraph |
 | `adjudicate --task <id> --real <n> --noise <n> [--escaped <n>] [--minutes <m>] [--note ...]` | Human adjudication |
 | `triage:note --task <id>` | Markdown triage comment for a PR |
 
@@ -79,6 +81,7 @@ Global flags: `--config <path>`, `--db <path>` (overrides config), `--json` (mac
 4. For a run: `pid.txt` present and process alive; `done.marker` present; `exit.txt` value; `events.jsonl` last event type and age; `out.txt` last non empty line with secrets redacted; watchdog escalation rows; quota windows for the run's provider and whether any is exhausted; elapsed against `wallclock_s`.
 5. For a task: attempts used, spend used, open escalations, the derived `next_action`.
 6. For `--all`: every `running` run older than `stall_s` with no recent event, every `input_required` task, every quota window at or above 90 percent.
+7. Provider health: for every provider ever seen in `task_runs`, how many of its runs ended `task_runs.failure_class = 'provider_unavailable'` in the last 24 hours (`docs/state-machine.md` "Provider unavailable") -- `warn`-level when the count is nonzero, `info`-level (and printed) when zero, so a throttled lane is visible without reading a transcript.
 
 Probable cause is chosen by rule: quota exhausted and last event is a model call → `quota`; process dead, no `done.marker`, no `exit.txt` → `killed externally or machine slept`; last event is a tool call with no result → `tool hang`; elapsed past the wall clock with no escalation → `watchdog missing`. Output ends with the exact `cortexctl` command that resolves the state when one exists.
 

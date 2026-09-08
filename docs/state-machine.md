@@ -34,7 +34,19 @@ Two soft limits with `warn` escalations: `stall_s` (default 900, no event writte
 
 ## Attempt counting
 
-Attempts count runs whose `agent` is `builder` or `solo` on the same task, regardless of status. A run that stalled still counts. `run:start --agent builder` on a task that already has three such runs exits 3 and writes `retry_limit`. A human can authorise one more with `cortexctl task:resolve --task <id> --retry-authorized --note "..."`, which writes a `human_interventions` row of kind `retry_authorized` and raises that task's ceiling by one. There is no flag that raises it silently.
+Attempts count runs whose `agent` is `builder` or `solo` on the same task, regardless of status, **except** a run classified `task_runs.failure_class = 'provider_unavailable'` (below) - a provider refusing to answer is not an attempt by the agent, so it is excluded from both the count and the ceiling check (`checkAttempts`, `src/limits.mjs`; the same exclusion is used everywhere else an attempt count is shown, including `cortexctl packet`/`doctor`). A run that stalled, or genuinely failed for any other reason, still counts. `run:start --agent builder` on a task that already has three such (countable) runs exits 3 and writes `retry_limit`. A human can authorise one more with `cortexctl task:resolve --task <id> --retry-authorized --note "..."`, which writes a `human_interventions` row of kind `retry_authorized` and raises that task's ceiling by one. There is no flag that raises it silently.
+
+The *challenge cycle* count (the "Blind review gate" below) is derived entirely from `review_verdicts.challenge_seq`, never from `task_runs` - a builder run's `failure_class` has no bearing on it either way; there is nothing to exclude there.
+
+## Provider unavailable
+
+Real evidence from a production batch: 12 of 16 runs failed with `out.txt` containing exactly one line - a normalized `error` event (`docs/adapters.md`) reporting a provider's own `429 Too Many Requests`, with `retryable: true`. An ordinary `fail` status would have counted every one of those against `builder_attempts_max` for a failure the agent never had a chance to attempt.
+
+`run:end` (`src/commands/runs.mjs`) classifies a run's `task_runs.failure_class` as `provider_unavailable` when its `events.jsonl` stream ended on a terminal `error` event with `retryable: true` and no successful completion (no `session.end` anywhere in the file with `exit_code: 0`) - see `src/guards/postrun.mjs`'s `classifyFailureClass`. This classification never itself writes an escalation and never changes task status; it is read back by `checkAttempts` (above) and reported by `doctor` (below).
+
+`run:launch --retry <n> --retry-backoff-s <seconds>` (defaults `0`/`30`) is the operator-facing use of this classification: passing `--retry` makes `run:launch` wait for its own run to finish (instead of firing and forgetting), and on a `provider_unavailable` outcome it waits `backoff × 2^(attempt-1)` with full jitter, capped at 15 minutes, then relaunches - reusing the same task, each retry a new run - up to `n` extra attempts. Each wait is logged to stderr. Exactly one `warn` escalation (reason `provider_unavailable`) is written when the retry budget is exhausted, never one per retry, with the attempt count in its detail. Omitting `--retry` entirely keeps `run:launch`'s original fire-and-forget behaviour unchanged - no waiting, no retrying, no escalation from this path (a run classified this way and never retried simply carries the `failure_class` on its row until something calls `run:end`).
+
+`cortexctl doctor` reports, per provider ever seen in `task_runs`, how many runs in the last 24 hours ended `provider_unavailable`, `warn`-level when nonzero, so an operator can see a lane is throttled without reading a transcript.
 
 ## Exit codes
 
@@ -47,6 +59,7 @@ Attempts count runs whose `agent` is `builder` or `solo` on the same task, regar
 | 4 | Provider quota exhausted or `public_only` provider asked to touch private material |
 | 5 | Verdict JSON invalid |
 | 6 | Task is in a state that does not allow the command (for example `run:start` on `completed`) |
+| 7 | `run:launch --retry` exhausted its retry budget: every attempt ended `provider_unavailable` (terminal retryable provider error, no successful completion) |
 
 Every non zero exit prints one line to stderr in the form `cortexctl: <reason>: <detail>` and, where applicable, the escalation id. Scripts key on the code, humans read the line.
 

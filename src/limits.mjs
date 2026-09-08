@@ -19,14 +19,28 @@ import { rollQuota, syncConfigQuota, reservedSpend } from './quota.mjs';
 // Attempts (docs/state-machine.md "Attempt counting")
 // ---------------------------------------------------------------------------
 
+// Failure classes excluded from attempt counting (docs/state-machine.md
+// "Attempt counting", Phase 1a real-batch fix F1): a run that never got a
+// real answer from the provider (a terminal retryable error - a 429/5xx -
+// and no successful completion, src/guards/postrun.mjs
+// classifyFailureClass) is not an attempt by the agent, so it must not
+// consume builder_attempts_max. Note: the *challenge cycle* count
+// (checkChallenge below) is derived entirely from review_verdicts.
+// challenge_seq, never from task_runs, so a builder run's failure_class has
+// no bearing on it either way - there is nothing to exclude there.
+const NON_COUNTABLE_FAILURE_CLASSES = ['provider_unavailable'];
+
 /**
  * Attempts count runs whose agent is `builder` or `solo` on the same task,
- * regardless of status. A `human_interventions` row of kind
- * `retry_authorized` (written by task:resolve --retry-authorized) raises the
- * ceiling by one, permanently, per authorization.
+ * regardless of status - except a run classified `failure_class =
+ * 'provider_unavailable'` (Phase 1a real-batch fix F1), which never counts:
+ * the provider refused to answer, the agent never got a turn. A
+ * `human_interventions` row of kind `retry_authorized` (written by
+ * task:resolve --retry-authorized) raises the ceiling by one, permanently,
+ * per authorization.
  */
 export function checkAttempts(db, config, taskId, agent) {
-  const used = countRuns(db, taskId, ['builder', 'solo']);
+  const used = countRuns(db, taskId, ['builder', 'solo'], { excludeFailureClass: NON_COUNTABLE_FAILURE_CLASSES });
   const authorized = db
     .prepare(
       "SELECT COUNT(*) AS c FROM human_interventions WHERE task_id = ? AND kind = 'retry_authorized'"
@@ -342,4 +356,26 @@ export function retroactiveWallclock(db, config, run, now = new Date()) {
     detail: `elapsed ${elapsedS.toFixed(0)}s exceeds limit ${limitS}s (retroactive, watchdog absent)`,
   });
   return { fired: true, elapsedS };
+}
+
+// ---------------------------------------------------------------------------
+// Provider-unavailable retry backoff (run:launch --retry, Phase 1a
+// real-batch fix F1)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_BACKOFF_CAP_S = 900; // 15 minutes
+
+/**
+ * "Full jitter" backoff (the well known AWS formula:
+ * `sleep = random_between(0, min(cap, base * 2^(attempt-1)))`), in
+ * milliseconds. `attempt` is 1 for the wait before the *first* retry (the
+ * second overall attempt), 2 for the wait before the third, and so on.
+ * Capped at 15 minutes per this task's own instructions. `random` is
+ * injectable (default `Math.random`) so tests can assert a specific value
+ * instead of merely a range.
+ */
+export function computeBackoffMs(backoffS, attempt, { capS = DEFAULT_BACKOFF_CAP_S, random = Math.random } = {}) {
+  const rawMs = backoffS * 1000 * Math.pow(2, Math.max(0, attempt - 1));
+  const boundedMs = Math.min(rawMs, capS * 1000);
+  return random() * boundedMs;
 }

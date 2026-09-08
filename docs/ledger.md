@@ -40,7 +40,9 @@ Migration 001 must handle an existing database created by the original `schema.s
 
 ### task_runs
 
-Adds `worktree TEXT`, `out_dir TEXT`, `exit_code INTEGER`, `files_touched INTEGER`, `wallclock_limit_s INTEGER`, `halted_reason TEXT`, `pid INTEGER`, `quota_reserved INTEGER NOT NULL DEFAULT 0` (set to 1 by `run:start` when it reserved one request against this run's provider/model quota window(s) at admission; `ingest` reads it so it never adds a second request for the same run -- see `provider_quota` below and `docs/guards.md` "Reserved spend and requests"). `status` values: `running`, `ok`, `fail`, `halted`, `stalled`. `agent` values are free text but the kit ships `architect`, `builder`, `reviewer`, `reviewer_b`, `second-opinion`, `solo`.
+Adds `worktree TEXT`, `out_dir TEXT`, `exit_code INTEGER`, `files_touched INTEGER`, `wallclock_limit_s INTEGER`, `halted_reason TEXT`, `pid INTEGER`, `quota_reserved INTEGER NOT NULL DEFAULT 0` (set to 1 by `run:start` when it reserved one request against this run's provider/model quota window(s) at admission; `ingest` reads it so it never adds a second request for the same run -- see `provider_quota` below and `docs/guards.md` "Reserved spend and requests"), `failure_class TEXT` (nullable; migration `007-v02-provider-and-verdict`). `status` values: `running`, `ok`, `fail`, `halted`, `stalled`. `agent` values are free text but the kit ships `architect`, `builder`, `reviewer`, `reviewer_b`, `second-opinion`, `solo`.
+
+`failure_class` is set by `run:end` only when `status = 'fail'` and no other `halted_reason` already explains it. The only value the kit writes today is `provider_unavailable`: the run's `events.jsonl` ended on a terminal `error` event with `retryable: true` and the stream never recorded a successful completion (`src/guards/postrun.mjs`'s `classifyFailureClass`; see `docs/state-machine.md` "Provider unavailable" for the production evidence that motivated it and `docs/adapters.md`'s normalized `error` event for the `status_code`/`retryable` fields it reads). Setting this column never itself writes an escalation and never changes task status; it exists so `checkAttempts` (`src/limits.mjs`) can exclude a provider's own outage from `builder_attempts_max`, and so `doctor` can report it per provider.
 
 ### agent_messages
 
@@ -52,7 +54,9 @@ Unchanged. `kind` values: `brief`, `patch`, `verdict`, `challenge`, `rebuttal`, 
 
 ### review_verdicts
 
-Adds `arm TEXT` (copied from the task at insert time so verdict statistics need no join), `challenge_seq INTEGER NOT NULL DEFAULT 0` (0 for the first blind verdict, 1 for the single allowed challenge cycle), `tests_touched INTEGER`, `scope_exceeded INTEGER`. `findings_json` must validate against `docs/review-protocol.md` before insert.
+Adds `arm TEXT` (copied from the task at insert time so verdict statistics need no join), `challenge_seq INTEGER NOT NULL DEFAULT 0` (0 for the first blind verdict, 1 for the single allowed challenge cycle), `tests_touched INTEGER`, `scope_exceeded INTEGER`, `summary_truncated_from INTEGER` (nullable; migration `007-v02-provider-and-verdict`). `findings_json` must validate against `docs/review-protocol.md` before insert.
+
+`summary_truncated_from` holds the original `summary` length in characters when `cortexctl verdict` truncated it to fit the cap (`docs/review-protocol.md`'s validation paragraph), and is `null` when the stored `summary` is exactly what the reviewer wrote. A truncation always writes a `warn` escalation, reason `verdict_truncated`, recording the reviewer, model, and original length; it is never a reason to exit non-zero or discard the verdict.
 
 ### test_results
 
@@ -64,7 +68,9 @@ Adds `requests INTEGER NOT NULL DEFAULT 0` so request based quotas can be comput
 
 ### escalations
 
-`reason` values: `retry_limit`, `challenge_limit`, `budget`, `wallclock`, `files_touched`, `quota`, `dirty_worktree`, `secrets`, `stall`, `tool_failure`, `test_edit`, `verdict_invalid`, `manual`. Adds `run_id TEXT` nullable and `severity TEXT` (`halt` or `warn`). A `halt` escalation moves the task to `input_required`. A `warn` escalation does not change task state.
+`reason` values: `retry_limit`, `challenge_limit`, `budget`, `wallclock`, `files_touched`, `quota`, `dirty_worktree`, `secrets`, `stall`, `tool_failure`, `test_edit`, `verdict_invalid`, `manual`, `provider_unavailable`, `verdict_truncated`. Adds `run_id TEXT` nullable and `severity TEXT` (`halt` or `warn`). A `halt` escalation moves the task to `input_required`. A `warn` escalation does not change task state.
+
+`provider_unavailable` (`warn`) is written exactly once by `run:launch --retry` when its retry budget is exhausted after every attempt ended with `task_runs.failure_class = 'provider_unavailable'` (`docs/state-machine.md` "Provider unavailable") -- never once per retry. `verdict_truncated` (`warn`) is written by `cortexctl verdict` whenever it truncates an over-length `summary` instead of rejecting the verdict (`review_verdicts.summary_truncated_from` above; `docs/review-protocol.md`'s validation paragraph). Neither of the existing reasons fit: `quota` is the kit's own configured rate ceiling being hit, not the provider refusing service on its own; `verdict_invalid` means the verdict was rejected and nothing was stored, which a truncated-but-accepted verdict is not.
 
 ### provider_quota (new)
 

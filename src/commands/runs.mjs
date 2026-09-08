@@ -29,6 +29,7 @@ import {
   escalate,
   resolveEscalations,
   retroactiveWallclock,
+  computeBackoffMs,
 } from '../limits.mjs';
 import { reserveRequest } from '../quota.mjs';
 import { preflight as runPreflight } from '../guards/preflight.mjs';
@@ -38,11 +39,13 @@ import {
   toolFailureStreak,
   scopeMarker,
   missingPatch,
+  classifyFailureClass,
 } from '../guards/postrun.mjs';
 import { getAdapter } from '../adapters/index.mjs';
-import { launchDetached, pollPidFile } from '../adapters/spawn.mjs';
+import { launchDetached, pollPidFile, waitForDoneMarker } from '../adapters/spawn.mjs';
 import { watch as watchRun } from '../guards/watchdog.mjs';
 import { activeFor } from '../policy.mjs';
+import { normalizeExitCode } from '../exit-code.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI_PATH = join(HERE, '..', '..', 'bin', 'cortexctl.mjs');
@@ -333,6 +336,134 @@ async function doRunStart({ db, config, flags, err, platform, env }, runStartOpt
   return { result: { code: 0, stdout: outcome.run.id }, run: outcome.run, task, outDir, adapterName };
 }
 
+/**
+ * Shared body of run:end (docs/cli.md "Post run guards, files touched,
+ * status"), extracted so `run:launch --retry` (Phase 1a real-batch fix F1)
+ * can finalize each attempt in process - the same guards, the same
+ * failure_class classification, no subprocess - rather than duplicating
+ * this logic or shelling out to itself. Returns `{code, stdout, failureClass}`;
+ * `failureClass` is `'provider_unavailable'` or `null`, always present, so a
+ * caller need not re-parse `stdout`/`--json` to make a retry decision.
+ */
+function doRunEnd({ db, config, flags, err }) {
+  if (!flags.run) return { ...fail(err, 1, 'usage', 'run:end requires --run <id>'), failureClass: null };
+  const run = db.prepare('SELECT * FROM task_runs WHERE id = ?').get(flags.run);
+  if (!run) return { ...fail(err, 1, 'not_found', `no such run: ${flags.run}`), failureClass: null };
+  const task = getTask(db, run.task_id);
+  if (!task) return { ...fail(err, 1, 'not_found', `no such task: ${run.task_id}`), failureClass: null };
+
+  // If the watchdog itself died, apply the wall clock rule now.
+  retroactiveWallclock(db, config, run, new Date());
+  const afterRetro = db.prepare('SELECT * FROM task_runs WHERE id = ?').get(run.id);
+  if (afterRetro.status === 'halted' && afterRetro.halted_reason === 'wallclock') {
+    return { code: 0, stdout: afterRetro.status, failureClass: null };
+  }
+
+  // F3: a Windows unsigned exit code (4294967295 for a native -1) is
+  // normalized to its signed value the moment it enters the ledger, whether
+  // it arrived via --exit or was read off exit.txt.
+  let exitCode;
+  if (flags.exit !== undefined) {
+    exitCode = normalizeExitCode(Number(flags.exit));
+  } else {
+    const exitPath = join(run.out_dir, 'exit.txt');
+    exitCode = normalizeExitCode(existsSync(exitPath) ? Number(readFileSync(exitPath, 'utf8').trim()) : 0);
+  }
+
+  const touched = filesTouched(run.worktree, task.base_commit);
+  const filesTouchedCount = touched.length;
+
+  let status = exitCode === 0 ? 'ok' : 'fail';
+  let haltedReason = null;
+
+  if (filesTouchedCount > config.limits.files_touched_max) {
+    status = 'halted';
+    haltedReason = 'files_touched';
+    escalate(db, {
+      taskId: task.id,
+      runId: run.id,
+      reason: 'files_touched',
+      severity: 'halt',
+      detail: `${filesTouchedCount} files touched, limit ${config.limits.files_touched_max}: ${touched.join(', ')}`,
+    });
+  }
+
+  const editDetection = testEditDetection(touched, config.test_patterns, task.task_class);
+  if (editDetection.touched) {
+    escalate(db, {
+      taskId: task.id,
+      runId: run.id,
+      reason: 'test_edit',
+      severity: 'warn',
+      detail: `touched test files: ${editDetection.files.join(', ')}`,
+    });
+  }
+
+  const failureStreak = toolFailureStreak(join(run.out_dir, 'events.jsonl'), 3);
+  if (failureStreak.hit) {
+    escalate(db, {
+      taskId: task.id,
+      runId: run.id,
+      reason: 'tool_failure',
+      severity: 'warn',
+      detail: `${failureStreak.tool ?? 'unknown tool'}: ${failureStreak.error ?? ''}`.trim(),
+    });
+  }
+
+  const scope = scopeMarker(run.out_dir);
+  if (scope.found && status !== 'halted') {
+    status = 'fail';
+    haltedReason = scope.line;
+  }
+
+  if ((run.agent === 'builder' || run.agent === 'solo') && exitCode === 0 && status === 'ok') {
+    if (missingPatch(run.out_dir)) {
+      status = 'fail';
+      haltedReason = 'no_patch';
+    }
+  }
+
+  // Phase 1a real-batch fix F1: a run that failed only because the stream
+  // ended on a terminal retryable provider error (a 429/5xx), with no
+  // successful completion anywhere in events.jsonl, is not an ordinary
+  // agent failure - it never got a turn. Only considered once `status` has
+  // settled to a plain `fail` (files_touched/scope/no_patch already claimed
+  // it for a more specific reason, and those take precedence: this run did
+  // touch too many files, or did exceed scope, regardless of what the
+  // provider also did). No escalation is written here - src/limits.mjs's
+  // NON_COUNTABLE_FAILURE_CLASSES / checkAttempts already exclude it from
+  // the attempt count by reading this column directly, and `run:launch
+  // --retry`'s own loop (docs/state-machine.md "Attempt counting", this
+  // command's own doc comment above) is the one place that ever writes a
+  // provider_unavailable escalation - exactly once, when its retry budget
+  // is exhausted, never once per individual run.
+  let failureClass = null;
+  if (status === 'fail' && haltedReason === null) {
+    const classification = classifyFailureClass(join(run.out_dir, 'events.jsonl'));
+    failureClass = classification.failureClass;
+  }
+
+  const summary = flags.summary ?? run.summary;
+  const tokensIn = flags['tokens-in'] !== undefined ? Number(flags['tokens-in']) : run.tokens_in;
+  const tokensOut = flags['tokens-out'] !== undefined ? Number(flags['tokens-out']) : run.tokens_out;
+  const costUsd = flags.cost !== undefined ? Number(flags.cost) : run.cost_usd;
+
+  db.prepare(
+    `UPDATE task_runs SET status = ?, exit_code = ?, files_touched = ?, halted_reason = ?,
+       tokens_in = ?, tokens_out = ?, cost_usd = ?, summary = ?, ended_at = ?, failure_class = ?
+     WHERE id = ?`
+  ).run(status, exitCode, filesTouchedCount, haltedReason, tokensIn, tokensOut, costUsd, summary, nowIso(), failureClass, run.id);
+
+  if (flags.json) {
+    return {
+      code: 0,
+      stdout: JSON.stringify({ status, exit_code: exitCode, halted_reason: haltedReason, failure_class: failureClass }),
+      failureClass,
+    };
+  }
+  return { code: 0, stdout: status, failureClass };
+}
+
 export function register(registry) {
   registry.add('preflight', {
     description: 'Guards, exit 2 or 4 on refusal',
@@ -368,32 +499,35 @@ export function register(registry) {
     },
   });
 
-  registry.add('run:launch', {
-    description: 'run:start plus adapter spawn plus watchdog',
-    async handler(ctx) {
-      const { db, config, flags, err } = ctx;
-      const need = missing(flags, ['task', 'agent', 'prompt-file']);
-      if (need.length) {
-        return fail(err, 1, 'usage', `missing required flags: ${need.map((n) => '--' + n).join(', ')}`);
-      }
+  /**
+   * One launch attempt: run:start plus adapter spawn plus watchdog (the
+   * body run:launch has always had). Returns `{ok:false, result}` on any
+   * failure to relay verbatim, or `{ok:true, run, task, outDir}` once the
+   * harness has been spawned (or, for `--sync`, has already finished).
+   * Factored out of the registry handler so `--retry` (Phase 1a real-batch
+   * fix F1) can call it more than once for the same `--task`/`--agent`
+   * without duplicating this body.
+   */
+  async function launchAttempt(ctx) {
+    const { db, config, flags, err } = ctx;
 
-      const started = await doRunStart(ctx, { checkCommandResolution: true });
-      if (started.result.code !== 0) return started.result;
-      const { run, task, outDir, adapterName } = started;
+    const started = await doRunStart(ctx, { checkCommandResolution: true });
+    if (started.result.code !== 0) return { ok: false, result: started.result };
+    const { run, task, outDir, adapterName } = started;
 
-      let prompt;
-      try {
-        prompt = readFileSync(flags['prompt-file'], 'utf8');
-      } catch (e) {
-        return fail(err, 1, 'usage', `cannot read --prompt-file: ${e.message}`);
-      }
+    let prompt;
+    try {
+      prompt = readFileSync(flags['prompt-file'], 'utf8');
+    } catch (e) {
+      return { ok: false, result: fail(err, 1, 'usage', `cannot read --prompt-file: ${e.message}`) };
+    }
 
-      let adapter;
-      try {
-        adapter = await getAdapter(adapterName);
-      } catch (e) {
-        return fail(err, e.code ?? 1, 'usage', e.message);
-      }
+    let adapter;
+    try {
+      adapter = await getAdapter(adapterName);
+    } catch (e) {
+      return { ok: false, result: fail(err, e.code ?? 1, 'usage', e.message) };
+    }
 
       const timeoutMs = config.limits.wallclock_s * 1000;
 
@@ -527,102 +661,94 @@ export function register(registry) {
         watcher.unref();
       }
 
-      return { code: 0, stdout: run.id };
+      return { ok: true, run, task, outDir };
+  }
+
+  registry.add('run:launch', {
+    description: 'run:start plus adapter spawn plus watchdog',
+    async handler(ctx) {
+      const { db, flags, err, config } = ctx;
+      const need = missing(flags, ['task', 'agent', 'prompt-file']);
+      if (need.length) {
+        return fail(err, 1, 'usage', `missing required flags: ${need.map((n) => '--' + n).join(', ')}`);
+      }
+
+      // --retry (Phase 1a real-batch fix F1): flag omitted entirely keeps
+      // run:launch's original behaviour exactly - one attempt, spawn and
+      // return immediately (fire and forget; a detached launch is watched
+      // by `cortexctl watch`/finalized by a later `run:end`, never awaited
+      // here). Passing --retry (even --retry 0) opts into this run waiting
+      // for its own completion so it can tell a provider outage from a real
+      // agent failure and, if asked, relaunch - see docs/cli.md's
+      // `run:launch` row and docs/state-machine.md's exit code table (7).
+      if (flags.retry === undefined) {
+        const attempt = await launchAttempt(ctx);
+        if (!attempt.ok) return attempt.result;
+        return { code: 0, stdout: attempt.run.id };
+      }
+
+      const maxExtraAttempts = Math.max(0, Number(flags.retry) || 0);
+      const backoffS = flags['retry-backoff-s'] !== undefined ? Number(flags['retry-backoff-s']) : 30;
+      const totalAttempts = maxExtraAttempts + 1;
+
+      for (let attemptNum = 1; ; attemptNum++) {
+        const attempt = await launchAttempt(ctx);
+        if (!attempt.ok) return attempt.result; // a gate/usage failure, unrelated to the provider - surface as-is, no retry.
+        const { run, task, outDir } = attempt;
+
+        // The watchdog (spawned inside launchAttempt, or --sync's own
+        // synchronous run() above) is what guarantees this run eventually
+        // gets a done.marker one way or another; the extra minute here is
+        // slack for process scheduling, not a second enforcement of
+        // wallclock_s.
+        await waitForDoneMarker(outDir, { timeoutMs: config.limits.wallclock_s * 1000 + 60000 });
+
+        const ended = doRunEnd({ db, config, flags: { run: run.id }, err });
+        if (ended.code !== 0) return ended;
+
+        if (ended.failureClass !== 'provider_unavailable') {
+          return { code: 0, stdout: run.id };
+        }
+
+        if (attemptNum >= totalAttempts) {
+          // Exactly one warn escalation on give-up, never one per retry
+          // (docs/ledger.md escalations.reason "provider_unavailable" -
+          // added by this fix, no existing reason fit a provider's own
+          // service being unavailable, as opposed to this kit's own quota
+          // ceilings).
+          const escalation = escalate(db, {
+            taskId: task.id,
+            runId: run.id,
+            reason: 'provider_unavailable',
+            severity: 'warn',
+            detail: `provider unavailable after ${attemptNum} attempt(s) (retry budget ${maxExtraAttempts} extra attempt(s) exhausted)`,
+          });
+          return fail(
+            err,
+            7,
+            'provider_unavailable',
+            `${attemptNum} attempt(s) exhausted, retry budget ${maxExtraAttempts} (run ${run.id}, escalation ${escalation.id})`
+          );
+        }
+
+        const waitMs = computeBackoffMs(backoffS, attemptNum);
+        err(
+          `cortexctl: provider_unavailable: waiting ${Math.round(waitMs / 1000)}s before retry attempt ${attemptNum + 1}/${totalAttempts} (run ${run.id})`
+        );
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        // Loop continues: the next launchAttempt(ctx) reuses the same
+        // --task/--agent, creating a new run on the same task
+        // (docs/state-machine.md "Attempt counting": a provider_unavailable
+        // run never counts against builder_attempts_max, so this never
+        // trips that gate on its own).
+      }
     },
   });
 
   registry.add('run:end', {
     description: 'Post run guards, files touched, status',
-    handler({ db, config, flags, err }) {
-      if (!flags.run) return fail(err, 1, 'usage', 'run:end requires --run <id>');
-      const run = db.prepare('SELECT * FROM task_runs WHERE id = ?').get(flags.run);
-      if (!run) return fail(err, 1, 'not_found', `no such run: ${flags.run}`);
-      const task = getTask(db, run.task_id);
-      if (!task) return fail(err, 1, 'not_found', `no such task: ${run.task_id}`);
-
-      // If the watchdog itself died, apply the wall clock rule now.
-      retroactiveWallclock(db, config, run, new Date());
-      const afterRetro = db.prepare('SELECT * FROM task_runs WHERE id = ?').get(run.id);
-      if (afterRetro.status === 'halted' && afterRetro.halted_reason === 'wallclock') {
-        return { code: 0, stdout: afterRetro.status };
-      }
-
-      let exitCode;
-      if (flags.exit !== undefined) {
-        exitCode = Number(flags.exit);
-      } else {
-        const exitPath = join(run.out_dir, 'exit.txt');
-        exitCode = existsSync(exitPath) ? Number(readFileSync(exitPath, 'utf8').trim()) : 0;
-      }
-
-      const touched = filesTouched(run.worktree, task.base_commit);
-      const filesTouchedCount = touched.length;
-
-      let status = exitCode === 0 ? 'ok' : 'fail';
-      let haltedReason = null;
-
-      if (filesTouchedCount > config.limits.files_touched_max) {
-        status = 'halted';
-        haltedReason = 'files_touched';
-        escalate(db, {
-          taskId: task.id,
-          runId: run.id,
-          reason: 'files_touched',
-          severity: 'halt',
-          detail: `${filesTouchedCount} files touched, limit ${config.limits.files_touched_max}: ${touched.join(', ')}`,
-        });
-      }
-
-      const editDetection = testEditDetection(touched, config.test_patterns, task.task_class);
-      if (editDetection.touched) {
-        escalate(db, {
-          taskId: task.id,
-          runId: run.id,
-          reason: 'test_edit',
-          severity: 'warn',
-          detail: `touched test files: ${editDetection.files.join(', ')}`,
-        });
-      }
-
-      const failureStreak = toolFailureStreak(join(run.out_dir, 'events.jsonl'), 3);
-      if (failureStreak.hit) {
-        escalate(db, {
-          taskId: task.id,
-          runId: run.id,
-          reason: 'tool_failure',
-          severity: 'warn',
-          detail: `${failureStreak.tool ?? 'unknown tool'}: ${failureStreak.error ?? ''}`.trim(),
-        });
-      }
-
-      const scope = scopeMarker(run.out_dir);
-      if (scope.found && status !== 'halted') {
-        status = 'fail';
-        haltedReason = scope.line;
-      }
-
-      if ((run.agent === 'builder' || run.agent === 'solo') && exitCode === 0 && status === 'ok') {
-        if (missingPatch(run.out_dir)) {
-          status = 'fail';
-          haltedReason = 'no_patch';
-        }
-      }
-
-      const summary = flags.summary ?? run.summary;
-      const tokensIn = flags['tokens-in'] !== undefined ? Number(flags['tokens-in']) : run.tokens_in;
-      const tokensOut = flags['tokens-out'] !== undefined ? Number(flags['tokens-out']) : run.tokens_out;
-      const costUsd = flags.cost !== undefined ? Number(flags.cost) : run.cost_usd;
-
-      db.prepare(
-        `UPDATE task_runs SET status = ?, exit_code = ?, files_touched = ?, halted_reason = ?,
-           tokens_in = ?, tokens_out = ?, cost_usd = ?, summary = ?, ended_at = ?
-         WHERE id = ?`
-      ).run(status, exitCode, filesTouchedCount, haltedReason, tokensIn, tokensOut, costUsd, summary, nowIso(), run.id);
-
-      if (flags.json) {
-        return { code: 0, stdout: JSON.stringify({ status, exit_code: exitCode, halted_reason: haltedReason }) };
-      }
-      return { code: 0, stdout: status };
+    handler(ctx) {
+      return doRunEnd(ctx);
     },
   });
 

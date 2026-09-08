@@ -272,3 +272,37 @@ test('doctor --all: flags a stalled running run, an input_required task, and a q
   assert.ok(texts.some((t) => t.includes('input_required')));
   assert.ok(texts.some((t) => t.includes('prov-90')));
 });
+
+// Phase 1a real-batch fix F1: "doctor reports, per provider seen in the
+// ledger, how many runs in the last 24 hours ended provider_unavailable, so
+// an operator can see a lane is throttled".
+test('doctor: reports provider_unavailable counts per provider over the last 24h, warn when nonzero', async () => {
+  const { db, config } = await migrated();
+  const task = insertTask(db, { repo: 'o/n', title: 'T', task_class: 'ci', arm: 'control' });
+  const now = new Date();
+  const recent = new Date(now.getTime() - 60 * 60 * 1000).toISOString(); // 1h ago
+  const stale = new Date(now.getTime() - 48 * 60 * 60 * 1000).toISOString(); // 48h ago
+
+  insertRun(db, {
+    task_id: task.id, seq: 1, agent: 'builder', provider: 'nvidia', model: 'x',
+    started_at: recent, failure_class: 'provider_unavailable',
+  });
+  insertRun(db, {
+    task_id: task.id, seq: 2, agent: 'builder', provider: 'nvidia', model: 'x',
+    started_at: stale, failure_class: 'provider_unavailable', // outside the 24h window
+  });
+  insertRun(db, {
+    task_id: task.id, seq: 3, agent: 'builder', provider: 'openai', model: 'y',
+    started_at: recent, // no failure_class - a clean run
+  });
+
+  const result = doctor(db, config, {});
+  const nvidia = result.findings.find((f) => f.text.startsWith('provider nvidia:'));
+  const openai = result.findings.find((f) => f.text.startsWith('provider openai:'));
+  assert.ok(nvidia, JSON.stringify(result.findings));
+  assert.ok(openai, JSON.stringify(result.findings));
+  assert.match(nvidia.text, /1 run\(s\) provider_unavailable/); // only the recent one counts
+  assert.equal(nvidia.level, 'warn');
+  assert.match(openai.text, /0 run\(s\) provider_unavailable/);
+  assert.equal(openai.level, 'info');
+});

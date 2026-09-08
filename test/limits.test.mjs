@@ -23,6 +23,7 @@ import {
   escalate,
   resolveEscalations,
   retroactiveWallclock,
+  computeBackoffMs,
 } from '../src/limits.mjs';
 
 const CONFIG = {
@@ -95,6 +96,40 @@ test('checkAttempts: non-builder agents are never limited', async () => {
   }
   assert.equal(checkAttempts(db, CONFIG, task.id, 'reviewer').ok, true);
   db.close();
+});
+
+// Phase 1a real-batch fix F1: a run the provider never answered
+// (failure_class 'provider_unavailable') is not an attempt by the agent.
+test('checkAttempts: runs classified provider_unavailable do not count toward builder_attempts_max', async () => {
+  const db = await freshDb();
+  const task = insertTask(db, { repo: 'o/n', title: 't', task_class: 'ci', arm: 'control' });
+
+  for (let i = 0; i < 5; i++) {
+    insertRun(db, {
+      task_id: task.id, seq: i + 1, agent: 'builder', provider: 'nvidia', model: 'x',
+      failure_class: 'provider_unavailable',
+    });
+  }
+  const stillOpen = checkAttempts(db, CONFIG, task.id, 'builder');
+  assert.equal(stillOpen.ok, true, 'five provider_unavailable runs must not exhaust a max of 3');
+  assert.equal(stillOpen.used, 0);
+
+  // A mix: 2 real attempts + 3 provider_unavailable ones - only the 2 count.
+  insertRun(db, { task_id: task.id, seq: 6, agent: 'builder', provider: 'fake', model: 'x' });
+  insertRun(db, { task_id: task.id, seq: 7, agent: 'builder', provider: 'fake', model: 'x' });
+  const mixed = checkAttempts(db, CONFIG, task.id, 'builder');
+  assert.equal(mixed.used, 2);
+  assert.equal(mixed.ok, true);
+  db.close();
+});
+
+test('computeBackoffMs: full jitter - zero for attempt with a zero-second base, and bounded by the cap', () => {
+  assert.equal(computeBackoffMs(0, 1), 0);
+  assert.equal(computeBackoffMs(30, 1, { random: () => 1 }), 30000); // attempt 1: 30 * 2^0 = 30s, jitter at max
+  assert.equal(computeBackoffMs(30, 2, { random: () => 1 }), 60000); // attempt 2: 30 * 2^1 = 60s
+  assert.equal(computeBackoffMs(30, 1, { random: () => 0 }), 0); // full jitter can be zero
+  // Capped at 15 minutes (900s) regardless of how large backoffS/attempt get.
+  assert.equal(computeBackoffMs(1000, 10, { random: () => 1 }), 900000);
 });
 
 test('checkChallenge: first challenge allowed, second refused', async () => {

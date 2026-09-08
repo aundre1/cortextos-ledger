@@ -43,6 +43,7 @@ import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { redact } from './credential-boundary.mjs';
 import { ADAPTER_NAMES } from './index.mjs';
+import { normalizeExitCode } from '../exit-code.mjs';
 
 function parseArgs(argv) {
   const flags = {};
@@ -83,10 +84,16 @@ function killTree(pid) {
   }
 }
 
-/** exit.txt is written once, first writer wins (F5: the watchdog's kill exit code must never be overwritten by this runner's own later observation). */
+/**
+ * exit.txt is written once, first writer wins (F5: the watchdog's kill exit
+ * code must never be overwritten by this runner's own later observation).
+ * `exitCode` is normalized (F3, src/exit-code.mjs) before it ever reaches
+ * disk - a Windows-native unsigned exit code (4294967295 for a native -1)
+ * must never enter the ledger as-is.
+ */
 function writeExitCodeOnce(outDir, exitCode) {
   const path = join(outDir, 'exit.txt');
-  if (!existsSync(path)) writeFileSync(path, String(exitCode));
+  if (!existsSync(path)) writeFileSync(path, String(normalizeExitCode(exitCode)));
 }
 
 function writeDone(outDir, exitCode, elapsedMs) {
@@ -240,7 +247,8 @@ async function main() {
 
   const startedAt = Date.now();
 
-  function finish(exitCode) {
+  function finish(rawExitCode) {
+    const exitCode = normalizeExitCode(rawExitCode);
     const elapsedMs = Date.now() - startedAt;
     if (parser && eventsPath) {
       if (!sawSessionEnd) {

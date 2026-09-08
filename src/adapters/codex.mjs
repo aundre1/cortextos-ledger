@@ -6,6 +6,8 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { filterEnv, redact, relativizeToCwd } from './credential-boundary.mjs';
 import { applyResolvedCommand, resolveConfiguredCommand } from './resolve-command.mjs';
+import { normalizeExitCode } from '../exit-code.mjs';
+import { firstStatusCode, retryableFromStatus } from './error-event.mjs';
 
 const ARGS_SUMMARY_MAX = 200;
 const TOOL_ITEM_TYPES = new Set(['command_execution', 'file_change', 'mcp_tool_call']);
@@ -139,6 +141,31 @@ export function createStreamParser({ cwd } = {}) {
       return [event];
     }
 
+    // Best-effort, undocumented shape (Phase 1a real-batch fix F1, see
+    // src/adapters/error-event.mjs's own doc comment): Codex's real
+    // `exec --json` error-on-provider-failure shape is not captured
+    // anywhere in this kit yet, so a top-level `{"type":"error",...}` line
+    // is translated the same way opencode.mjs's own (verified) `error`
+    // shape is - `status_code` from whichever common field name is
+    // actually present, `retryable` only from a numeric status in the well
+    // known transient set (429/500/502/503/504), never invented when
+    // absent.
+    if (obj.type === 'error') {
+      const errObj = obj.error ?? {};
+      const statusCode = firstStatusCode(errObj.status_code, errObj.statusCode, obj.status_code, obj.statusCode);
+      const message = errObj.message ?? obj.message ?? '';
+      return [
+        {
+          ts,
+          type: 'error',
+          severity: 'halt',
+          status_code: statusCode,
+          retryable: retryableFromStatus(statusCode),
+          message: capSummary(message, cwd),
+        },
+      ];
+    }
+
     if (obj.type === 'turn.completed') {
       const usage = obj.usage;
       if (usage) {
@@ -237,10 +264,12 @@ export async function run(opts) {
     stderr += d.toString();
   });
 
-  const exitCode = await new Promise((resolve) => {
-    child.on('close', (code) => resolve(timedOut ? 137 : code ?? 1));
-    child.on('error', () => resolve(1));
-  });
+  const exitCode = normalizeExitCode(
+    await new Promise((resolve) => {
+      child.on('close', (code) => resolve(timedOut ? 137 : code ?? 1));
+      child.on('error', () => resolve(1));
+    })
+  );
   if (timer) clearTimeout(timer);
   const elapsedMs = Date.now() - start;
 

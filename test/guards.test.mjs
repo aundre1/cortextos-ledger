@@ -17,6 +17,7 @@ import {
   toolFailureStreak,
   scopeMarker,
   missingPatch,
+  classifyFailureClass,
 } from '../src/guards/postrun.mjs';
 
 const CONFIG = {
@@ -329,6 +330,52 @@ test('toolFailureStreak: missing events.jsonl is not a failure', () => {
   const result = toolFailureStreak(join(makeTempDir(), 'events.jsonl'), 3);
   assert.equal(result.hit, false);
   assert.equal(result.streak, 0);
+});
+
+// Phase 1a real-batch fix F1: the real evidence - 12 of 16 runs in the live
+// batch had an events.jsonl containing exactly one line, this exact
+// normalized error event.
+function writeEventsFile(events) {
+  const path = join(makeTempDir(), 'events.jsonl');
+  writeFileSync(path, events.map((e) => JSON.stringify(e)).join('\n') + (events.length ? '\n' : ''));
+  return path;
+}
+
+test('classifyFailureClass: a stream ending in a terminal retryable error with no success is provider_unavailable', () => {
+  const path = writeEventsFile([
+    { type: 'error', severity: 'halt', status_code: 429, retryable: true, message: 'Too Many Requests' },
+  ]);
+  const result = classifyFailureClass(path);
+  assert.equal(result.failureClass, 'provider_unavailable');
+  assert.equal(result.statusCode, 429);
+});
+
+test('classifyFailureClass: a retryable error is not terminal (something else followed it) does not classify', () => {
+  const path = writeEventsFile([
+    { type: 'error', severity: 'halt', status_code: 429, retryable: true, message: 'Too Many Requests' },
+    { type: 'tool.call', tool: 'bash' },
+  ]);
+  assert.equal(classifyFailureClass(path).failureClass, null);
+});
+
+test('classifyFailureClass: a non-retryable terminal error does not classify', () => {
+  const path = writeEventsFile([
+    { type: 'error', severity: 'halt', status_code: 400, retryable: false, message: 'bad request' },
+  ]);
+  assert.equal(classifyFailureClass(path).failureClass, null);
+});
+
+test('classifyFailureClass: any successful session.end anywhere in the stream rules it out, even after a retryable error', () => {
+  const path = writeEventsFile([
+    { type: 'error', severity: 'halt', status_code: 429, retryable: true, message: 'rate limited' },
+    { type: 'session.end', exit_code: 0 },
+  ]);
+  assert.equal(classifyFailureClass(path).failureClass, null);
+});
+
+test('classifyFailureClass: a missing or empty events.jsonl classifies as null, never guessed', () => {
+  assert.equal(classifyFailureClass(join(makeTempDir(), 'events.jsonl')).failureClass, null);
+  assert.equal(classifyFailureClass(writeEventsFile([])).failureClass, null);
 });
 
 test('scopeMarker: detects SCOPE_EXCEEDED and BLOCKED: lines in out.txt or reasoning.md', () => {

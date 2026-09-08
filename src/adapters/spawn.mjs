@@ -113,6 +113,25 @@ export async function pollPidFile(pidPath, timeoutMs = 3000, stepMs = 50) {
   }
 }
 
+/**
+ * Poll for `<outDir>/done.marker` to appear, up to `timeoutMs` in `stepMs`
+ * steps (`run:launch --retry`, Phase 1a real-batch fix F1: a retry decision
+ * needs the run to have actually finished before `run:end` can classify
+ * it). Returns `true` once found, `false` if it never appears within the
+ * deadline - the watchdog (docs/state-machine.md "Wall clock watchdog") is
+ * what guarantees a wedged run eventually gets a done.marker one way or
+ * another, so `timeoutMs` here is a generous safety net on top of that, not
+ * the enforcement mechanism itself.
+ */
+export async function waitForDoneMarker(outDir, { timeoutMs = 60 * 60 * 1000, stepMs = 250 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (existsSync(join(outDir, 'done.marker'))) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, stepMs));
+  }
+}
+
 /** Kill a process tree by pid: `taskkill /T /F` on Windows, process group SIGKILL elsewhere. */
 export function killTree(pid) {
   if (!pid) return;

@@ -153,18 +153,25 @@ export function insertRun(db, fields) {
     // guessing an adapter from `agent`/`provider` - see
     // src/schema/004-v02-run-adapter.mjs.
     adapter: nullish(fields.adapter),
+    // Phase 1a real-batch fix F1: normally set later, by run:end
+    // (src/commands/runs.mjs doRunEnd, src/guards/postrun.mjs
+    // classifyFailureClass) - accepted here too so a caller (a test, or a
+    // future direct insert) that already knows the classification does not
+    // need a second UPDATE.
+    failure_class: nullish(fields.failure_class),
   };
   db.prepare(
     `INSERT INTO task_runs
        (id, task_id, seq, agent, provider, model, started_at, ended_at, status,
         tokens_in, tokens_out, cost_usd, tool_calls, session_id, summary,
-        worktree, out_dir, exit_code, files_touched, wallclock_limit_s, halted_reason, pid, adapter)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+        worktree, out_dir, exit_code, files_touched, wallclock_limit_s, halted_reason, pid, adapter,
+        failure_class)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.task_id, row.seq, row.agent, row.provider, row.model, row.started_at,
     row.ended_at, row.status, row.tokens_in, row.tokens_out, row.cost_usd, row.tool_calls,
     row.session_id, row.summary, row.worktree, row.out_dir, row.exit_code, row.files_touched,
-    row.wallclock_limit_s, row.halted_reason, row.pid, row.adapter
+    row.wallclock_limit_s, row.halted_reason, row.pid, row.adapter, row.failure_class
   );
   return row;
 }
@@ -184,15 +191,29 @@ export function nextRunSeq(db, taskId) {
   return row.m + 1;
 }
 
-/** Number of runs for a task, optionally restricted to a set of agents. */
-export function countRuns(db, taskId, agents = []) {
-  if (!agents.length) {
-    return db.prepare('SELECT COUNT(*) AS c FROM task_runs WHERE task_id = ?').get(taskId).c;
+/**
+ * Number of runs for a task, optionally restricted to a set of agents.
+ *
+ * `excludeFailureClass` (Phase 1a real-batch fix F1, docs/state-machine.md
+ * "Attempt counting"): a run whose `failure_class` matches one of these
+ * values is not counted - a provider refusing to answer (a retryable 429/5xx
+ * with no successful completion, `classifyFailureClass` in
+ * src/guards/postrun.mjs) is not an attempt by the agent, so it must not
+ * consume `builder_attempts_max`. Optional and additive: every existing
+ * caller that does not pass it keeps counting every run, unchanged.
+ */
+export function countRuns(db, taskId, agents = [], { excludeFailureClass = [] } = {}) {
+  const clauses = ['task_id = ?'];
+  const params = [taskId];
+  if (agents.length) {
+    clauses.push(`agent IN (${agents.map(() => '?').join(',')})`);
+    params.push(...agents);
   }
-  const placeholders = agents.map(() => '?').join(',');
-  return db
-    .prepare(`SELECT COUNT(*) AS c FROM task_runs WHERE task_id = ? AND agent IN (${placeholders})`)
-    .get(taskId, ...agents).c;
+  if (excludeFailureClass.length) {
+    clauses.push(`(failure_class IS NULL OR failure_class NOT IN (${excludeFailureClass.map(() => '?').join(',')}))`);
+    params.push(...excludeFailureClass);
+  }
+  return db.prepare(`SELECT COUNT(*) AS c FROM task_runs WHERE ${clauses.join(' AND ')}`).get(...params).c;
 }
 
 // ---------------------------------------------------------------------------
@@ -288,17 +309,23 @@ export function insertVerdict(db, fields) {
     challenge_seq: fields.challenge_seq ?? 0,
     tests_touched: nullish(fields.tests_touched),
     scope_exceeded: nullish(fields.scope_exceeded),
+    // Phase 1a real-batch fix F2: the original (pre-truncation) length of an
+    // over-cap `summary`, or null when it was not truncated - see
+    // src/review.mjs storeVerdict and docs/review-protocol.md "Verdict
+    // schema".
+    summary_truncated_from: nullish(fields.summary_truncated_from),
   };
   db.prepare(
     `INSERT INTO review_verdicts
        (id, task_id, run_id, created_at, reviewer, provider, model, blind, decision,
         findings_total, findings_real, findings_noise, findings_json, arm, challenge_seq,
-        tests_touched, scope_exceeded)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+        tests_touched, scope_exceeded, summary_truncated_from)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     row.id, row.task_id, row.run_id, row.created_at, row.reviewer, row.provider, row.model,
     row.blind, row.decision, row.findings_total, row.findings_real, row.findings_noise,
-    row.findings_json, row.arm, row.challenge_seq, row.tests_touched, row.scope_exceeded
+    row.findings_json, row.arm, row.challenge_seq, row.tests_touched, row.scope_exceeded,
+    row.summary_truncated_from
   );
   return row;
 }

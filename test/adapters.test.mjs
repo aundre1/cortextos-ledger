@@ -635,19 +635,20 @@ test('opencode parseStream: real fixture - synthesized session.end totals and un
   assert.equal(end.elapsed_ms, null);
 });
 
-test('opencode createStreamParser: a 410 Gone error line becomes a halt error event with statusCode and a capped message, exit code left untouched', () => {
+test('opencode createStreamParser: a 410 Gone error line becomes a halt error event with status_code and a capped message, exit code left untouched', () => {
   const parser = opencode.createStreamParser();
   const line = JSON.stringify({
     type: 'error',
     timestamp: 1788839200000,
     sessionID: 'ses_eol_model_test',
-    error: { name: 'APIError', data: { message: 'The model `nvidia/some-eol-model` has been retired and is no longer available.', statusCode: 410 } },
+    error: { name: 'APIError', data: { message: 'The model `nvidia/some-eol-model` has been retired and is no longer available.', statusCode: 410, isRetryable: false } },
   });
   const events = parser.push(line);
   const errorEvent = events.find((e) => e.type === 'error');
   assert.ok(errorEvent);
   assert.equal(errorEvent.severity, 'halt');
-  assert.equal(errorEvent.statusCode, 410);
+  assert.equal(errorEvent.status_code, 410);
+  assert.equal(errorEvent.retryable, false);
   assert.equal(errorEvent.name, 'APIError');
   assert.ok(errorEvent.message.includes('retired'));
   assert.equal('exit_code' in errorEvent, false, 'an error event never sets an exit code itself - the process exit code stays authoritative');
@@ -662,14 +663,76 @@ test('opencode createStreamParser: a 401 Unauthorized error line becomes a halt 
     type: 'error',
     timestamp: 1788839200000,
     sessionID: 'ses_unauthorized_test',
-    error: { name: 'APIError', data: { message: 'Unauthorized: invalid or missing API key for provider nvidia.', statusCode: 401 } },
+    error: { name: 'APIError', data: { message: 'Unauthorized: invalid or missing API key for provider nvidia.', statusCode: 401, isRetryable: false } },
   });
   const events = parser.push(line);
   const errorEvent = events.find((e) => e.type === 'error');
   assert.ok(errorEvent);
   assert.equal(errorEvent.severity, 'halt');
-  assert.equal(errorEvent.statusCode, 401);
+  assert.equal(errorEvent.status_code, 401);
+  assert.equal(errorEvent.retryable, false);
   assert.ok(errorEvent.message.includes('Unauthorized'));
+});
+
+// Phase 1a real-batch fix F1: the real evidence this fix is built from - 12
+// of 16 runs in the live batch failed on exactly this shape, a 429 "Too Many
+// Requests" from nvidia's API with isRetryable: true.
+test('opencode createStreamParser: a 429 Too Many Requests error line is retryable', () => {
+  const parser = opencode.createStreamParser();
+  const line = JSON.stringify({
+    type: 'error',
+    timestamp: 1788839200000,
+    sessionID: 'ses_429_test',
+    error: {
+      name: 'APIError',
+      data: {
+        message: 'Too Many Requests: {"status":429,"title":"Too Many Requests"}',
+        statusCode: 429,
+        isRetryable: true,
+        metadata: { url: 'https://integrate.api.nvidia.com/v1/chat/completions' },
+      },
+    },
+  });
+  const events = parser.push(line);
+  const errorEvent = events.find((e) => e.type === 'error');
+  assert.ok(errorEvent);
+  assert.equal(errorEvent.status_code, 429);
+  assert.equal(errorEvent.retryable, true);
+});
+
+test('claude createStreamParser: a top-level error line carrying a 429 status becomes a retryable halt error event', () => {
+  const parser = claude.createStreamParser();
+  const line = JSON.stringify({ type: 'error', error: { status_code: 429, message: 'rate limited' } });
+  const events = parser.push(line);
+  const errorEvent = events.find((e) => e.type === 'error');
+  assert.ok(errorEvent);
+  assert.equal(errorEvent.severity, 'halt');
+  assert.equal(errorEvent.status_code, 429);
+  assert.equal(errorEvent.retryable, true);
+  assert.ok(errorEvent.message.includes('rate limited'));
+});
+
+test('claude createStreamParser: an error line with no status, or a non-transient status, is not retryable', () => {
+  const parser = claude.createStreamParser();
+  assert.equal(parser.push(JSON.stringify({ type: 'error', error: { message: 'something broke' } }))[0].retryable, false);
+  assert.equal(parser.push(JSON.stringify({ type: 'error', error: { status_code: 400, message: 'bad request' } }))[0].retryable, false);
+});
+
+test('codex createStreamParser: a top-level error line carrying a 503 status becomes a retryable halt error event', () => {
+  const parser = codex.createStreamParser();
+  const line = JSON.stringify({ type: 'error', error: { statusCode: 503, message: 'service unavailable' } });
+  const events = parser.push(line);
+  const errorEvent = events.find((e) => e.type === 'error');
+  assert.ok(errorEvent);
+  assert.equal(errorEvent.severity, 'halt');
+  assert.equal(errorEvent.status_code, 503);
+  assert.equal(errorEvent.retryable, true);
+});
+
+test('codex createStreamParser: an error line with a non-transient status is not retryable', () => {
+  const parser = codex.createStreamParser();
+  const events = parser.push(JSON.stringify({ type: 'error', error: { statusCode: 404, message: 'not found' } }));
+  assert.equal(events[0].retryable, false);
 });
 
 test('opencode createStreamParser: unknown raw JSON type is ignored but counted in session.end.unparsed_lines', () => {

@@ -73,6 +73,7 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
     '004-v02-run-adapter',
     '005-v02-pr-capture',
     '006-v02-quota-reserve',
+    '007-v02-provider-and-verdict',
   ]);
 
   const applied = await migrate(db);
@@ -84,8 +85,9 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
     '004-v02-run-adapter',
     '005-v02-pr-capture',
     '006-v02-quota-reserve',
+    '007-v02-provider-and-verdict',
   ]);
-  assert.equal(schemaVersion(db), '006-v02-quota-reserve');
+  assert.equal(schemaVersion(db), '007-v02-provider-and-verdict');
   assert.deepEqual(pendingMigrations(db), []);
 
   const tableNames = db
@@ -135,10 +137,16 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
   // Running migrate again is a no-op: nothing pending, no error, same version.
   const secondApplied = await migrate(db);
   assert.deepEqual(secondApplied, []);
-  assert.equal(schemaVersion(db), '006-v02-quota-reserve');
+  assert.equal(schemaVersion(db), '007-v02-provider-and-verdict');
 
   const migrationRows = db.prepare('SELECT version FROM schema_migrations').all();
-  assert.equal(migrationRows.length, 7);
+  assert.equal(migrationRows.length, 8);
+
+  // task_runs.failure_class / review_verdicts.summary_truncated_from
+  // (Phase 1a real-batch fixes F1/F2).
+  assert.ok(runColumns.includes('failure_class'), 'task_runs should have column failure_class');
+  const verdictColumns = db.prepare('PRAGMA table_info(review_verdicts)').all().map((c) => c.name);
+  assert.ok(verdictColumns.includes('summary_truncated_from'), 'review_verdicts should have column summary_truncated_from');
 
   db.close();
 });
