@@ -11,7 +11,8 @@ Global flags: `--config <path>`, `--db <path>` (overrides config), `--json` (mac
 | `config:show` | Print resolved config with paths made absolute |
 | `quota:set --provider <p> [--model <m>] --window <kind> [--limit-requests <n>] [--limit-usd <x>]` | Upsert a quota window, overriding the config for that (provider, model, window) permanently -- see `docs/guards.md` "Provider quota ceilings: config vs. quota:set" |
 | `quota:tick --provider <p> [--model <m>] [--requests <n>] [--usd <x>]` | Manual usage increment |
-| `quota:show` | All windows (including any declared only in `config.providers.<name>.windows` and never set by hand) with headroom, reset time, and `origin` (`config` or `quota:set`) |
+| `quota:show` | All windows (including any declared only in `config.providers.<name>.windows` and never set by hand) with headroom, `reserved_usd` (in-flight spend from currently `running` runs, see `docs/guards.md` "Reserved spend and requests"), reset time, and `origin` (`config` or `quota:set`) |
+| `quota:clear --provider <p> [--model <m>] --window <kind>` | Delete that provider_quota window row (any source), print what was deleted -- see `docs/guards.md` "Removing a window from config" |
 
 ## Tasks
 

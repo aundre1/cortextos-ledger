@@ -82,7 +82,9 @@ Adds `requests INTEGER NOT NULL DEFAULT 0` so request based quotas can be comput
 | source | TEXT | `config`, `manual`, `ingest` |
 | updated_at | TEXT | |
 
-Windows roll: when `now` is past `window_started_at` plus the window length, usage resets to zero and `window_started_at` advances. `5h` windows are rolling from first use, matching OpenCode Go and Claude subscription behaviour; `day`, `week`, `month` are calendar UTC. Usage increments come from `cost_usage` rows at ingest and from `cortexctl quota:tick`.
+Windows roll: when `now` is past `window_started_at` plus the window length, usage resets to zero and `window_started_at` advances. `5h` windows are rolling from first use, matching OpenCode Go and Claude subscription behaviour; `day`, `week`, `month` are calendar UTC. Usage increments come from `cost_usage` rows at ingest, from `cortexctl quota:tick`, and from `run:start` itself, which reserves one request against the matching row(s) at admission (`docs/guards.md` "Reserved spend and requests") -- the run this reserved for is marked `task_runs.quota_reserved` so `ingest` does not also add a request for it from the run's real event count.
+
+A `UNIQUE` index on `(provider, model, window_kind)` enforces at most one row per key, treating a `NULL` model (provider-wide) as one value rather than SQLite's usual "every `NULL` is distinct" rule (an expression index over `COALESCE(model, '')`, portable to Postgres unchanged). `syncConfigQuota`'s find-or-insert uses `INSERT ... ON CONFLICT DO NOTHING` against this index inside one transaction, so concurrent callers racing a never-before-seen window cannot each insert their own copy. `quota:clear --provider <p> [--model <m>] --window <kind>` deletes a row outright regardless of `source`; `syncConfigQuota` re-creates it (fresh, zero usage) only if the config still declares that window.
 
 ### human_interventions (new)
 
