@@ -183,8 +183,32 @@ function failGate(err, db, taskId, gate) {
  * caller - and only then computes `seq` (MAX(seq)+1, not a COUNT that a
  * concurrent insert could make stale) and inserts the run, all before
  * releasing the lock. test/concurrency.test.mjs exercises this directly.
+ *
+ * `runStartOpts.checkCommandResolution` (default false): whether the
+ * preflight call below is told which adapter this run needs, so it can
+ * refuse (code 1, reason `command_not_found`) when that harness cannot be
+ * found anywhere on PATH (docs/adapters.md "Windows command resolution").
+ *
+ * `run:start` never spawns anything itself - it only records admission (a
+ * ledger row, a status transition) - so it must keep admitting a run even
+ * on a host where the harness binary is not installed at all (a pure
+ * ledger-admission test, or an orchestrator that provisions the harness
+ * later, should not be blocked by this). `run:launch` (the one command that
+ * actually spawns the harness right after admitting the run) passes
+ * `checkCommandResolution: true` so a missing harness is caught before the
+ * spawn ever happens; the standalone `preflight --adapter <x>` command
+ * checks it unconditionally, independent of either. See docs/guards.md
+ * "Command resolution" and docs/cli.md's `run:start`/`run:launch` rows.
+ *
+ * `ctx.platform`/`ctx.env` are test-only injection points (never set by the
+ * real CLI dispatcher in bin/cortexctl.mjs, so they are always `undefined`
+ * -> the real `process.platform`/`process.env` in production) forwarded
+ * straight through to `preflight`'s own same-named, same-purpose opts -
+ * see test/runs.test.mjs "command resolution: run:start admits, run:launch
+ * refuses".
  */
-async function doRunStart({ db, config, flags, err }) {
+async function doRunStart({ db, config, flags, err, platform, env }, runStartOpts = {}) {
+  const { checkCommandResolution = false } = runStartOpts;
   const need = missing(flags, ['task', 'agent']);
   if (need.length) {
     return { result: fail(err, 1, 'usage', `missing required flags: ${need.map((n) => '--' + n).join(', ')}`) };
@@ -247,7 +271,11 @@ async function doRunStart({ db, config, flags, err }) {
       allowDirty: !!flags['allow-dirty'],
       strict: !!flags.strict,
       taskId: task.id,
-      adapterName,
+      // Only launch (which actually spawns the harness) tells preflight
+      // which adapter this run needs - see doRunStart's doc comment above.
+      adapterName: checkCommandResolution ? adapterName : null,
+      platform,
+      env,
     });
     if (!pf.ok) {
       return { result: fail(err, pf.code, pf.reason, pf.detail ?? '') };
@@ -349,7 +377,7 @@ export function register(registry) {
         return fail(err, 1, 'usage', `missing required flags: ${need.map((n) => '--' + n).join(', ')}`);
       }
 
-      const started = await doRunStart(ctx);
+      const started = await doRunStart(ctx, { checkCommandResolution: true });
       if (started.result.code !== 0) return started.result;
       const { run, task, outDir, adapterName } = started;
 

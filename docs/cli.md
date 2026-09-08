@@ -31,9 +31,9 @@ Global flags: `--config <path>`, `--db <path>` (overrides config), `--json` (mac
 
 | Command | Effect |
 |---|---|
-| `preflight --worktree <p> --provider <p> [--model <m>] [--adapter <x>] [--public] [--allow-dirty] [--strict]` | Guards, exit 1/2/4 on refusal. `--adapter` (optional here; `run:start`/`run:launch` always pass their own resolved adapter through) additionally checks Windows command resolution -- see `docs/guards.md` "Command resolution" and `docs/adapters.md` "Windows command resolution" |
-| `run:start --task <id> --agent <a> [--adapter <x>] [--provider <p>] [--model <m>] [--public] [--no-preflight]` | Limit and quota gates, insert run, print run id |
-| `run:launch --task <id> --agent <a> --prompt-file <f> [--detach]` | `run:start` plus adapter spawn plus watchdog; the one command an orchestrator needs |
+| `preflight --worktree <p> --provider <p> [--model <m>] [--adapter <x>] [--public] [--allow-dirty] [--strict]` | Guards, exit 1/2/4 on refusal. `--adapter` additionally checks Windows command resolution for that adapter -- omit it and this check is skipped, same as `run:start` -- see `docs/guards.md` "Command resolution" and `docs/adapters.md` "Windows command resolution" |
+| `run:start --task <id> --agent <a> [--adapter <x>] [--provider <p>] [--model <m>] [--public] [--no-preflight]` | Limit and quota gates, insert run, print run id. Never spawns anything, so it never checks command resolution -- it still admits a run on a host where the resolved adapter's harness is not installed at all |
+| `run:launch --task <id> --agent <a> --prompt-file <f> [--detach]` | `run:start` plus adapter spawn plus watchdog; the one command an orchestrator needs. Unlike `run:start`, it always passes its resolved adapter to preflight's command resolution check (`docs/guards.md` "Command resolution") since it is about to spawn that adapter's harness -- exit 1 with reason `command_not_found` if that harness cannot be found anywhere on PATH |
 | `run:end --run <id> [--exit <code>] [--tokens-in <n>] [--tokens-out <n>] [--cost <x>] [--summary ...]` | Post run guards, files touched, status |
 | `watch --run <id>` | Watchdog process, started by `run:launch` |
 | `ingest --events <file> --task <id> --run <id>` | Replay normalized events into the ledger and quota |

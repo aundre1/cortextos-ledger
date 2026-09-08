@@ -294,8 +294,15 @@ function describeResolution(resolvedFrom) {
  * Each line names the resolved command's path and how it got there,
  * `warn`-level with `command_not_found` when nothing on PATH matched at all
  * - the same condition preflight refuses a run over (see preflight.mjs).
+ *
+ * `platform`/`env` (default: the real `process.platform`/`process.env`) are
+ * test-only injection points, same convention as preflight.mjs's own
+ * platform/env overrides - resolveCommand is a deliberate no-op on every
+ * non-win32 platform (docs/adapters.md rule 1), so the NOT FOUND/warn shape
+ * this function can otherwise only ever produce on a real Windows host
+ * lacking the harness (see test/doctor.test.mjs "doctor: NOT FOUND shape").
  */
-function diagnoseCommandResolution(config) {
+function diagnoseCommandResolution(config, { platform = process.platform, env = process.env } = {}) {
   const findings = [];
   const seen = new Set();
 
@@ -307,6 +314,8 @@ function diagnoseCommandResolution(config) {
     const resolution = resolveToolCommand(adapterName, {
       cmd: adapterConfig.cmd,
       toolOverride: config.tools?.[adapterName],
+      platform,
+      env,
     });
     findings.push({
       level: resolution.resolvedFrom === null ? 'warn' : 'info',
@@ -314,7 +323,7 @@ function diagnoseCommandResolution(config) {
     });
   }
 
-  const gh = resolveToolCommand('gh', { toolOverride: config.tools?.gh });
+  const gh = resolveToolCommand('gh', { toolOverride: config.tools?.gh, platform, env });
   findings.push({
     level: gh.resolvedFrom === null ? 'warn' : 'info',
     text: `command gh: ${describeResolution(gh.resolvedFrom)} (${gh.cmd})`,
@@ -353,7 +362,7 @@ function diagnoseOpencodeAuth(config, { authEnv, authHomedir, authReadFile, auth
 // doctor
 // ---------------------------------------------------------------------------
 
-export function doctor(db, config, { taskId, runId, all, now = new Date(), authEnv, authHomedir, authReadFile, authExistsSync } = {}) {
+export function doctor(db, config, { taskId, runId, all, now = new Date(), authEnv, authHomedir, authReadFile, authExistsSync, platform, env } = {}) {
   const findings = [];
   let probableCause = null;
   let resolveCommand = null;
@@ -369,7 +378,7 @@ export function doctor(db, config, { taskId, runId, all, now = new Date(), authE
     text: `schema version ${schemaVersion(db) ?? '(none applied)'}, pending migrations: ${pending.length}`,
   });
 
-  findings.push(...diagnoseCommandResolution(config));
+  findings.push(...diagnoseCommandResolution(config, { platform, env }));
   // authEnv/authHomedir/authReadFile/authExistsSync: test-only injection
   // points for the operator's real environment/homedir/filesystem (same
   // convention as preflight.mjs's platform/env overrides) - real callers

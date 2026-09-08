@@ -48,9 +48,43 @@ test('doctor: always reports gh command resolution, and one line per distinct re
   const commandLines = result.findings.filter((f) => f.text.startsWith('command '));
   const names = commandLines.map((f) => f.text.split(':')[0]);
   assert.deepEqual(new Set(names), new Set(['command opencode', 'command codex', 'command gh']));
-  // Every real adapter resolves trivially on this (non-win32) test host -
-  // resolveCommand's rule 1 is a pure no-op there - so every line is 'info'.
-  assert.ok(commandLines.every((f) => f.level === 'info'), JSON.stringify(commandLines));
+  // Each line is either a real resolution (level info, "<name>: <resolvedFrom>
+  // (<path>)") or NOT FOUND (level warn, "<name>: NOT FOUND (<cmd>)") - which
+  // one depends on whether that harness is actually installed on *this* host,
+  // so (unlike the old, host-dependent assertion here) this never hardcodes
+  // 'info': a CI runner missing opencode/codex (e.g. windows-latest with
+  // neither installed) legitimately reports NOT FOUND/warn for them, and
+  // that is correct doctor behavior, not a bug. See the NOT FOUND-shape test
+  // below for the platform-injected case that pins down the warn shape
+  // itself, deterministically, independent of what's installed on any host.
+  for (const f of commandLines) {
+    const isNotFound = / NOT FOUND \(/.test(f.text);
+    assert.equal(f.level, isNotFound ? 'warn' : 'info', JSON.stringify(f));
+    if (!isNotFound) assert.match(f.text, /^command \S+: \S.* \(\S+\)$/, JSON.stringify(f));
+  }
+});
+
+test('doctor: NOT FOUND shape - command resolution warns with "NOT FOUND (<cmd>)" when injected win32 + empty PATH cannot resolve any harness', async () => {
+  const { db, config: base } = await migrated();
+  const config = {
+    ...base,
+    agents: {
+      builder: { adapter: 'opencode', model: 'x' },
+      reviewer_b: { adapter: 'codex', model: 'y' },
+    },
+  };
+  // Deterministic, host-independent: resolveCommand is a no-op passthrough
+  // on every non-win32 platform (docs/adapters.md rule 1), so NOT FOUND can
+  // only be produced by actually injecting platform: 'win32' together with
+  // a PATH empty of every harness - never by relying on what happens to be
+  // installed on whatever host runs this suite.
+  const result = doctor(db, config, { platform: 'win32', env: { PATH: '' } });
+  const commandLines = result.findings.filter((f) => f.text.startsWith('command '));
+  assert.equal(commandLines.length, 3); // opencode, codex, gh
+  for (const f of commandLines) {
+    assert.equal(f.level, 'warn', JSON.stringify(f));
+    assert.match(f.text, /^command \S+: NOT FOUND \(\S+\)$/, JSON.stringify(f));
+  }
 });
 
 // D1: "cortexctl doctor shows whether auth.json was found" (this task's own

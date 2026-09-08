@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { runCli, makeTempGitRepo, makeTempDir } from './helpers.mjs';
 import { openDb } from '../src/db.mjs';
 import { insertTask, insertRun, insertCost } from '../src/ledger.mjs';
+import { loadConfig } from '../src/config.mjs';
+import { register as registerRuns } from '../src/commands/runs.mjs';
 
 function makeConfig(dir, limitsOverride = {}, extra = {}) {
   const configPath = join(dir, 'cortex-ledger.json');
@@ -342,6 +344,82 @@ test('run:end: builder exit 0 without a non-empty patch.diff fails with halted_r
 
   const view = taskShow(ctx, taskId);
   assert.equal(view.runs[0].halted_reason, 'no_patch');
+});
+
+// ---------------------------------------------------------------------------
+// command resolution: run:start admits, run:launch refuses (docs/guards.md
+// "Command resolution", docs/cli.md's run:start/run:launch rows)
+// ---------------------------------------------------------------------------
+
+// A real subprocess (what `cli()`/`runCli()` spawns) cannot fake
+// process.platform from the outside, so this simulates a CI-shaped Windows
+// runner (win32, empty PATH, no harness installed anywhere) by calling the
+// exported `register()`'s resulting run:start/run:launch handlers directly,
+// in-process, with a hand-built ctx carrying `platform`/`env` - the same
+// test-only injection point preflight.mjs and doctor.mjs already accept,
+// and one bin/cortexctl.mjs's real ctx object literal never sets (so real
+// dispatch always falls through to the real process.platform/process.env).
+function buildRunsRegistry() {
+  const commands = new Map();
+  const registry = {
+    add(name, entry) {
+      commands.set(name, entry);
+    },
+    get(name) {
+      return commands.get(name);
+    },
+  };
+  registerRuns(registry);
+  return registry;
+}
+
+test('command resolution: run:start admits under an injected win32 + empty PATH, but run:launch (which spawns) refuses with command_not_found', async () => {
+  const ctx = setup();
+  assert.equal(cli(['init'], ctx).code, 0);
+  const taskId = newTask(ctx);
+
+  const config = loadConfig({ configPath: ctx.configPath });
+  const db = openDb(config.db);
+  const registry = buildRunsRegistry();
+  const win32 = { platform: 'win32', env: { PATH: '' } };
+
+  // run:start never spawns anything - only admits - so it must not care
+  // that this simulated host cannot find `claude` anywhere on PATH.
+  const startErrLines = [];
+  const startResult = await registry.get('run:start').handler({
+    db, config,
+    flags: { task: taskId, agent: 'builder', adapter: 'claude', provider: 'fake', model: 'm' },
+    args: [], out: () => {}, err: (l) => startErrLines.push(l),
+    ...win32,
+  });
+  assert.equal(startResult.code, 0, JSON.stringify({ startResult, startErrLines }));
+  assert.match(startResult.stdout, /^r_/);
+
+  // A fresh task for run:launch: the first task is now 'working' from the
+  // run:start above, and reusing it here would fail for an unrelated
+  // reason (a second concurrent run on the same task), muddying this
+  // test's one actual point - that *launch*, not admission, is what checks
+  // command resolution.
+  const taskId2 = newTask(ctx);
+  const promptPath = join(ctx.homeDir, 'ci-shape-prompt.txt');
+  writeFileSync(promptPath, 'do the thing');
+  const launchErrLines = [];
+  const launchResult = await registry.get('run:launch').handler({
+    db, config,
+    flags: {
+      task: taskId2, agent: 'builder', adapter: 'claude', provider: 'fake', model: 'm',
+      'prompt-file': promptPath,
+    },
+    args: [], out: () => {}, err: (l) => launchErrLines.push(l),
+    ...win32,
+  });
+  assert.equal(launchResult.code, 1, JSON.stringify({ launchResult, launchErrLines }));
+  assert.ok(
+    launchErrLines.some((l) => l.includes('command_not_found')),
+    JSON.stringify(launchErrLines)
+  );
+
+  db.close();
 });
 
 // ---------------------------------------------------------------------------

@@ -13,9 +13,23 @@ Each guard maps to a failure that happened to someone in the community this kit 
 | Provider quota | A shakedown died on a 20 request per day quota after one call | Roll windows, check headroom for one request and the projected cost, then reserve it: `run:start` increments `used_requests` for the admitted run in the same atomic check, so the ceiling is enforced under concurrency, not merely read. Exit 4 with escalation `quota`. A window declared in `config.providers.<name>.windows` (`docs/architecture.md`) is enforced even if `quota:set` was never run: the config value is the ceiling until an operator overrides it, and the override then wins for good (see "Provider quota ceilings: config vs. `quota:set`" below) |
 | Public only provider | Private repository content sent to a provider restricted to public material | If the provider config has `public_only: true` and `--public` is absent, exit 4 with reason `public_only` |
 | Node version | `node:sqlite` missing | Exit 1 with a plain message naming 22.5 |
-| Command resolution | `run:launch` spawning a harness npm installed as a Windows `.cmd` shim that Node's `shell: false` spawn cannot exec, failing ENOENT/EINVAL with no useful message | When the caller names the adapter the run needs (`run:start`/`run:launch` always do; the standalone `preflight` command only with `--adapter`), resolve it (`docs/adapters.md` "Windows command resolution"). If nothing on PATH matches at all (`resolvedFrom === null`), exit 1 with reason `command_not_found` naming the tool and how many PATH entries were searched, before any git/filesystem work runs. `fake` is never checked (it spawns a fixed in-repo script). No escalation row is written -- like `node_version` above, this is a missing-prerequisite failure, not one of `docs/ledger.md`'s enumerated escalation reasons |
+| Command resolution | `run:launch` spawning a harness npm installed as a Windows `.cmd` shim that Node's `shell: false` spawn cannot exec, failing ENOENT/EINVAL with no useful message | Only checked when the caller names the adapter the run needs (`docs/adapters.md` "Windows command resolution"). If nothing on PATH matches at all (`resolvedFrom === null`), exit 1 with reason `command_not_found` naming the tool and how many PATH entries were searched, before any git/filesystem work runs. `fake` is never checked (it spawns a fixed in-repo script). No escalation row is written -- like `node_version` above, this is a missing-prerequisite failure, not one of `docs/ledger.md`'s enumerated escalation reasons |
 
 Preflight is invoked automatically by `run:start` unless `--no-preflight` is passed, and the skip is recorded in the run's `halted_reason` column as `preflight_skipped` so it is never silent.
+
+**`run:start` vs. `run:launch`: who checks command resolution.** `run:start`
+only records admission (a ledger row, a status transition to `working`) --
+it never spawns anything -- so it never names an adapter to preflight and
+therefore never fails with `command_not_found`, even on a host where no
+harness is installed at all (a pure ledger-admission run, or an
+orchestrator that will provision the harness later, is not blocked by
+this). `run:launch` shares `run:start`'s admission logic but is the one
+command that actually spawns the harness right afterwards, so it always
+passes preflight the adapter it resolved, and refuses with exit 1 /
+`command_not_found` before ever admitting the run if that harness cannot be
+found. The standalone `cortexctl preflight` command checks command
+resolution only when given `--adapter <name>` explicitly; without it, this
+check is skipped the same way `run:start` skips it.
 
 ### Provider quota ceilings: config vs. `quota:set`
 
