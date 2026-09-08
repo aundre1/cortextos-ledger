@@ -350,6 +350,27 @@ test('classifyFailureClass: a stream ending in a terminal retryable error with n
   assert.equal(result.statusCode, 429);
 });
 
+// Real production capture, byte-shaped from a live Phase 1a run on Windows
+// against OpenCode 1.18.27 on a rate limited NVIDIA lane. The error is never
+// the last line: the runner appends a session.end when the harness exits and
+// a second corrected one carrying the real exit code. The original classifier
+// required the error to be literally last, so every 429 in the live batch was
+// misclassified as an ordinary agent failure and --retry never fired, while
+// the fixture test above passed because its fixture ended on the error.
+test('classifyFailureClass: the real production shape - trailing session.end events do not stop the classification', () => {
+  const path = writeEventsFile([
+    { type: 'credentials.forwarded', severity: 'info', providers: ['nvidia'] },
+    { type: 'prompt.delivery', severity: 'info', delivery: 'stdin', length: 9603 },
+    { type: 'session.start', session_id: 'ses_x' },
+    { type: 'error', severity: 'halt', name: 'APIError', status_code: 429, retryable: true, message: 'Too Many Requests' },
+    { type: 'session.end', session_id: 'ses_x', exit_code: null, elapsed_ms: null },
+    { type: 'session.end', session_id: 'ses_x', exit_code: 1, elapsed_ms: 76100 },
+  ]);
+  const result = classifyFailureClass(path);
+  assert.equal(result.failureClass, 'provider_unavailable');
+  assert.equal(result.statusCode, 429);
+});
+
 test('classifyFailureClass: a retryable error is not terminal (something else followed it) does not classify', () => {
   const path = writeEventsFile([
     { type: 'error', severity: 'halt', status_code: 429, retryable: true, message: 'Too Many Requests' },

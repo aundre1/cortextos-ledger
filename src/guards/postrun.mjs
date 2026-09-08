@@ -191,7 +191,19 @@ export function classifyFailureClass(eventsPath) {
   );
   if (hadSuccessfulCompletion) return { failureClass: null };
 
-  const last = events[events.length - 1];
+  // "Terminal" means the last SUBSTANTIVE event is that retryable error.
+  // Trailing `session.end` events are bookkeeping, not work: the runner
+  // always appends one when the harness process exits, and appends a second
+  // corrected one carrying the real exit code and elapsed time. So the error
+  // is never literally the last line in a real run - it is followed by one
+  // or two session.end events every time. Requiring it to be last made this
+  // classifier dead on arrival in production (every 429 in the live Phase 1a
+  // batch was misclassified as an ordinary agent failure, so --retry never
+  // fired) while its fixture-based test passed, because the fixture ended on
+  // the error and no real capture did.
+  let i = events.length - 1;
+  while (i >= 0 && events[i] && events[i].type === 'session.end') i -= 1;
+  const last = i >= 0 ? events[i] : null;
   if (last && last.type === 'error' && last.retryable === true) {
     return { failureClass: 'provider_unavailable', statusCode: last.status_code ?? null, message: last.message ?? null };
   }
