@@ -60,7 +60,9 @@ test('doctor: always reports gh command resolution, and one line per distinct re
   for (const f of commandLines) {
     const isNotFound = / NOT FOUND \(/.test(f.text);
     assert.equal(f.level, isNotFound ? 'warn' : 'info', JSON.stringify(f));
-    if (!isNotFound) assert.match(f.text, /^command \S+: \S.* \(\S+\)$/, JSON.stringify(f));
+    // The resolved path may contain spaces (C:\Program Files\...), so the
+    // parenthesised tail is "anything non-empty", not \S+.
+    if (!isNotFound) assert.match(f.text, /^command \S+: \S.* \(.+\)$/, JSON.stringify(f));
   }
 });
 
