@@ -15,7 +15,18 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, copyFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  closeSync,
+  copyFileSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -93,6 +104,63 @@ function taskCount(dbPath) {
   }
 }
 
+/**
+ * Every entry directly under `<workDir>/.cortex/runs/` other than `.tmp`
+ * itself (review round 2, F4 tests): a fresh task directory shows up here,
+ * a cleaned-up failed capture must not. Returns [] if the runs root does
+ * not exist at all yet.
+ */
+function taskDirsUnderRuns(workDir) {
+  const runsRoot = join(workDir, '.cortex', 'runs');
+  if (!existsSync(runsRoot)) return [];
+  return readdirSync(runsRoot).filter((name) => name !== '.tmp');
+}
+
+/** Entries left behind in `<workDir>/.cortex/runs/.tmp/`, or [] if that directory does not exist (never created, or nothing ever landed in it). */
+function leftoverTmpFiles(workDir) {
+  const tmpDir = join(workDir, '.cortex', 'runs', '.tmp');
+  if (!existsSync(tmpDir)) return [];
+  return readdirSync(tmpDir);
+}
+
+// A syntactically valid AWS access key id (matches src/guards/secrets-scan.mjs's
+// aws_access_key pattern AKIA[0-9A-Z]{16} exactly) planted inside a large
+// generated diff fixture, never committed as a file (review round 2, F6).
+const AKIA_KEY = `AKIA${'ABCDEFGHIJKLMNOP'}`;
+
+/**
+ * Writes a synthetic diff of at least `targetBytes` to `path` via a chunked
+ * synchronous write loop (never building the whole thing as one in-memory
+ * string) with `secretLine` planted roughly halfway through - large enough
+ * to exercise the 2,000,000 byte size guard and, for the 70 MB variant, the
+ * spawnSync ENOBUFS repro this task fixes (F6), without ever committing a
+ * multi-megabyte fixture file to the repo.
+ */
+function writeLargeDiffFixture(path, targetBytes, secretLine) {
+  const fd = openSync(path, 'w');
+  try {
+    const line = 'diff line filler padding padding padding padding padding\n';
+    const lineBytes = Buffer.byteLength(line, 'utf8');
+    const half = Math.floor(targetBytes / 2);
+    let written = 0;
+    while (written < half) {
+      writeSync(fd, line);
+      written += lineBytes;
+    }
+    if (secretLine) {
+      const secretText = `${secretLine}\n`;
+      writeSync(fd, secretText);
+      written += Buffer.byteLength(secretText, 'utf8');
+    }
+    while (written < targetBytes) {
+      writeSync(fd, line);
+      written += lineBytes;
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
+
 const newTaskArgs = (extra = []) => [
   'task:new',
   '--repo', 'o/n', '--title', 'PR review task', '--class', 'pr-triage', '--arm', 'control',
@@ -152,10 +220,15 @@ if (IS_WIN32) {
     assert.ok(prArtifact, 'expected a pr_review artifact row');
     assert.equal(prArtifact.path, diffPath);
     assert.equal(prArtifact.bytes, Buffer.byteLength(diffText, 'utf8'));
+    assert.match(prArtifact.sha256, /^[0-9a-f]{64}$/, 'sha256 should be computed even though it was precomputed off the temp file, not the final path');
+
+    // Review round 2, F4: on the happy path the temp file was renamed into
+    // place, not left behind alongside it.
+    assert.deepEqual(leftoverTmpFiles(workDir), []);
   });
 
   test('task:new --kind pr_review: gh exits non-zero, task is not created, exit code matches the reason', () => {
-    const { dbPath, cli } = makeHarness();
+    const { workDir, dbPath, cli } = makeHarness();
     assert.equal(cli(['init']).code, 0);
 
     const before = taskCount(dbPath);
@@ -168,6 +241,8 @@ if (IS_WIN32) {
     assert.match(result.stderr, /cortexctl: gh_failed:/);
     assert.match(result.stderr, /pull request not found/);
     assert.equal(taskCount(dbPath), before, 'no task row should have been inserted');
+    assert.deepEqual(taskDirsUnderRuns(workDir), [], 'no task directory should exist');
+    assert.deepEqual(leftoverTmpFiles(workDir), [], 'no temp file should be left behind');
   });
 
   test('task:new --kind pr_review: gh binary missing fails cleanly instead of hanging or crashing', () => {
@@ -187,6 +262,49 @@ if (IS_WIN32) {
     assert.notEqual(result.code, 0);
     assert.match(result.stderr, /cortexctl: gh_missing:/);
     assert.equal(taskCount(dbPath), before, 'no task row should have been inserted');
+    assert.deepEqual(taskDirsUnderRuns(workDir), [], 'no task directory should exist');
+    assert.deepEqual(leftoverTmpFiles(workDir), [], 'no temp file should be left behind');
+  });
+
+  test('task:new --kind pr_review: F4 repro - a bad --parent (FOREIGN KEY failure inside the transaction) leaves no task directory and no temp file behind', () => {
+    // This is the blind adversarial reviewer's exact repro: --parent names a
+    // task id that does not exist, so insertTask's FOREIGN KEY REFERENCES
+    // tasks(id) fails partway through the withImmediateTransaction block -
+    // after the diff has already been captured and redacted to a temp file,
+    // but (per the F4 fix) before anything is ever created under
+    // `<runs>/<taskId>/`.
+    const { workDir, dbPath, cli } = makeHarness();
+    assert.equal(cli(['init']).code, 0);
+    const before = taskCount(dbPath);
+
+    const result = cli(newTaskArgs(['--parent', 't_doesnotexist0000000000']), {
+      GH_STUB_TITLE: 'Fix the widget',
+      GH_STUB_BODY: 'This fixes the widget that was broken.',
+      GH_STUB_DIFF: 'diff --git a/feature.mjs b/feature.mjs\n+console.log("hi");\n',
+    });
+    assert.equal(result.code, 1, result.stderr);
+    assert.match(result.stderr, /FOREIGN KEY constraint failed/);
+    assert.equal(taskCount(dbPath), before, 'no task row should have been inserted');
+    assert.deepEqual(taskDirsUnderRuns(workDir), [], 'no task directory should have been created');
+    assert.deepEqual(leftoverTmpFiles(workDir), [], 'the temp diff file must be cleaned up on a failed transaction');
+  });
+
+  test('task:new --kind pr_review: gh pr view JSON missing baseRefOid/headRefOid stores null instead of crashing', () => {
+    const { dbPath, cli } = makeHarness();
+    assert.equal(cli(['init']).code, 0);
+
+    const result = cli(newTaskArgs(), { GH_STUB_OMIT_SHAS: '1' });
+    assert.equal(result.code, 0, result.stderr);
+    const taskId = result.stdout.trim();
+
+    const shown = cli(['task:show', taskId, '--json']);
+    assert.equal(shown.code, 0, shown.stderr);
+    const view = JSON.parse(shown.stdout);
+    assert.equal(view.task.base_sha, null);
+    assert.equal(view.task.head_sha, null);
+    // base_commit falls back to the (also missing) baseRefOid, so it too is
+    // null rather than the string "undefined" or a thrown TypeError.
+    assert.equal(view.task.base_commit, null);
   });
 
   test('task:new --kind pr_review: a secret-looking token in the PR body is redacted at rest', () => {
@@ -204,6 +322,34 @@ if (IS_WIN32) {
     assert.equal(briefs.length, 1);
     assert.ok(!briefs[0].body.includes(GHP_TOKEN), 'the raw token must never be stored');
     assert.match(briefs[0].body, /\[REDACTED\]/);
+  });
+
+  test('task:new --kind pr_review: F5 repro - a PR body with an embedded NUL byte is not silently truncated', () => {
+    // node:sqlite's TEXT bind truncates a JS string at its first embedded
+    // NUL byte with no error (db.prepare(...).run('abc\0def') reads back as
+    // 'abc') - see test/ledger.test.mjs for the underlying repro in
+    // isolation. GH_STUB_BODY can't carry a raw NUL byte itself (an OS
+    // environment variable is a NUL-terminated C string), so the marker
+    // "<<NUL>>" stands in for it and the stub swaps it for a real NUL - see
+    // test/fixtures/gh-stub.mjs.
+    const { dbPath, cli } = makeHarness();
+    assert.equal(cli(['init']).code, 0);
+
+    const result = cli(newTaskArgs(), {
+      GH_STUB_TITLE: 'NUL byte repro',
+      GH_STUB_BODY: 'textbefore<<NUL>>textafter',
+      GH_STUB_BODY_NUL_MARKER: '<<NUL>>',
+    });
+    assert.equal(result.code, 0, result.stderr);
+    const taskId = result.stdout.trim();
+
+    const briefs = briefMessagesFor(dbPath, taskId);
+    assert.equal(briefs.length, 1);
+    // Both sides of where the NUL was must survive - a truncating bind
+    // would keep only 'textbefore' and silently drop 'textafter' entirely.
+    assert.match(briefs[0].body, /textbefore/);
+    assert.match(briefs[0].body, /textafter/);
+    assert.ok(!briefs[0].body.includes('\0'), 'the NUL byte itself should be stripped, not stored');
   });
 
   test('task:new --kind pr_review: a diff over the 2,000,000 byte guard is still written in full, with a note and a warning', () => {
@@ -230,4 +376,82 @@ if (IS_WIN32) {
     const view = JSON.parse(shown.stdout);
     assert.match(view.task.notes ?? '', /pr_diff_oversized:\d+/);
   });
+
+  test('task:new --kind pr_review: a 5 MB diff with a planted AWS key is captured in full and the key is redacted (fast, always on)', () => {
+    const { workDir, dbPath, cli } = makeHarness();
+    assert.equal(cli(['init']).code, 0);
+
+    const diffPath5mb = join(workDir, 'five-mb.diff');
+    const targetBytes = 5 * 1024 * 1024;
+    writeLargeDiffFixture(diffPath5mb, targetBytes, `+  const key = "${AKIA_KEY}"; // pretend leaked credential`);
+    assert.ok(statSync(diffPath5mb).size >= targetBytes);
+
+    const result = cli(newTaskArgs(), { GH_STUB_DIFF_FILE: diffPath5mb });
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stderr, /warning:.*over the 2000000 byte guard/);
+    const taskId = result.stdout.trim();
+
+    const finalDiffPath = join(workDir, '.cortex', 'runs', taskId, 'pr.diff');
+    const written = readFileSync(finalDiffPath, 'utf8');
+    assert.ok(!written.includes(AKIA_KEY), 'the AWS key must be redacted, not passed through because the diff is large');
+    assert.match(written, /\[REDACTED\]/);
+    // Only the one secret line's length changed - still essentially the
+    // full 5 MB, never truncated.
+    assert.ok(Buffer.byteLength(written, 'utf8') > targetBytes - 1000);
+
+    const shown = cli(['task:show', taskId, '--json']);
+    const view = JSON.parse(shown.stdout);
+    assert.match(view.task.notes ?? '', /pr_diff_oversized:\d+/);
+    assert.deepEqual(leftoverTmpFiles(workDir), []);
+  });
+
+  // F6 repro at the reported scale: a 70 MB diff piped through the old
+  // buffered spawnSync call (maxBuffer: 64 MiB) failed with ENOBUFS before
+  // the 2,000,000 byte size guard ever got a chance to apply - see this
+  // task's F4/F6 write-up. Generating and redact-scanning 70 MB is I/O
+  // bound, not CPU bound, and measured well under the "seconds, not
+  // minutes" target locally; CORTEX_TEST_SKIP_LARGE_DIFF=1 is the escape
+  // hatch this task asked for in case a slower CI runner needs it.
+  const skip70mb = process.env.CORTEX_TEST_SKIP_LARGE_DIFF === '1';
+  test(
+    'task:new --kind pr_review: F6 repro - a 70 MB diff no longer hits spawnSync ENOBUFS; exits 0, written in full, planted key redacted',
+    { skip: skip70mb && 'set CORTEX_TEST_SKIP_LARGE_DIFF=1 to skip this on a slow CI runner' },
+    () => {
+      const { workDir, dbPath, cli } = makeHarness();
+      assert.equal(cli(['init']).code, 0);
+
+      const diffPath70mb = join(workDir, 'seventy-mb.diff');
+      const targetBytes = 70 * 1024 * 1024;
+      writeLargeDiffFixture(diffPath70mb, targetBytes, `+  const key = "${AKIA_KEY}"; // pretend leaked credential`);
+      const rawBytes = statSync(diffPath70mb).size;
+      assert.ok(rawBytes >= targetBytes, 'fixture must actually reach 70 MB to exercise the repro');
+
+      const result = cli(newTaskArgs(), { GH_STUB_DIFF_FILE: diffPath70mb });
+      assert.equal(result.code, 0, result.stderr);
+      assert.doesNotMatch(result.stderr, /ENOBUFS/);
+      assert.match(result.stderr, /warning:.*over the 2000000 byte guard/);
+      const taskId = result.stdout.trim();
+
+      const finalDiffPath = join(workDir, '.cortex', 'runs', taskId, 'pr.diff');
+      const finalBytes = statSync(finalDiffPath).size;
+      // Redaction can only shrink or hold the byte count (the AKIA key,
+      // once matched, is replaced by the shorter literal '[REDACTED]'), so
+      // this allows for that one substitution while still confirming the
+      // diff was captured essentially in full, not truncated or dropped.
+      assert.ok(finalBytes > rawBytes - 1000, `expected ~${rawBytes} bytes, got ${finalBytes}`);
+
+      const shown = cli(['task:show', taskId, '--json']);
+      const view = JSON.parse(shown.stdout);
+      assert.match(view.task.notes ?? '', /pr_diff_oversized:\d+/);
+
+      // Reading the whole 70 MB result back into memory here is fine - the
+      // "no whole-file readFileSync" constraint (F6) is on task:new's own
+      // production code path, not on this test's own verification step.
+      const finalText = readFileSync(finalDiffPath, 'utf8');
+      assert.ok(!finalText.includes(AKIA_KEY), 'the planted AWS key must be redacted in the final file');
+      assert.match(finalText, /\[REDACTED\]/);
+
+      assert.deepEqual(leftoverTmpFiles(workDir), []);
+    }
+  );
 }

@@ -16,6 +16,27 @@ import { findQuotaRow } from './quota.mjs';
 
 const nullish = (v) => (v === undefined ? null : v);
 
+/**
+ * Review round 2, F5: node:sqlite's TEXT bind silently truncates a JS string
+ * at its first embedded NUL byte (`\0`) with no error and no warning -
+ * `db.prepare('insert into t values (?)').run('abc\0def')` reads back as
+ * `'abc'`, because SQLite's C API binds through a NUL-terminated C string,
+ * not the string's declared length. A NUL is invisible in a PR title/body,
+ * an escalation detail, a reviewer's finding text, or any other free text
+ * this kit stores verbatim from outside its own control (gh, a human
+ * operator, an agent's own output) that was never guaranteed to be
+ * C-string-safe, so every such insert strips embedded NULs before the value
+ * ever reaches a bind parameter rather than silently lose a whole tail of
+ * legitimate text with no trace. Deliberately NOT folded into `redact()`
+ * (src/adapters/credential-boundary.mjs) - that function's one job is
+ * finding secrets, this one's is text hygiene, and the two stay
+ * independently testable.
+ */
+export function sanitizeText(value) {
+  if (typeof value !== 'string' || value.indexOf('\0') === -1) return value;
+  return value.split('\0').join('');
+}
+
 // ---------------------------------------------------------------------------
 // tasks
 // ---------------------------------------------------------------------------
@@ -40,7 +61,7 @@ export function insertTask(db, fields) {
     base_sha: nullish(fields.base_sha),
     head_sha: nullish(fields.head_sha),
     kind: fields.kind ?? 'implement',
-    title: fields.title,
+    title: sanitizeText(fields.title),
     task_class: fields.task_class,
     arm: fields.arm,
     owner: nullish(fields.owner),
@@ -57,7 +78,7 @@ export function insertTask(db, fields) {
     human_edits: fields.human_edits ?? 0,
     defects_escaped: fields.defects_escaped ?? 0,
     closed_at: nullish(fields.closed_at),
-    notes: nullish(fields.notes),
+    notes: sanitizeText(nullish(fields.notes)),
   };
   db.prepare(
     `INSERT INTO tasks
@@ -119,7 +140,7 @@ export function insertRun(db, fields) {
     cost_usd: fields.cost_usd ?? 0,
     tool_calls: fields.tool_calls ?? 0,
     session_id: nullish(fields.session_id),
-    summary: nullish(fields.summary),
+    summary: sanitizeText(nullish(fields.summary)),
     worktree: nullish(fields.worktree),
     out_dir: nullish(fields.out_dir),
     exit_code: nullish(fields.exit_code),
@@ -187,7 +208,7 @@ export function insertMessage(db, fields) {
     sender: fields.sender,
     recipient: fields.recipient,
     kind: fields.kind,
-    body: fields.body ?? '',
+    body: sanitizeText(fields.body ?? ''),
   };
   db.prepare(
     `INSERT INTO agent_messages (id, task_id, run_id, created_at, sender, recipient, kind, body)
@@ -200,11 +221,22 @@ export function insertMessage(db, fields) {
 // artifacts
 // ---------------------------------------------------------------------------
 
-/** Insert an artifact; sha256 and bytes are computed when path exists on disk. */
+/**
+ * Insert an artifact. sha256 and bytes are computed by reading `fields.path`
+ * off disk when it exists there at insert time - the common case, every
+ * caller but one. task:new's PR capture (F4 fix, src/commands/tasks.mjs)
+ * writes the diff to a temp path, inserts this row inside a transaction
+ * still naming the *final* (not-yet-existing) path so a failed transaction
+ * leaves no half-written run directory behind, and only renames the temp
+ * file into that final path after commit - so it passes `fields.sha256`/
+ * `fields.bytes` already computed from the temp file, and those explicit
+ * values are used verbatim instead of trying (and failing) to stat a path
+ * that does not exist yet.
+ */
 export function insertArtifact(db, fields) {
-  let sha256 = null;
-  let bytes = null;
-  if (fields.path && existsSync(fields.path)) {
+  let sha256 = fields.sha256 !== undefined ? fields.sha256 : null;
+  let bytes = fields.bytes !== undefined ? fields.bytes : null;
+  if (fields.sha256 === undefined && fields.bytes === undefined && fields.path && existsSync(fields.path)) {
     const buf = readFileSync(fields.path);
     sha256 = createHash('sha256').update(buf).digest('hex');
     bytes = statSync(fields.path).size;
@@ -215,7 +247,7 @@ export function insertArtifact(db, fields) {
     run_id: nullish(fields.run_id),
     created_at: nowIso(),
     kind: fields.kind,
-    path: nullish(fields.path),
+    path: sanitizeText(nullish(fields.path)),
     sha256,
     bytes,
   };
@@ -251,7 +283,7 @@ export function insertVerdict(db, fields) {
     findings_total: fields.findings_total ?? 0,
     findings_real: nullish(fields.findings_real),
     findings_noise: nullish(fields.findings_noise),
-    findings_json: nullish(fields.findings_json),
+    findings_json: sanitizeText(nullish(fields.findings_json)),
     arm: nullish(arm),
     challenge_seq: fields.challenge_seq ?? 0,
     tests_touched: nullish(fields.tests_touched),
@@ -371,7 +403,7 @@ export function insertEscalation(db, fields) {
     task_id: fields.task_id,
     created_at: nowIso(),
     reason: fields.reason,
-    detail: nullish(fields.detail),
+    detail: sanitizeText(nullish(fields.detail)),
     resolved_at: nullish(fields.resolved_at),
     resolution: nullish(fields.resolution),
     run_id: nullish(fields.run_id),
@@ -404,7 +436,7 @@ export function insertIntervention(db, fields) {
     created_at: nowIso(),
     kind: fields.kind,
     minutes: nullish(fields.minutes),
-    detail: nullish(fields.detail),
+    detail: sanitizeText(nullish(fields.detail)),
   };
   db.prepare(
     `INSERT INTO human_interventions (id, task_id, run_id, created_at, kind, minutes, detail)
@@ -542,9 +574,9 @@ export function insertProposal(db, fields) {
     business_id: fields.business_id,
     goal_metric: nullish(fields.goal_metric),
     kind: fields.kind,
-    title: fields.title,
-    rationale: nullish(fields.rationale),
-    expected_impact: nullish(fields.expected_impact),
+    title: sanitizeText(fields.title),
+    rationale: sanitizeText(nullish(fields.rationale)),
+    expected_impact: sanitizeText(nullish(fields.expected_impact)),
     estimated_usd: nullish(fields.estimated_usd),
     estimated_hours: nullish(fields.estimated_hours),
     task_class: nullish(fields.task_class),
@@ -552,7 +584,7 @@ export function insertProposal(db, fields) {
     converted_task_id: nullish(fields.converted_task_id),
     decided_by: nullish(fields.decided_by),
     decided_at: nullish(fields.decided_at),
-    decision_note: nullish(fields.decision_note),
+    decision_note: sanitizeText(nullish(fields.decision_note)),
   };
   db.prepare(
     `INSERT INTO proposals
@@ -620,7 +652,7 @@ export function insertProposalReview(db, fields) {
     created_at: nowIso(),
     reviewer: fields.reviewer,
     verdict: fields.verdict,
-    note: nullish(fields.note),
+    note: sanitizeText(nullish(fields.note)),
     confidence: nullish(fields.confidence),
   };
   db.prepare(
@@ -657,11 +689,11 @@ export function insertLesson(db, fields) {
     business_id: nullish(fields.business_id),
     task_class: nullish(fields.task_class),
     applies_to: fields.applies_to ?? 'all',
-    lesson: fields.lesson,
-    evidence: nullish(fields.evidence),
+    lesson: sanitizeText(fields.lesson),
+    evidence: sanitizeText(nullish(fields.evidence)),
     confidence: fields.confidence ?? 0.5,
     status: fields.status ?? 'active',
-    retired_reason: nullish(fields.retired_reason),
+    retired_reason: sanitizeText(nullish(fields.retired_reason)),
   };
   db.prepare(
     `INSERT INTO lessons
@@ -764,7 +796,7 @@ export function insertLoopTick(db, fields) {
     task_id: nullish(fields.task_id),
     proposal_id: nullish(fields.proposal_id),
     cost_usd: fields.cost_usd ?? 0,
-    note: nullish(fields.note),
+    note: sanitizeText(nullish(fields.note)),
   };
   db.prepare(
     `INSERT INTO loop_ticks (id, agent, started_at, ended_at, action, task_id, proposal_id, cost_usd, note)

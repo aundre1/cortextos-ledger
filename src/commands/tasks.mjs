@@ -6,9 +6,36 @@
 // PR's metadata and diff before the task row is ever inserted, so a `gh`
 // failure never leaves a half-populated task (requirement 6 on this task
 // card) - see capturePr()/runGh() below.
+//
+// Review round 2 (F4/F6, blind adversarial reviewer against the real CLI and
+// a real stub `gh`): the diff is written to a temp path under
+// `<runs>/.tmp/` (created alongside, and covered by, the same `.cortex/`
+// gitignore/publish-check rule that already excludes the whole runs root -
+// docs/security.md "Never committed") and streamed straight to disk from
+// `gh pr diff`'s stdout - never buffered in memory (spawnSync's `maxBuffer`
+// only applies to piped output; here stdout goes straight to an open file
+// descriptor, so a 70 MB diff is exactly as safe as a 5 MB one - F6). The
+// ledger transaction that inserts the task/artifact/brief rows runs entirely
+// against that temp file (with the artifact row's sha256/bytes precomputed
+// from it and passed straight to insertArtifact, since the final path does
+// not exist on disk yet); only after a successful commit is `<runs>/<task
+// id>/` created and the temp file renamed into place. A transaction failure
+// (FOREIGN KEY constraint, or anything else) deletes the temp file and never
+// creates the task directory - F4.
 
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+} from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
 import { withImmediateTransaction, newId } from '../db.mjs';
@@ -58,6 +85,14 @@ function fail(errFn, code, reason, detail) {
  * for a missing environment prerequisite - there, node:sqlite) rather than
  * inventing a new code the docs do not define. See this task's OPEN
  * QUESTION in the wave log.
+ *
+ * Only used for `gh pr view`'s small JSON payload - review round 2, F6: the
+ * diff itself no longer goes through a buffered spawnSync call at all (see
+ * runGhDiffToFile below), because spawnSync's `maxBuffer` applies to piped
+ * output regardless of how high it is set, and a 70 MB diff piped through
+ * Node exceeded even this function's old 64 MiB ceiling on some platforms
+ * (ENOBUFS) well before the 2,000,000 byte size guard ever got a chance to
+ * apply.
  */
 function runGh(args) {
   let result;
@@ -65,11 +100,6 @@ function runGh(args) {
     result = spawnSync('gh', args, {
       shell: false,
       encoding: 'utf8',
-      // A `gh pr diff` on a large PR can exceed Node's default 1 MiB
-      // maxBuffer long before this command's own 2,000,000 byte size guard
-      // even gets a chance to apply - raised well past that guard so a big
-      // diff is captured (and only then evaluated against the guard),
-      // never silently cut short by spawnSync itself.
       maxBuffer: 64 * 1024 * 1024,
       env: filterEnv(process.env, {}),
     });
@@ -94,16 +124,125 @@ function runGh(args) {
 }
 
 /**
- * `gh pr view <n> --repo <r> --json ...` then `gh pr diff <n> --repo <r>`,
- * in that order (docs/review-protocol.md). Never throws; propagates runGh's
- * `{ ok: false, code, reason, detail }` on either call's failure - "gh
- * missing", "gh not authenticated", and "PR not found" all come back this
- * way, distinguished only by gh's own stderr text in `detail` (this task
- * card's four failure modes do not get four different reason codes: gh's
- * own error text already says which one happened, and hand-parsing that
- * text to re-derive a reason would be brittle across gh versions).
+ * `gh pr diff <n> --repo <r>`, with stdout streamed straight to a file
+ * descriptor opened on `destPath` instead of through spawnSync's own pipe
+ * buffering (review round 2, F6). This is the fix for the 70 MB diff
+ * repro: `stdio: ['ignore', <fd>, 'pipe']` means Node never buffers stdout
+ * in memory at all - the kernel copies bytes straight from gh's pipe to the
+ * destination file - so `maxBuffer` (which only bounds a *piped* stream)
+ * never comes into play for the diff, only for stderr, which stays small.
+ * Same return shape as runGh: `{ ok: true }` or `{ ok: false, code, reason,
+ * detail }`. Never throws.
  */
-function capturePr(repo, pr) {
+function runGhDiffToFile(args, destPath) {
+  let fd;
+  try {
+    fd = openSync(destPath, 'w');
+  } catch (e) {
+    return { ok: false, code: 1, reason: 'gh_failed', detail: `could not open ${destPath}: ${e.message}` };
+  }
+  let result;
+  try {
+    result = spawnSync('gh', args, {
+      shell: false,
+      stdio: ['ignore', fd, 'pipe'],
+      encoding: 'utf8',
+      env: filterEnv(process.env, {}),
+    });
+  } catch (e) {
+    return { ok: false, code: 1, reason: 'gh_missing', detail: e.message };
+  } finally {
+    closeSync(fd);
+  }
+  if (result.error) {
+    const isMissing = result.error.code === 'ENOENT';
+    return {
+      ok: false,
+      code: 1,
+      reason: isMissing ? 'gh_missing' : 'gh_failed',
+      detail: result.error.message,
+    };
+  }
+  if (result.status !== 0) {
+    const detail = (result.stderr || '').trim() || `gh exited ${result.status}`;
+    return { ok: false, code: 1, reason: 'gh_failed', detail: `gh ${args.join(' ')}: ${detail}` };
+  }
+  return { ok: true };
+}
+
+/**
+ * Copies `srcPath` to `destPath`, redacting (src/adapters/credential-
+ * boundary.mjs `redact()`) one line at a time - the same at-rest approach
+ * src/adapters/runner.mjs uses for out.txt. A streaming read (createReadStream,
+ * decoded as utf8 so a multi-byte character split across a chunk boundary
+ * is reassembled correctly rather than mangled) means the whole diff is
+ * never held in memory at once (review round 2, F6 - no whole-file
+ * readFileSync). Lines are split/rejoined on '\n' exactly as the source had
+ * them, including a source that does not end in a trailing newline, so a
+ * diff needing no redaction round-trips byte for byte. Returns a Promise
+ * that resolves once `destPath` is fully written, or rejects on any read/
+ * write error.
+ */
+function redactFileToFile(srcPath, destPath) {
+  return new Promise((resolve, reject) => {
+    const input = createReadStream(srcPath, { encoding: 'utf8' });
+    const output = createWriteStream(destPath);
+    let buffer = '';
+    let settled = false;
+    const fail = (e) => {
+      if (settled) return;
+      settled = true;
+      input.destroy();
+      output.destroy();
+      reject(e);
+    };
+    input.on('error', fail);
+    output.on('error', fail);
+    input.on('data', (chunk) => {
+      buffer += chunk;
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) output.write(`${redact(line)}\n`);
+    });
+    input.on('end', () => {
+      if (buffer.length) output.write(redact(buffer));
+      output.end();
+    });
+    output.on('finish', () => {
+      if (!settled) {
+        settled = true;
+        resolve();
+      }
+    });
+  });
+}
+
+/** sha256 of a file via a streaming read (no readFileSync - review round 2, F6 applies here too, since this runs on the same potentially-70MB file). Byte size is measured separately via fs.statSync, not by accumulating chunk lengths or Buffer.byteLength on a string. */
+function hashFile(path) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const stream = createReadStream(path);
+    stream.on('error', reject);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
+}
+
+/**
+ * `gh pr view <n> --repo <r> --json ...` then streams `gh pr diff <n> --repo
+ * <r>` straight to `tmpRawDiffPath` (docs/review-protocol.md). Never throws;
+ * propagates runGh's/runGhDiffToFile's `{ ok: false, code, reason, detail }`
+ * on either call's failure - "gh missing", "gh not authenticated", and "PR
+ * not found" all come back this way, distinguished only by gh's own stderr
+ * text in `detail` (this task card's four failure modes do not get four
+ * different reason codes: gh's own error text already says which one
+ * happened, and hand-parsing that text to re-derive a reason would be
+ * brittle across gh versions). `meta.baseRefOid`/`meta.headRefOid`/etc. may
+ * be `undefined` rather than crash when gh's JSON omits a field (e.g. a PR
+ * with no computed merge base yet) - every read of `meta` downstream uses
+ * `?.` for exactly this reason.
+ */
+function capturePr(repo, pr, tmpRawDiffPath) {
   const view = runGh([
     'pr', 'view', String(pr),
     '--repo', repo,
@@ -118,10 +257,10 @@ function capturePr(repo, pr) {
     return { ok: false, code: 1, reason: 'gh_failed', detail: `gh pr view returned invalid JSON: ${e.message}` };
   }
 
-  const diff = runGh(['pr', 'diff', String(pr), '--repo', repo]);
+  const diff = runGhDiffToFile(['pr', 'diff', String(pr), '--repo', repo], tmpRawDiffPath);
   if (!diff.ok) return diff;
 
-  return { ok: true, meta, diffText: diff.stdout };
+  return { ok: true, meta };
 }
 
 function missing(flags, required) {
@@ -154,7 +293,7 @@ export function register(registry) {
   registry.add('task:new', {
     description:
       'Insert task, status submitted, print id (--kind pr_review --repo <r> --pr <n> also captures the PR via gh)',
-    handler({ db, config, flags, err }) {
+    async handler({ db, config, flags, err }) {
       const need = missing(flags, ['repo', 'title', 'class', 'arm']);
       if (need.length) {
         return fail(err, 1, 'usage', `missing required flags: ${need.map((n) => '--' + n).join(', ')}`);
@@ -192,10 +331,41 @@ export function register(registry) {
       // pr_review` with no --pr, or --pr with a different --kind, is left
       // exactly as it was before this task - a plain pr_number column set,
       // no gh capture - so existing callers are unaffected.
+      //
+      // Review round 2, F4: the task id is generated up front (as before -
+      // needed to name the temp diff files below), but nothing lands under
+      // `<runs>/<taskId>/` until after the ledger transaction near the
+      // bottom of this branch commits. Everything before that point only
+      // ever touches `<runs>/.tmp/` - a sibling of every task's run
+      // directory, created here and cleaned up on any failure path, so a
+      // `gh` failure or a transaction failure (e.g. FOREIGN KEY from a bad
+      // --parent) never leaves an orphaned task directory or temp file
+      // behind. `<runs>/.tmp/` sits under the same runs root that
+      // docs/security.md's "Never committed" table and this repo's
+      // .gitignore already exclude wholesale via `.cortex/` (config.runs
+      // defaults to `./.cortex/runs`), so no separate ignore rule is
+      // needed for it.
       let capture = null;
+      let taskId;
+      let tmpDir;
+      let tmpRawDiffPath;
+      let tmpRedactedDiffPath;
       if (flags.kind === 'pr_review' && pr.value !== undefined) {
-        const captured = capturePr(flags.repo, pr.value);
+        taskId = newId('t');
+        tmpDir = join(config.runs, '.tmp');
+        mkdirSync(tmpDir, { recursive: true });
+        tmpRawDiffPath = join(tmpDir, `${taskId}.pr.diff.raw`);
+
+        const captured = capturePr(flags.repo, pr.value, tmpRawDiffPath);
         if (!captured.ok) {
+          // gh may have opened (and partially written) the raw temp file
+          // before failing, or never reached it at all (a `gh pr view`
+          // failure) - either way, nothing of this attempt survives on disk.
+          try {
+            if (existsSync(tmpRawDiffPath)) unlinkSync(tmpRawDiffPath);
+          } catch {
+            // best effort - a failed cleanup must not mask the real error
+          }
           return fail(err, captured.code, captured.reason, captured.detail);
         }
         capture = captured;
@@ -203,14 +373,31 @@ export function register(registry) {
 
       let redactedTitle;
       let redactedBody;
-      let redactedDiff;
-      let taskId;
       let diffPath;
+      let diffSha256;
+      let diffBytes;
       if (capture) {
-        redactedTitle = redact(capture.meta.title ?? '');
-        redactedBody = redact(capture.meta.body ?? '');
-        redactedDiff = redact(capture.diffText ?? '');
-        const diffBytes = Buffer.byteLength(redactedDiff, 'utf8');
+        redactedTitle = redact(capture.meta?.title ?? '');
+        redactedBody = redact(capture.meta?.body ?? '');
+
+        // Review round 2, F6: redact the raw temp diff to a second temp
+        // file line by line via a streaming read (never a whole-file
+        // readFileSync - the raw file can be 70+ MB), reusing the exact
+        // same redact() src/adapters/runner.mjs applies to out.txt.
+        tmpRedactedDiffPath = join(tmpDir, `${taskId}.pr.diff`);
+        await redactFileToFile(tmpRawDiffPath, tmpRedactedDiffPath);
+        try {
+          unlinkSync(tmpRawDiffPath);
+        } catch {
+          // best effort - the raw temp file is scratch, not the artifact
+        }
+
+        // fs.statSync (not Buffer.byteLength on a string - the diff is no
+        // longer ever held as one in-memory string) measures the size guard
+        // against the file that will actually become pr.diff; the sha256
+        // for the artifact row is computed with its own streaming read.
+        diffBytes = statSync(tmpRedactedDiffPath).size;
+        diffSha256 = await hashFile(tmpRedactedDiffPath);
         if (diffBytes > MAX_DIFF_BYTES) {
           // Requirement 7: still write it in full, never truncate - only
           // note it, on the task and on stderr.
@@ -221,19 +408,12 @@ export function register(registry) {
           );
         }
 
-        // The task id is generated up front (rather than left to
-        // insertTask's default) so the run dir / pr.diff path can be built
-        // before the task row exists, and so insertTask below can be given
-        // that same id inside the transaction that also writes the brief
-        // message and the diff artifact row.
-        taskId = newId('t');
-        const taskDir = join(config.runs, taskId);
-        mkdirSync(taskDir, { recursive: true });
-        diffPath = join(taskDir, 'pr.diff');
-        // Requirement 6: this fs write happens before any database write,
-        // so a disk failure here still leaves zero rows behind - nothing to
-        // roll back.
-        writeFileSync(diffPath, redactedDiff);
+        // The final path the artifact row and the reviewer brief will name.
+        // It does not exist on disk yet - see the rename after the
+        // transaction below (F4) - so insertArtifact is given the sha256/
+        // bytes already computed from the temp file instead of trying (and
+        // failing) to stat a path that isn't there yet.
+        diffPath = join(config.runs, taskId, 'pr.diff');
       }
 
       const notes = notesParts.length ? notesParts.join('; ') : undefined;
@@ -247,16 +427,20 @@ export function register(registry) {
         issue_number: issue.value,
         pr_number: pr.value,
         pr_repo: capture ? flags.repo : undefined,
-        base_sha: capture ? capture.meta.baseRefOid : undefined,
-        head_sha: capture ? capture.meta.headRefOid : undefined,
+        base_sha: capture ? capture.meta?.baseRefOid : undefined,
+        head_sha: capture ? capture.meta?.headRefOid : undefined,
         kind: flags.kind,
         // For a captured PR, default base_commit/branch from the PR's own
         // base/head shas and head branch name when the operator did not
         // pass --base/--branch explicitly - the columns already exist for
         // exactly this purpose (docs/review-protocol.md's reviewer brief
         // reads task.base_commit/branch) and an explicit flag always wins.
-        base_commit: flags.base ?? (capture ? capture.meta.baseRefOid : undefined),
-        branch: flags.branch ?? (capture ? capture.meta.headRefName : undefined),
+        // `meta.baseRefOid`/`meta.headRefName` may be missing from gh's own
+        // JSON (e.g. no computed merge base yet); `?.` here plus
+        // insertTask's own nullish() means that stores a plain null rather
+        // than throwing a TypeError.
+        base_commit: flags.base ?? (capture ? capture.meta?.baseRefOid : undefined),
+        branch: flags.branch ?? (capture ? capture.meta?.headRefName : undefined),
         worktree: flags.worktree,
         owner: flags.owner,
         priority: priority.value,
@@ -266,27 +450,60 @@ export function register(registry) {
         notes,
       };
 
-      // Requirement 6: with a PR capture, the task row, its brief message,
-      // and its diff artifact row are inserted together inside one
-      // BEGIN IMMEDIATE transaction (src/db.mjs withImmediateTransaction) -
-      // a failure partway through rolls every one of those inserts back, so
-      // the ledger never shows a task with no brief or no artifact row.
-      // Without a capture this is a single insertTask call, unchanged from
-      // before this task.
-      const task = capture
-        ? withImmediateTransaction(db, () => {
-            const inserted = insertTask(db, taskFields);
-            insertArtifact(db, { task_id: inserted.id, kind: 'pr_review', path: diffPath });
-            insertMessage(db, {
-              task_id: inserted.id,
-              sender: 'ledger',
-              recipient: flags.owner ?? 'architect',
-              kind: 'brief',
-              body: `${redactedTitle}\n\n${redactedBody}`,
-            });
-            return inserted;
-          })
-        : insertTask(db, taskFields);
+      // Requirement 6 (and review round 2, F4): with a PR capture, the task
+      // row, its brief message, and its diff artifact row are inserted
+      // together inside one BEGIN IMMEDIATE transaction (src/db.mjs
+      // withImmediateTransaction) - a failure partway through (a bad
+      // --parent's FOREIGN KEY violation, for instance) rolls every one of
+      // those inserts back. This transaction only ever touches `db`, never
+      // the run directory - the temp redacted diff file is only renamed
+      // into `<runs>/<taskId>/pr.diff` after a successful commit, below, so
+      // a rolled-back transaction leaves nothing on disk but the temp file,
+      // which the catch here deletes. Without a capture this is a single
+      // insertTask call, unchanged from before this task.
+      let task;
+      try {
+        task = capture
+          ? withImmediateTransaction(db, () => {
+              const inserted = insertTask(db, taskFields);
+              insertArtifact(db, {
+                task_id: inserted.id,
+                kind: 'pr_review',
+                path: diffPath,
+                sha256: diffSha256,
+                bytes: diffBytes,
+              });
+              insertMessage(db, {
+                task_id: inserted.id,
+                sender: 'ledger',
+                recipient: flags.owner ?? 'architect',
+                kind: 'brief',
+                body: `${redactedTitle}\n\n${redactedBody}`,
+              });
+              return inserted;
+            })
+          : insertTask(db, taskFields);
+      } catch (e) {
+        if (capture) {
+          try {
+            unlinkSync(tmpRedactedDiffPath);
+          } catch {
+            // best effort - the original transaction error is what matters
+          }
+        }
+        throw e;
+      }
+
+      // Only after a successful commit does anything land under
+      // `<runs>/<taskId>/` (F4) - create the task's run directory now and
+      // atomically rename the fully redacted temp file into place.
+      // fs.renameSync is atomic because both paths share the runs root's
+      // volume (never os.tmpdir(), which can be a different filesystem -
+      // Windows-safe rename requires staying on one volume).
+      if (capture) {
+        mkdirSync(join(config.runs, taskId), { recursive: true });
+        renameSync(tmpRedactedDiffPath, diffPath);
+      }
 
       return { code: 0, stdout: task.id };
     },
