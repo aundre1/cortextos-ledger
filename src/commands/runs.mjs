@@ -43,7 +43,7 @@ import {
   classifyFailureClass,
 } from '../guards/postrun.mjs';
 import { getAdapter } from '../adapters/index.mjs';
-import { launchDetached, pollPidFile, waitForDoneMarker } from '../adapters/spawn.mjs';
+import { launchDetached, pollPidFile, waitForDoneMarker, archivePriorAttempt } from '../adapters/spawn.mjs';
 import { redact } from '../adapters/credential-boundary.mjs';
 import { watch as watchRun } from '../guards/watchdog.mjs';
 import { activeFor } from '../policy.mjs';
@@ -526,6 +526,33 @@ export function register(registry) {
     if (started.result.code !== 0) return { ok: false, result: started.result };
     const { run, task, outDir, adapterName } = started;
 
+    // Real Phase 1a defect fix (retry directory reuse, confirmed root
+    // cause): out dirs are per task+agent, not per run
+    // (docs/architecture.md's runtime layout is `<runs>/<task>/<agent>/`),
+    // so this attempt's `outDir` may still hold whatever a PREVIOUS run for
+    // this exact (task, agent) left behind - its own done.marker, exit.txt,
+    // events.jsonl. Archive that - never delete, the owner's standing rule -
+    // before this attempt writes a single byte into `outDir` (the stdinFile
+    // write and buildArgv/launchDetached below, or `--sync`'s in-process
+    // adapter.run() further down): without this, `waitForDoneMarker` is
+    // satisfied by the OLD attempt's stale marker and `doRunEnd` classifies
+    // the NEW run from the OLD attempt's artifacts (see
+    // src/adapters/spawn.mjs's `archivePriorAttempt` and `waitForDoneMarker`
+    // doc comments, and docs/state-machine.md "Provider unavailable"). The
+    // archive key is the previous run's own id when one can be found in the
+    // ledger for this exact task+agent (recorded back onto that run's
+    // `attempt_evidence_dir` column so `task:show` can point at it); when
+    // none can be found (this task+agent's first ever run, or an out dir
+    // that predates this fix), `archivePriorAttempt` falls back to a UTC
+    // timestamp on its own.
+    const previousRun = db
+      .prepare('SELECT id FROM task_runs WHERE task_id = ? AND agent = ? AND id != ? ORDER BY seq DESC LIMIT 1')
+      .get(task.id, run.agent, run.id);
+    const archivedTo = archivePriorAttempt(outDir, previousRun?.id ?? null);
+    if (archivedTo && previousRun) {
+      db.prepare('UPDATE task_runs SET attempt_evidence_dir = ? WHERE id = ?').run(archivedTo, previousRun.id);
+    }
+
     let prompt;
     try {
       prompt = readFileSync(flags['prompt-file'], 'utf8');
@@ -748,8 +775,16 @@ export function register(registry) {
         // synchronous run() above) is what guarantees this run eventually
         // gets a done.marker one way or another; the extra minute here is
         // slack for process scheduling, not a second enforcement of
-        // wallclock_s.
-        await waitForDoneMarker(outDir, { timeoutMs: config.limits.wallclock_s * 1000 + 60000 });
+        // wallclock_s. `sinceMs` is the belt-and-braces check described on
+        // `waitForDoneMarker` itself: this attempt's own `started_at`, so a
+        // marker somehow left over from a previous attempt (outDir is
+        // archived clean above, in `launchAttempt`, before this run even
+        // spawns - this is a second line of defense, not the fix itself)
+        // can never be mistaken for this one's.
+        await waitForDoneMarker(outDir, {
+          timeoutMs: config.limits.wallclock_s * 1000 + 60000,
+          sinceMs: new Date(run.started_at).getTime(),
+        });
 
         const ended = doRunEnd({ db, config, flags: { run: run.id }, err });
         if (ended.code !== 0) return ended;

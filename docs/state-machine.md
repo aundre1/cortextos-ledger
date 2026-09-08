@@ -48,6 +48,8 @@ Real evidence from a production batch: 12 of 16 runs failed with `out.txt` conta
 
 `cortexctl doctor` reports, per provider ever seen in `task_runs`, how many runs in the last 24 hours ended `provider_unavailable`, `warn`-level when nonzero, so an operator can see a lane is throttled without reading a transcript.
 
+Per-attempt directory archiving: every attempt of the same `(task, agent)` writes into the same out dir, `<runs>/<task>/<agent>/` (`docs/architecture.md`'s runtime layout is per task+agent, not per run), so before a retried attempt's harness spawns, `run:launch` moves -- never deletes, the owner's standing "archive, never delete" rule -- whatever the previous attempt left there into `<outDir>/attempts/<previous run id>/`, recording that path on the previous run's own `task_runs.attempt_evidence_dir` (`docs/ledger.md`). This closes a confirmed real defect: without it, a stale `done.marker` from the attempt that just finished satisfies the retry loop's wait for the *new* attempt's completion immediately, and `run:end` classifies the new run entirely from the old attempt's leftover `exit.txt`/`events.jsonl`, so a genuinely still-failing retry can be misreported as done.
+
 ## Exit codes
 
 | Code | Meaning |

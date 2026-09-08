@@ -605,7 +605,15 @@ export function register(registry) {
         );
       }
       lines.push(`  runs (${runs.length}):`);
-      for (const r of runs) lines.push(`    ${r.id}  seq ${r.seq}  ${r.agent}  ${r.status ?? 'running'}`);
+      for (const r of runs) {
+        // Real Phase 1a defect fix (retry directory reuse): a run whose own
+        // out dir a later attempt reused (docs/state-machine.md "Provider
+        // unavailable") has its evidence archived, never deleted, under
+        // `attempts/<this run's id>/` - point at it here rather than making
+        // an operator infer the convention from src/adapters/spawn.mjs.
+        const archivedNote = r.attempt_evidence_dir ? `  archived to ${r.attempt_evidence_dir}` : '';
+        lines.push(`    ${r.id}  seq ${r.seq}  ${r.agent}  ${r.status ?? 'running'}${archivedNote}`);
+      }
       lines.push(`  verdicts (${verdicts.length}):`);
       for (const v of verdicts) {
         lines.push(`    ${v.id}  ${v.reviewer}  ${v.decision}  challenge_seq ${v.challenge_seq}`);

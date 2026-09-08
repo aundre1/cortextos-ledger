@@ -76,6 +76,7 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
     '007-v02-provider-and-verdict',
     '008-v02-prompt-delivery',
     '009-v02-archive',
+    '010-v02-attempt-archive',
   ]);
 
   const applied = await migrate(db);
@@ -90,8 +91,9 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
     '007-v02-provider-and-verdict',
     '008-v02-prompt-delivery',
     '009-v02-archive',
+    '010-v02-attempt-archive',
   ]);
-  assert.equal(schemaVersion(db), '009-v02-archive');
+  assert.equal(schemaVersion(db), '010-v02-attempt-archive');
   assert.deepEqual(pendingMigrations(db), []);
 
   const tableNames = db
@@ -141,10 +143,14 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
   // Running migrate again is a no-op: nothing pending, no error, same version.
   const secondApplied = await migrate(db);
   assert.deepEqual(secondApplied, []);
-  assert.equal(schemaVersion(db), '009-v02-archive');
+  assert.equal(schemaVersion(db), '010-v02-attempt-archive');
 
   const migrationRows = db.prepare('SELECT version FROM schema_migrations').all();
-  assert.equal(migrationRows.length, 10);
+  assert.equal(migrationRows.length, 11);
+
+  // task_runs.attempt_evidence_dir (real Phase 1a defect fix: retry
+  // directory reuse - see src/schema/010-v02-attempt-archive.mjs).
+  assert.ok(runColumns.includes('attempt_evidence_dir'), 'task_runs should have column attempt_evidence_dir');
 
   // task_runs.failure_class / review_verdicts.summary_truncated_from
   // (Phase 1a real-batch fixes F1/F2).

@@ -491,6 +491,75 @@ section mirroring the unadjudicated-task exclusion language).
 argv-shape, 1 runner stdin-relay checksum). `node scripts/check-syntax.mjs`:
 108 files, 0 failures. `node scripts/publish-check.mjs`: clean.
 
+### Real defect fix: `run:launch --retry` misreading a retried attempt from the previous attempt's stale artifacts
+
+Confirmed real defect from the owner's machine: `run:launch --retry 4 --retry-backoff-s 45` against a rate-limited
+lane logged two correct `provider_unavailable` retries, then, on attempt 3, printed a run id and exited 0 almost
+immediately even though that attempt's own run directory shows `exit.txt = 1` and an `events.jsonl` holding a
+retryable 429 with no successful completion.
+
+Root cause, confirmed by reading the code: every attempt of the same `(task, agent)` writes into the same out dir,
+`<runs>/<task>/<agent>/` (`docs/architecture.md`'s runtime layout is per task+agent, not per run). `runner.mjs`
+truncates only `out.txt`/`events.jsonl` fresh per run and never touches `done.marker`/`exit.txt`/`elapsed_ms.txt`/
+`pid.txt` at all. `waitForDoneMarker` (`src/adapters/spawn.mjs`) therefore found the *previous* attempt's own
+`done.marker`, still sitting there, and returned immediately for the *new* attempt; `doRunEnd` (`src/commands/
+runs.mjs`) then classified the new run entirely from the old attempt's `exit.txt`/`events.jsonl` on disk at that
+moment.
+
+Fixed: `launchAttempt` (`src/commands/runs.mjs`) now calls a new `archivePriorAttempt` (`src/adapters/spawn.mjs`)
+right after `doRunStart` returns and before this attempt writes anything into the out dir. It moves - never
+deletes, the owner's standing "archive, never delete" rule - every artifact file a previous attempt for this exact
+`(task, agent)` left behind (`done.marker`, `exit.txt`, `elapsed_ms.txt`, `events.jsonl`, `out.txt`, `pid.txt`,
+`prompt.txt`, and the agent-produced `patch.diff`/`reasoning.md`/`verdict.json`) into `<outDir>/attempts/<previous
+run id>/`, recorded on that previous run's own new `task_runs.attempt_evidence_dir` column (migration
+`010-v02-attempt-archive.mjs`) so `task:show` can point at it. `waitForDoneMarker` also gained a belt-and-braces
+`sinceMs` check (a found marker older than the current attempt's own `started_at` does not count as done) even
+though the archiving above already guarantees a clean directory - the same kind of invariant the original defect
+silently violated is worth verifying, not just trusting. That check needed its own fix along the way: a strict
+`mtimeMs >= sinceMs` intermittently hung `--sync` launches for the full `wallclock_s` timeout, because the gap
+between `started_at` (a millisecond-resolution JS `Date`) and the real `done.marker` write can be under a
+millisecond in that path - well inside the jitter between `Date.now()`'s clock source and the filesystem's own
+`mtime` clock - so a 5 second tolerance was added; it does not weaken the check's real job; a marker that
+`archivePriorAttempt` should have archived away is from a categorically earlier CLI invocation, not a same-attempt
+race, and is virtually certain to be older than that by far more than 5 seconds. `src/ingest.mjs`'s well-known-artifact lookup now prefers
+`attempt_evidence_dir` over `out_dir` when present, so ingesting an archived attempt by its own explicit `--events
+<path>` attributes artifacts to the run that actually produced them rather than to whichever attempt is currently
+live in the shared directory; `ingest`'s existing per-run idempotency (keyed by `run_id`, not by path) already
+means archived attempts can be ingested by path with no double counting, since each is a distinct run id.
+
+A related latent bug fixed as part of the same root cause: the stale `done.marker` also made `run:launch` skip
+spawning a watchdog for every retried attempt (the pre-spawn `existsSync(done.marker)` check saw the *old* marker
+and concluded, wrongly, that this attempt had already finished synchronously) - a retried attempt was running with
+no wall-clock/stall protection at all. Archiving the directory clean before each attempt fixes this for free.
+
+Tests (`test/runs.test.mjs`): two new tests drive the real `run:launch --retry` loop through the real CLI (a real
+subprocess, not an in-process call) over the fake adapter's real (non `--sync`) launch path - `src/adapters/
+fake-harness.mjs` spawned as its own child process through `runner.mjs`, exactly like a real claude/codex/opencode
+harness, since `--sync`'s in-process `run()` overwrites every file unconditionally on every call and cannot
+reproduce this defect. The first asserts that a stub harness emitting a retryable 429 on every attempt keeps
+retrying to the full budget: exactly `totalAttempts` runs, every one `failure_class = provider_unavailable`, exactly
+one `warn` escalation at the end, exit 7, and each earlier attempt's artifacts preserved and readable under
+`attempts/<run id>/`. The second chains three fixtures (429, 429, then a clean success, each attempt's own `files`
+rewriting the shared fixture file for the next spawn) and asserts exit 0, three runs, and that the live out dir
+holds the successful run's own artifacts, not an earlier failed attempt's.
+
+Confirmed pre-fix with a `git stash` cycle (fix files stashed, new tests and the migration file kept aside, run
+against HEAD `862e253`): both new tests fail, and the second reproduces the confirmed defect almost exactly as
+observed on the owner's machine. Because attempt N's own fixture write races several still-running detached
+`runner.mjs` processes writing into the identical shared out dir concurrently (not just a two-attempt stale read -
+every prior attempt's `runner.mjs` keeps running in the background, unref'd and unawaited, after the loop has
+already moved on), the loop over-fired: **4** run rows were created chasing a 3-attempt success instead of 3, and
+the run `run:launch` printed and exited `0` for was itself left on disk as `status: fail`, `exit_code: 1`,
+`failure_class: null` - a run:launch exit 0 over a run that never actually succeeded and was not even correctly
+classified `provider_unavailable`, matching the owner's report almost exactly (`run:launch` exiting 0 over a run
+whose own `exit.txt` is 1). The first test fails on the one assertion pre-fix code has no way to satisfy at all:
+`attempt_evidence_dir` is never set and no `attempts/<run id>/` directory is ever created, because the archiving
+this fix adds does not exist yet.
+
+Docs: `docs/state-machine.md` ("Provider unavailable" gains a paragraph on per-attempt directory archiving),
+`docs/cli.md` (`--retry` row), `docs/ledger.md` (`task_runs.attempt_evidence_dir`), `docs/security.md` (at-rest
+table gains the `attempts/<run id>/` path).
+
 ### Known limitations (open questions carried forward)
 
 Everything below is a wave log `OPEN QUESTION` that is still open after the

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { runCli, makeTempGitRepo, makeTempDir } from './helpers.mjs';
@@ -417,6 +417,147 @@ test('run:launch --retry: an immediate success never waits or writes a provider_
   assert.equal(view.runs.length, 1, 'no retry was ever needed');
   assert.equal(view.runs[0].failure_class, null);
   assert.equal(view.escalations.filter((e) => e.reason === 'provider_unavailable').length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// run:launch --retry: retry directory reuse (real Phase 1a defect, confirmed
+// root cause). The two tests above use `--sync`, which runs fake.mjs's
+// `run()` in process and unconditionally overwrites every file on every
+// call - it never reuses runner.mjs's own truncate-only-two-files/first-
+// writer-wins bookkeeping and so cannot reproduce the defect. These two
+// drive the exact same retry loop through the real (non `--sync`) launch
+// path instead: `--adapter fake` without `--sync` spawns
+// src/adapters/fake-harness.mjs as its own real child process through
+// src/adapters/runner.mjs, exactly like a real claude/codex/opencode
+// harness would be - a real stub harness on the real detached path, not an
+// in-process shortcut.
+// ---------------------------------------------------------------------------
+
+function launchWithRealFixture(ctx, taskId, fixture, extraFlags = []) {
+  const fixturePath = join(ctx.homeDir, `fixture-real-${Math.random().toString(36).slice(2)}.json`);
+  writeFileSync(fixturePath, JSON.stringify(fixture));
+  const promptPath = join(ctx.homeDir, `prompt-real-${Math.random().toString(36).slice(2)}.txt`);
+  writeFileSync(promptPath, 'do the thing');
+  return cli(
+    ['run:launch', '--task', taskId, '--agent', 'builder', '--provider', 'fake', '--model', 'fake-model',
+     '--adapter', 'fake', '--prompt-file', promptPath, ...extraFlags],
+    ctx,
+    { ...ctx.env, CORTEX_FAKE_FIXTURE: fixturePath }
+  );
+}
+
+test('run:launch --retry (real launch path): keeps retrying while every attempt classifies provider_unavailable, all the way to the budget, archiving each attempt\'s evidence', () => {
+  const ctx = setup({ builder_attempts_max: 1 });
+  assert.equal(cli(['init'], ctx).code, 0);
+  const taskId = newTask(ctx);
+  const outDir = join(ctx.homeDir, 'runs', taskId, 'builder');
+
+  const totalAttempts = 3; // the first attempt plus 2 retries
+  const launch = launchWithRealFixture(ctx, taskId, providerUnavailableFixture(), [
+    '--retry', String(totalAttempts - 1), '--retry-backoff-s', '0',
+  ]);
+  assert.equal(launch.code, 7, launch.stderr);
+  assert.match(launch.stderr, /provider_unavailable/);
+  assert.equal((launch.stderr.match(/waiting \d+s before retry attempt/g) ?? []).length, totalAttempts - 1);
+
+  const view = taskShow(ctx, taskId);
+  assert.equal(view.runs.length, totalAttempts, 'exactly totalAttempts runs were created');
+  for (const run of view.runs) {
+    assert.equal(run.failure_class, 'provider_unavailable', `run ${run.id} should classify provider_unavailable`);
+  }
+
+  const puEscalations = view.escalations.filter((e) => e.reason === 'provider_unavailable');
+  assert.equal(puEscalations.length, 1, 'exactly one warn escalation exists at the end');
+  assert.equal(puEscalations[0].severity, 'warn');
+
+  // Every attempt but the last (which is still live - nothing after it ever
+  // started, so nothing ever archived it) has its own artifacts preserved
+  // under attempts/<run id>/ - moved, not deleted, and matching what
+  // task:show now records on the archived run's own row.
+  for (const run of view.runs.slice(0, -1)) {
+    assert.ok(run.attempt_evidence_dir, `run ${run.id} should have attempt_evidence_dir set`);
+    assert.equal(run.attempt_evidence_dir, join(outDir, 'attempts', run.id));
+    const archivedExit = join(run.attempt_evidence_dir, 'exit.txt');
+    assert.ok(existsSync(archivedExit), `${archivedExit} should exist`);
+    assert.equal(readFileSync(archivedExit, 'utf8').trim(), '1');
+    const archivedEvents = readFileSync(join(run.attempt_evidence_dir, 'events.jsonl'), 'utf8');
+    assert.match(archivedEvents, /"type":"error"/);
+    assert.match(archivedEvents, /"status_code":429/);
+    assert.ok(existsSync(join(run.attempt_evidence_dir, 'done.marker')));
+  }
+  const lastRun = view.runs[view.runs.length - 1];
+  assert.equal(lastRun.attempt_evidence_dir, null, 'the final attempt was never superseded, so nothing archived it');
+  assert.ok(existsSync(join(outDir, 'exit.txt')), 'the final attempt\'s own exit.txt is still live in outDir');
+  assert.equal(readFileSync(join(outDir, 'exit.txt'), 'utf8').trim(), '1');
+
+  // docs/state-machine.md "Attempt counting": none of the provider_unavailable
+  // runs above counted against builder_attempts_max (set to 1 here).
+  const start = cli(['run:start', '--task', taskId, '--agent', 'builder', '--provider', 'fake', '--model', 'fake-model'], ctx);
+  assert.equal(start.code, 0, start.stderr);
+});
+
+test('run:launch --retry (real launch path): 429 on the first two attempts, clean success on the third', () => {
+  const ctx = setup();
+  assert.equal(cli(['init'], ctx).code, 0);
+  const taskId = newTask(ctx);
+  const outDir = join(ctx.homeDir, 'runs', taskId, 'builder');
+
+  // A chain of three fixtures, each one's `files` overwriting the shared
+  // CORTEX_FAKE_FIXTURE path with the NEXT attempt's fixture before this
+  // attempt exits - fake-harness.mjs re-reads that path fresh on every
+  // spawn (a new child process per attempt), so this drives a genuinely
+  // different outcome per attempt without any test-side coordination
+  // between attempts (the whole retry loop runs inside one blocking
+  // `run:launch --retry` process - there is no window for the test itself
+  // to intervene between attempts).
+  const fixturePath = join(ctx.homeDir, `fixture-chain-${Math.random().toString(36).slice(2)}.json`);
+  const successFixture = {
+    exitCode: 0,
+    events: [{ ts: '2026-09-07T00:02:00.000Z', type: 'session.start' }],
+    files: { [join(outDir, 'patch.diff')]: 'diff --git a/x b/x\n+hello\n' },
+  };
+  const secondFixture = {
+    ...providerUnavailableFixture(),
+    files: { [fixturePath]: JSON.stringify(successFixture) },
+  };
+  const firstFixture = {
+    ...providerUnavailableFixture(),
+    files: { [fixturePath]: JSON.stringify(secondFixture) },
+  };
+  writeFileSync(fixturePath, JSON.stringify(firstFixture));
+
+  const promptPath = join(ctx.homeDir, 'prompt-chain.txt');
+  writeFileSync(promptPath, 'do the thing');
+  const launch = cli(
+    ['run:launch', '--task', taskId, '--agent', 'builder', '--provider', 'fake', '--model', 'fake-model',
+     '--adapter', 'fake', '--prompt-file', promptPath, '--retry', '3', '--retry-backoff-s', '0'],
+    ctx,
+    { ...ctx.env, CORTEX_FAKE_FIXTURE: fixturePath }
+  );
+  assert.equal(launch.code, 0, launch.stderr);
+
+  const view = taskShow(ctx, taskId);
+  assert.equal(view.runs.length, 3, 'exactly three runs: two failed attempts plus the successful one');
+  assert.equal(view.runs[0].failure_class, 'provider_unavailable');
+  assert.equal(view.runs[1].failure_class, 'provider_unavailable');
+  assert.equal(view.runs[2].failure_class, null);
+  assert.equal(view.runs[2].status, 'ok');
+  assert.ok(view.runs[0].attempt_evidence_dir);
+  assert.ok(view.runs[1].attempt_evidence_dir);
+  assert.equal(view.runs[2].attempt_evidence_dir, null);
+  assert.equal(launch.stdout.trim(), view.runs[2].id);
+
+  // The successful run's artifacts are the ones actually live in outDir -
+  // the two failed attempts' own artifacts are archived away, not mixed in.
+  assert.equal(readFileSync(join(outDir, 'exit.txt'), 'utf8').trim(), '0');
+  assert.ok(existsSync(join(outDir, 'patch.diff')));
+  assert.equal(readFileSync(join(outDir, 'patch.diff'), 'utf8'), 'diff --git a/x b/x\n+hello\n');
+  assert.ok(!existsSync(join(outDir, 'attempts', view.runs[2].id)), 'the live attempt was never archived');
+
+  for (const run of [view.runs[0], view.runs[1]]) {
+    assert.equal(readFileSync(join(run.attempt_evidence_dir, 'exit.txt'), 'utf8').trim(), '1');
+    assert.match(readFileSync(join(run.attempt_evidence_dir, 'events.jsonl'), 'utf8'), /"status_code":429/);
+  }
 });
 
 // ---------------------------------------------------------------------------

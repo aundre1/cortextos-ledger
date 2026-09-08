@@ -192,10 +192,24 @@ export function ingest(db, config, { eventsPath, taskId, runId }) {
   // Artifacts: only the well-known files, only when present on disk, and
   // only once per (run, kind) - a second ingest of the same run must not
   // insert a duplicate row for a file that has not changed.
+  //
+  // Real Phase 1a defect fix (retry directory reuse): `run.out_dir` is
+  // shared across every attempt of the same (task, agent) forever
+  // (docs/architecture.md's runtime layout) - once a LATER attempt has
+  // reused it, `run.out_dir` no longer holds THIS run's own patch.diff/
+  // out.txt/etc, only whatever attempt currently lives there. `attempt_
+  // evidence_dir` (set on this run's row by that later attempt's own
+  // archiving step - src/adapters/spawn.mjs `archivePriorAttempt`,
+  // src/commands/runs.mjs `launchAttempt`) is where this run's own files
+  // actually are once that has happened; prefer it over `out_dir` so
+  // ingesting an archived attempt by its own explicit `--events <path>`
+  // attributes artifacts to the run that actually produced them, not to
+  // whichever attempt happens to be live in the shared directory right now.
   const artifactsInserted = [];
-  if (run.out_dir) {
+  const artifactDir = run.attempt_evidence_dir || run.out_dir;
+  if (artifactDir) {
     for (const [file, kind] of ARTIFACT_FILES) {
-      const filePath = join(run.out_dir, file);
+      const filePath = join(artifactDir, file);
       if (existsSync(filePath) && !artifactAlreadyRecorded(db, runId, kind)) {
         insertArtifact(db, { task_id: taskId, run_id: runId, kind, path: filePath });
         artifactsInserted.push(kind);
