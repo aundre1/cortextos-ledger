@@ -13,7 +13,7 @@ import {
   insertEscalation,
   insertIntervention,
 } from './ledger.mjs';
-import { rollQuota, syncConfigQuota } from './quota.mjs';
+import { rollQuota, syncConfigQuota, reservedSpend } from './quota.mjs';
 
 // ---------------------------------------------------------------------------
 // Attempts (docs/state-machine.md "Attempt counting")
@@ -140,6 +140,17 @@ export function checkQuota(db, config, provider, model, projectedCost = 0, { isP
     .prepare('SELECT * FROM provider_quota WHERE provider = ? AND (model IS NULL OR model = ?)')
     .all(provider, model ?? null);
 
+  // Round 3, F1(a)/(b): admission is now a real gate. `doRunStart` reserves
+  // one request (src/quota.mjs reserveRequest) inside the same transaction
+  // right after this passes, so the check below and the actual increment
+  // stay in lockstep across concurrent callers. For limit_usd, real cost is
+  // unknown until a run ends, so `reservedSpend` adds a pessimistic
+  // reservation: every OTHER run currently running for this provider is
+  // assumed to cost up to config.limits.spend_usd (the per-task budget cap
+  // checkSpend also enforces), on top of `projectedCost` (this call's own
+  // median-based projection, unchanged).
+  const reserved = reservedSpend(db, config, provider);
+
   for (const row of rows) {
     if (row.limit_requests != null && row.used_requests + 1 > row.limit_requests) {
       return {
@@ -148,15 +159,18 @@ export function checkQuota(db, config, provider, model, projectedCost = 0, { isP
         detail: `${provider} ${row.model ?? '*'} ${row.window_kind}: requests ${row.used_requests + 1}/${row.limit_requests}`,
       };
     }
-    if (row.limit_usd != null && row.used_usd + projectedCost > row.limit_usd) {
-      return {
-        ok: false,
-        reason: 'quota',
-        detail: `${provider} ${row.model ?? '*'} ${row.window_kind}: usd ${(row.used_usd + projectedCost).toFixed(4)}/${row.limit_usd}`,
-      };
+    if (row.limit_usd != null) {
+      const committed = row.used_usd + reserved + projectedCost;
+      if (committed > row.limit_usd) {
+        return {
+          ok: false,
+          reason: 'quota',
+          detail: `${provider} ${row.model ?? '*'} ${row.window_kind}: usd ${committed.toFixed(4)}/${row.limit_usd} (reserved ${reserved.toFixed(4)})`,
+        };
+      }
     }
   }
-  return { ok: true };
+  return { ok: true, reservedUsd: reserved };
 }
 
 // ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@
 //   week        - calendar UTC week, Monday 00:00:00Z start (ISO 8601 weeks).
 //   month       - calendar UTC month, first-of-month 00:00:00Z start.
 
-import { newId } from './db.mjs';
+import { newId, withImmediateTransaction } from './db.mjs';
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 3_600_000;
@@ -152,36 +152,46 @@ export function findQuotaRow(db, { provider, model = null, windowKind }) {
  * `quota:show`, and `quota:tick`'s command handler so the config-derived
  * ceiling is enforced and visible everywhere provider_quota is read.
  */
+// Round 3, F3: this find-or-insert used to be a plain read followed by a
+// separate INSERT or UPDATE - two concurrent callers racing a
+// never-before-seen (provider, model, window_kind) key could both see "no
+// existing row" and both INSERT, producing duplicate rows for the same key.
+// Fixed with a UNIQUE index on (provider, COALESCE(model, ''), window_kind)
+// (src/schema/006-v02-quota-reserve.mjs) plus INSERT ... ON CONFLICT DO
+// NOTHING against it, the whole sync wrapped in withImmediateTransaction
+// (reentrant - see src/db.mjs - safe even though checkQuota, one caller,
+// sometimes already holds doRunStart's own transaction).
 export function syncConfigQuota(db, config, now = new Date()) {
   const providers = config?.providers ?? {};
   const nowIsoStr = new Date(toMs(now)).toISOString();
 
-  for (const [provider, providerConfig] of Object.entries(providers)) {
-    const windows = Array.isArray(providerConfig?.windows) ? providerConfig.windows : [];
-    for (const w of windows) {
-      const windowKind = w?.kind;
-      if (!windowKind) continue;
-      const model = w.model ?? null;
-      const limitRequests = w.limit_requests ?? null;
-      const limitUsd = w.limit_usd ?? null;
+  withImmediateTransaction(db, () => {
+    for (const [provider, providerConfig] of Object.entries(providers)) {
+      const windows = Array.isArray(providerConfig?.windows) ? providerConfig.windows : [];
+      for (const w of windows) {
+        const windowKind = w?.kind;
+        if (!windowKind) continue;
+        const model = w.model ?? null;
+        const limitRequests = w.limit_requests ?? null;
+        const limitUsd = w.limit_usd ?? null;
 
-      const existing = findQuotaRow(db, { provider, model, windowKind });
-      if (existing?.source === 'manual') continue; // quota:set's override always wins
-
-      if (existing) {
-        db.prepare(
-          'UPDATE provider_quota SET limit_requests = ?, limit_usd = ?, source = ?, updated_at = ? WHERE id = ?'
-        ).run(limitRequests, limitUsd, 'config', nowIsoStr, existing.id);
-      } else {
         db.prepare(
           `INSERT INTO provider_quota
              (id, provider, model, window_kind, window_started_at, limit_requests, limit_usd,
               used_requests, used_usd, source, updated_at)
-           VALUES (?,?,?,?,?,?,?,0,0,'config',?)`
+           VALUES (?,?,?,?,?,?,?,0,0,'config',?)
+           ON CONFLICT(provider, COALESCE(model, ''), window_kind) DO NOTHING`
         ).run(newId('q'), provider, model, windowKind, nowIsoStr, limitRequests, limitUsd, nowIsoStr);
+
+        const existing = findQuotaRow(db, { provider, model, windowKind });
+        if (!existing || existing.source === 'manual') continue; // quota:set's override always wins
+
+        db.prepare(
+          'UPDATE provider_quota SET limit_requests = ?, limit_usd = ?, source = ?, updated_at = ? WHERE id = ?'
+        ).run(limitRequests, limitUsd, 'config', nowIsoStr, existing.id);
       }
     }
-  }
+  });
 }
 
 /**
@@ -206,4 +216,49 @@ export function tickQuota(db, { provider, model = null, requests = 0, usd = 0, n
     update.run(requests, usd, nowIsoStr, row.id);
   }
   return rows.length;
+}
+
+// Round 3, F1: admission-time reservation. Before this, a
+// config.providers.<x>.windows request ceiling was read at run:start but
+// never written to - only ingest/quota:tick ever incremented
+// used_requests/used_usd - so concurrent (or even sequential) run:start
+// calls all succeeded past the ceiling.
+
+/**
+ * Reserve one request against every provider_quota row matching `provider`
+ * (model-specific plus provider-wide, same matching rule as tickQuota
+ * above and checkQuota's own read in src/limits.mjs). Called by
+ * `doRunStart` (src/commands/runs.mjs) inside the same
+ * withImmediateTransaction that re-checks checkQuota right before it, so
+ * check-then-increment is atomic across concurrent run:start calls.
+ */
+export function reserveRequest(db, { provider, model = null, now = new Date() } = {}) {
+  const nowIsoStr = new Date(toMs(now)).toISOString();
+  const rows = db
+    .prepare('SELECT id FROM provider_quota WHERE provider = ? AND (model IS NULL OR model = ?)')
+    .all(provider, model);
+  const update = db.prepare('UPDATE provider_quota SET used_requests = used_requests + 1, updated_at = ? WHERE id = ?');
+  for (const row of rows) {
+    update.run(nowIsoStr, row.id);
+  }
+  return rows.length;
+}
+
+/**
+ * Pessimistic in-flight spend reservation for a provider (F1(b)): real cost
+ * is unknown until a run ends and ingest records it, so while a run is
+ * `running` this treats it as if it could spend up to the per-task budget
+ * cap (config.limits.spend_usd, the same number checkSpend enforces).
+ * Counts task_runs currently `running` for `provider` (provider-wide, not
+ * scoped to model). Zero when config.limits.spend_usd is not set. Used by
+ * checkQuota (src/limits.mjs) and by quota:show's `reserved_usd` column
+ * (src/commands/setup.mjs).
+ */
+export function reservedSpend(db, config, provider) {
+  const perRun = config?.limits?.spend_usd;
+  if (!perRun) return 0;
+  const row = db
+    .prepare("SELECT COUNT(*) AS c FROM task_runs WHERE status = 'running' AND provider = ?")
+    .get(provider);
+  return row.c * perRun;
 }

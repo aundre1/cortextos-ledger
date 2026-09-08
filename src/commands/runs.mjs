@@ -30,6 +30,7 @@ import {
   resolveEscalations,
   retroactiveWallclock,
 } from '../limits.mjs';
+import { reserveRequest } from '../quota.mjs';
 import { preflight as runPreflight } from '../guards/preflight.mjs';
 import {
   filesTouched,
@@ -273,6 +274,13 @@ async function doRunStart({ db, config, flags, err }) {
       wallclock_limit_s: config.limits.wallclock_s,
       halted_reason: haltedReasonPreflight,
     });
+    // Round 3, F1(a): reserve one request against every provider_quota row
+    // this run's provider/model matches, atomically with the gate check and
+    // insert above. Marked quota_reserved so ingest (src/ingest.mjs) never
+    // double-counts this run's request from its real event count (F1(c)).
+    reserveRequest(db, { provider, model });
+    db.prepare('UPDATE task_runs SET quota_reserved = 1 WHERE id = ?').run(run.id);
+    run.quota_reserved = 1;
     transition(db, task.id, 'working');
     return { ok: true, run };
   });

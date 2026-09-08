@@ -166,7 +166,17 @@ export function ingest(db, config, { eventsPath, taskId, runId }) {
     source: 'plugin',
   });
 
-  const deltaRequests = requests - (prior?.requests ?? 0);
+  // Round 3, F1(c): a run whose `run:start` already reserved one request
+  // against provider_quota (`task_runs.quota_reserved`, src/quota.mjs
+  // `reserveRequest`, src/commands/runs.mjs `doRunStart`) must not also get
+  // its real event-derived request count added here - that would count the
+  // same run's admission twice. Real spend always ticks in full regardless:
+  // cost is unknown until this exact moment, so there is nothing to have
+  // double counted for usd. A run inserted directly (not via `run:start` -
+  // `quota_reserved` defaults to 0 for every row that predates this column
+  // and every row a caller inserts by hand, e.g. some tests) keeps the prior
+  // behaviour of ticking its real request count here.
+  const deltaRequests = run.quota_reserved ? 0 : requests - (prior?.requests ?? 0);
   const deltaUsd = costUsd - (prior?.cost_usd ?? 0);
 
   // syncConfigQuota first: a provider whose only ceiling lives in the config

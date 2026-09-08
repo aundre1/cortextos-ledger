@@ -233,8 +233,20 @@ async function applyOne(db, migration) {
  * from `fn`, not thrown, so the transaction still commits and the lock is
  * released promptly).
  */
+const TX_DEPTH = Symbol('cortex.txDepth');
+
 export function withImmediateTransaction(db, fn) {
+  if (db[TX_DEPTH] > 0) {
+    db[TX_DEPTH] += 1;
+    try {
+      return fn();
+    } finally {
+      db[TX_DEPTH] -= 1;
+    }
+  }
+
   db.exec('BEGIN IMMEDIATE');
+  db[TX_DEPTH] = 1;
   let result;
   try {
     result = fn();
@@ -245,9 +257,11 @@ export function withImmediateTransaction(db, fn) {
       // best effort - if the connection is already unusable there is
       // nothing more productive to do than let the original error surface.
     }
+    db[TX_DEPTH] = 0;
     throw e;
   }
   db.exec('COMMIT');
+  db[TX_DEPTH] = 0;
   return result;
 }
 

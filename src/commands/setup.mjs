@@ -3,7 +3,7 @@
 
 import { migrate, pendingMigrations, schemaVersion } from '../db.mjs';
 import { upsertQuota, listQuota } from '../ledger.mjs';
-import { tickQuota, rollQuota, windowEndsAt, syncConfigQuota } from '../quota.mjs';
+import { tickQuota, rollQuota, windowEndsAt, syncConfigQuota, findQuotaRow, reservedSpend } from '../quota.mjs';
 
 function fail(errFn, code, reason, detail) {
   errFn(`cortexctl: ${reason}: ${detail}`);
@@ -14,11 +14,19 @@ function missing(flags, required) {
   return required.filter((name) => flags[name] === undefined);
 }
 
-function quotaRowView(row) {
+// Round 3, F1(b): `reserved_usd` is the pessimistic in-flight spend this
+// window is already carrying (see src/quota.mjs `reservedSpend`) - every run
+// currently `running` for this row's provider, assumed to cost up to
+// `config.limits.spend_usd` each, since its real cost is unknown until
+// ingest. Shown so an operator sees why a refusal happened, not only the
+// raw `used_usd`/`limit_usd` numbers (docs/guards.md "Reserved spend and
+// requests").
+function quotaRowView(db, config, row) {
   return {
     ...row,
     headroom_requests: row.limit_requests != null ? row.limit_requests - row.used_requests : null,
     headroom_usd: row.limit_usd != null ? row.limit_usd - row.used_usd : null,
+    reserved_usd: reservedSpend(db, config, row.provider),
     resets_at: windowEndsAt(row),
     // 'config' (seeded/refreshed from config.providers.<name>.windows and
     // never touched by quota:set) or 'manual' (quota:set's own override, or
@@ -112,7 +120,7 @@ export function register(registry) {
   });
 
   registry.add('quota:show', {
-    description: 'All windows with headroom, reset time, and origin (config or quota:set)',
+    description: 'All windows with headroom, reserved spend, reset time, and origin (config or quota:set)',
     handler({ db, config, flags }) {
       // Seed/refresh config-derived windows first so an operator who has
       // never run quota:set still sees every ceiling docs/architecture.md's
@@ -120,16 +128,42 @@ export function register(registry) {
       // as "no limit".
       syncConfigQuota(db, config);
       rollQuota(db);
-      const rows = listQuota(db).map(quotaRowView);
+      const rows = listQuota(db).map((row) => quotaRowView(db, config, row));
       if (flags.json) return { code: 0, stdout: JSON.stringify(rows) };
       if (!rows.length) return { code: 0, stdout: 'no quota windows configured' };
       const lines = rows.map((r) => {
         const model = r.model ?? '*';
         const reqPart = r.limit_requests != null ? `requests ${r.used_requests}/${r.limit_requests}` : '';
-        const usdPart = r.limit_usd != null ? `usd ${r.used_usd.toFixed(2)}/${r.limit_usd.toFixed(2)}` : '';
+        const usdPart =
+          r.limit_usd != null
+            ? `usd ${r.used_usd.toFixed(2)}/${r.limit_usd.toFixed(2)} (reserved ${r.reserved_usd.toFixed(2)})`
+            : '';
         return `${r.provider} ${model} ${r.window_kind}  ${[reqPart, usdPart].filter(Boolean).join('  ')}  resets ${r.resets_at}  origin ${r.origin}`;
       });
       return { code: 0, stdout: lines.join('\n') };
+    },
+  });
+
+  registry.add('quota:clear', {
+    description: 'Delete a provider_quota window row (any source) - see docs/guards.md "Removing a window from config"',
+    handler({ db, flags, err }) {
+      const need = missing(flags, ['provider', 'window']);
+      if (need.length) {
+        return fail(err, 1, 'usage', `missing required flags: ${need.map((n) => '--' + n).join(', ')}`);
+      }
+      const model = flags.model ?? null;
+      const row = findQuotaRow(db, { provider: flags.provider, model, windowKind: flags.window });
+      if (!row) {
+        const detail = `no such quota window: ${flags.provider} ${model ?? '*'} ${flags.window}`;
+        if (flags.json) return { code: 0, stdout: JSON.stringify({ deleted: null }) };
+        return { code: 0, stdout: detail };
+      }
+      db.prepare('DELETE FROM provider_quota WHERE id = ?').run(row.id);
+      if (flags.json) return { code: 0, stdout: JSON.stringify({ deleted: row }) };
+      return {
+        code: 0,
+        stdout: `deleted ${row.provider} ${row.model ?? '*'} ${row.window_kind} (source ${row.source}, used_requests ${row.used_requests}, used_usd ${row.used_usd})`,
+      };
     },
   });
 
