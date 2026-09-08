@@ -101,13 +101,20 @@ function writeDone(outDir, exitCode, elapsedMs) {
  * value - dynamically, so a bad/attacker-controlled flag can never make this
  * process import an unintended file. Returns null (tee out.txt only, no
  * events.jsonl) when no adapter is named, the name is not on the allowlist,
- * or the module has no createStreamParser().
+ * or the module has no createStreamParser(). `cwd` (this run's own worktree,
+ * already known to `main()` below) is forwarded to every adapter's
+ * `createStreamParser({cwd})` so a tool call's own absolute-path input never
+ * reaches `args_summary`/`error` on disk verbatim (`relativizeToCwd`,
+ * `src/adapters/credential-boundary.mjs`) - a real run's `events.jsonl`
+ * captured the operator's own `D:\...` worktree path this way. Every
+ * adapter's `createStreamParser` treats a missing/undefined `cwd` as a
+ * no-op, so this is safe even for a module that predates this parameter.
  */
-async function loadParser(adapterName) {
+async function loadParser(adapterName, cwd) {
   if (!adapterName || !ADAPTER_NAMES.includes(adapterName)) return null;
   try {
     const mod = await import(`./${adapterName}.mjs`);
-    if (typeof mod.createStreamParser === 'function') return mod.createStreamParser();
+    if (typeof mod.createStreamParser === 'function') return mod.createStreamParser({ cwd });
   } catch {
     // no parser available - still tee stdout/stderr to out.txt below
   }
@@ -172,8 +179,25 @@ async function main() {
   writeFileSync(outPath, '');
   if (eventsPath) writeFileSync(eventsPath, '');
 
-  const parser = await loadParser(adapterName);
+  const parser = await loadParser(adapterName, cwd);
   let sawSessionEnd = false;
+  // The most recently appended session.end event object, kept around so
+  // `finish()` below can tell whether it already carries the *real*
+  // exit_code/elapsed_ms - not just whether one exists at all. Every
+  // adapter's own createStreamParser() can emit a session.end mid-stream
+  // (claude's final `result` line, codex's `turn.completed`, opencode's
+  // synthesized end-of-stream one) well before this runner's own child
+  // actually closes and the true exit code/elapsed time are known, and none
+  // of the three reports both fields correctly on its own: claude's carries
+  // a real exit_code but a `duration_ms` field, never `elapsed_ms`; codex's
+  // `turn.completed` session.end carries neither; opencode's raw-stream
+  // fallback (docs/adapters.md "opencode: parsing the real run --format
+  // json stream") explicitly reports both as `null`, deferring to the real
+  // process on purpose. Previously this runner treated "a session.end was
+  // already seen" as "nothing more to do", so none of the three ever got a
+  // corrected value once `sawSessionEnd` flipped true - see CHANGELOG.md
+  // "runner: patch the real exit_code/elapsed_ms onto session.end".
+  let lastSessionEndEvent = null;
 
   function appendOut(rawLine) {
     appendFileSync(outPath, `${redact(rawLine)}\n`);
@@ -183,7 +207,10 @@ async function main() {
     if (!eventsPath || !events || !events.length) return;
     let text = '';
     for (const event of events) {
-      if (event && event.type === 'session.end') sawSessionEnd = true;
+      if (event && event.type === 'session.end') {
+        sawSessionEnd = true;
+        lastSessionEndEvent = event;
+      }
       text += `${JSON.stringify(event)}\n`;
     }
     if (text) appendFileSync(eventsPath, text);
@@ -215,8 +242,24 @@ async function main() {
 
   function finish(exitCode) {
     const elapsedMs = Date.now() - startedAt;
-    if (parser && eventsPath && !sawSessionEnd) {
-      appendEvents([{ ts: new Date().toISOString(), type: 'session.end', exit_code: exitCode, elapsed_ms: elapsedMs }]);
+    if (parser && eventsPath) {
+      if (!sawSessionEnd) {
+        // No adapter ever reported a session.end at all - the pre-existing
+        // fallback, unchanged.
+        appendEvents([{ ts: new Date().toISOString(), type: 'session.end', exit_code: exitCode, elapsed_ms: elapsedMs }]);
+      } else if (lastSessionEndEvent.exit_code !== exitCode || lastSessionEndEvent.elapsed_ms !== elapsedMs) {
+        // A session.end was already written, but it does not carry the real
+        // spawned process's exit code and elapsed time (missing, null, or a
+        // harness-reported value that disagrees with what this runner
+        // itself just observed) - append one more, corrected line rather
+        // than rewriting the one already on disk (events.jsonl is append
+        // only everywhere else in this kit). `ingest`/any other consumer
+        // that wants "the" session.end already takes the *last* line of
+        // this type in the file, so this corrected line is the one that
+        // wins, while every other field the original event carried (tokens,
+        // cost, session_id, unparsed_lines, ...) is preserved.
+        appendEvents([{ ...lastSessionEndEvent, ts: new Date().toISOString(), exit_code: exitCode, elapsed_ms: elapsedMs }]);
+      }
     }
     writeDone(outDir, exitCode, elapsedMs);
     process.exit(0);

@@ -7,7 +7,7 @@
 import { spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { filterEnv, redact } from './credential-boundary.mjs';
+import { filterEnv, redact, relativizeToCwd } from './credential-boundary.mjs';
 import { applyResolvedCommand, resolveConfiguredCommand } from './resolve-command.mjs';
 
 const ARGS_SUMMARY_MAX = 200;
@@ -50,8 +50,17 @@ export function buildArgv({ prompt, cwd, model, allowedTools, auth, cmd, argsPre
   };
 }
 
-function capSummary(value) {
-  const text = typeof value === 'string' ? value : JSON.stringify(value ?? {});
+/**
+ * `cwd`, when given, relativizes any string in `value` equal to or starting
+ * with it (`relativizeToCwd`, `src/adapters/credential-boundary.mjs`)
+ * before redaction/capping - a tool call's own input (e.g. `Read`'s
+ * `file_path`) is frequently the run's absolute worktree path or a path
+ * under it, which must never reach `args_summary`/`error` on disk verbatim
+ * (see CHANGELOG.md "tool args relative to cwd").
+ */
+function capSummary(value, cwd) {
+  const relativized = cwd ? relativizeToCwd(value, cwd) : value;
+  const text = typeof relativized === 'string' ? relativized : JSON.stringify(relativized ?? {});
   const safe = redact(text);
   return safe.length > ARGS_SUMMARY_MAX ? safe.slice(0, ARGS_SUMMARY_MAX) : safe;
 }
@@ -80,7 +89,7 @@ function capSummary(value) {
  *   harness's own final text, capped and redacted) used to build a run
  *   summary.
  */
-export function createStreamParser() {
+export function createStreamParser({ cwd } = {}) {
   let sessionId = null;
   const toolNameById = new Map();
 
@@ -107,17 +116,17 @@ export function createStreamParser() {
       const content = Array.isArray(message.content) ? message.content : [];
 
       if (obj.parent_tool_use_id) {
-        events.push({ ts, type: 'tool.call', tool: 'subagent', args_summary: capSummary(message.role ?? obj.type) });
+        events.push({ ts, type: 'tool.call', tool: 'subagent', args_summary: capSummary(message.role ?? obj.type, cwd) });
       }
 
       for (const block of content) {
         if (block.type === 'tool_use') {
           toolNameById.set(block.id, block.name);
-          events.push({ ts, type: 'tool.call', tool: block.name, args_summary: capSummary(block.input) });
+          events.push({ ts, type: 'tool.call', tool: block.name, args_summary: capSummary(block.input, cwd) });
         } else if (block.type === 'tool_result') {
           const ok = block.is_error !== true;
           const event = { ts, type: 'tool.result', tool: toolNameById.get(block.tool_use_id) ?? null, ok };
-          if (!ok) event.error = capSummary(block.content);
+          if (!ok) event.error = capSummary(block.content, cwd);
           events.push(event);
         }
       }
@@ -146,7 +155,7 @@ export function createStreamParser() {
         cost_usd: obj.total_cost_usd ?? 0,
         requests: obj.num_turns ?? 0,
         duration_ms: obj.duration_ms ?? null,
-        result_excerpt: typeof obj.result === 'string' ? capSummary(obj.result).slice(0, 300) : null,
+        result_excerpt: typeof obj.result === 'string' ? capSummary(obj.result, cwd).slice(0, 300) : null,
       });
       return events;
     }
@@ -163,15 +172,19 @@ export function createStreamParser() {
 }
 
 /**
- * parseStream(lines) -> normalized events, batch form. `lines` may be an
- * array of raw JSON text lines or a single newline delimited string; blank
- * and unparsable lines are skipped. A thin wrapper over createStreamParser()
- * kept for the existing unit tests (and any other caller that already has
- * the whole stream in hand, e.g. run()'s own non-detached path below) - see
- * createStreamParser()'s own doc comment for the translation rules.
+ * parseStream(lines, { cwd }) -> normalized events, batch form. `lines` may
+ * be an array of raw JSON text lines or a single newline delimited string;
+ * blank and unparsable lines are skipped. A thin wrapper over
+ * createStreamParser() kept for the existing unit tests (and any other
+ * caller that already has the whole stream in hand, e.g. run()'s own
+ * non-detached path below) - see createStreamParser()'s own doc comment for
+ * the translation rules. `cwd`, forwarded straight through, keeps a tool
+ * call's own absolute-path input out of `args_summary`/`error` (see
+ * `capSummary`/`relativizeToCwd`); omitted, every existing caller behaves
+ * exactly as before.
  */
-export function parseStream(lines) {
-  const parser = createStreamParser();
+export function parseStream(lines, { cwd } = {}) {
+  const parser = createStreamParser({ cwd });
   const list = Array.isArray(lines) ? lines : String(lines ?? '').split('\n');
   const events = [];
   for (const raw of list) events.push(...parser.push(raw));
@@ -222,7 +235,7 @@ export async function run(opts) {
   if (timer) clearTimeout(timer);
   const elapsedMs = Date.now() - start;
 
-  const events = parseStream(stdout.split('\n'));
+  const events = parseStream(stdout.split('\n'), { cwd });
   for (const event of events) onEvent?.(event);
 
   writeFileSync(join(outDir, 'events.jsonl'), events.map((e) => JSON.stringify(e)).join('\n') + (events.length ? '\n' : ''));

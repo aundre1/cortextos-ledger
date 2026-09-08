@@ -4,14 +4,23 @@
 import { spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { filterEnv, redact } from './credential-boundary.mjs';
+import { filterEnv, redact, relativizeToCwd } from './credential-boundary.mjs';
 import { applyResolvedCommand, resolveConfiguredCommand } from './resolve-command.mjs';
 
 const ARGS_SUMMARY_MAX = 200;
 const TOOL_ITEM_TYPES = new Set(['command_execution', 'file_change', 'mcp_tool_call']);
 
-function capSummary(value) {
-  const text = typeof value === 'string' ? value : JSON.stringify(value ?? {});
+/**
+ * `cwd`, when given, relativizes any string in `value` equal to or starting
+ * with it (`relativizeToCwd`, `src/adapters/credential-boundary.mjs`)
+ * before redaction/capping - a `command_execution`/`file_change` item's own
+ * `command`/`path` is frequently the run's absolute worktree path or a path
+ * under it, which must never reach `args_summary`/`error` on disk verbatim
+ * (see CHANGELOG.md "tool args relative to cwd").
+ */
+function capSummary(value, cwd) {
+  const relativized = cwd ? relativizeToCwd(value, cwd) : value;
+  const text = typeof relativized === 'string' ? relativized : JSON.stringify(relativized ?? {});
   const safe = redact(text);
   return safe.length > ARGS_SUMMARY_MAX ? safe.slice(0, ARGS_SUMMARY_MAX) : safe;
 }
@@ -92,7 +101,7 @@ export function buildArgv({ prompt, cwd, sandbox, readOnly, outDir, resumeThread
  *   are visibly missing rather than silently wrong", docs/adapters.md) is
  *   `flush()`'s job, not `push()`'s.
  */
-export function createStreamParser() {
+export function createStreamParser({ cwd } = {}) {
   let sessionId = null;
   let sawUsage = false;
 
@@ -118,7 +127,7 @@ export function createStreamParser() {
           ts,
           type: 'tool.call',
           tool: obj.item.type,
-          args_summary: capSummary(obj.item.command ?? obj.item.path ?? obj.item),
+          args_summary: capSummary(obj.item.command ?? obj.item.path ?? obj.item, cwd),
         },
       ];
     }
@@ -126,7 +135,7 @@ export function createStreamParser() {
     if (obj.type === 'item.completed' && obj.item && TOOL_ITEM_TYPES.has(obj.item.type)) {
       const ok = obj.item.exit_code === undefined || obj.item.exit_code === 0;
       const event = { ts, type: 'tool.result', tool: obj.item.type, ok };
-      if (!ok) event.error = capSummary(obj.item.error ?? obj.item.aggregated_output ?? '');
+      if (!ok) event.error = capSummary(obj.item.error ?? obj.item.aggregated_output ?? '', cwd);
       return [event];
     }
 
@@ -174,13 +183,16 @@ export function createStreamParser() {
 }
 
 /**
- * parseStream(lines) -> normalized events, batch form. A thin wrapper over
- * createStreamParser() kept for the existing unit tests (and run()'s own
- * non-detached path below) - see createStreamParser()'s doc comment for the
- * translation rules.
+ * parseStream(lines, { cwd }) -> normalized events, batch form. A thin
+ * wrapper over createStreamParser() kept for the existing unit tests (and
+ * run()'s own non-detached path below) - see createStreamParser()'s doc
+ * comment for the translation rules. `cwd`, forwarded straight through,
+ * keeps a tool item's own absolute-path `command`/`path` out of
+ * `args_summary`/`error` (see `capSummary`/`relativizeToCwd`); omitted,
+ * every existing caller behaves exactly as before.
  */
-export function parseStream(lines) {
-  const parser = createStreamParser();
+export function parseStream(lines, { cwd } = {}) {
+  const parser = createStreamParser({ cwd });
   const list = Array.isArray(lines) ? lines : String(lines ?? '').split('\n');
   const events = [];
   for (const raw of list) events.push(...parser.push(raw));
@@ -232,7 +244,7 @@ export async function run(opts) {
   if (timer) clearTimeout(timer);
   const elapsedMs = Date.now() - start;
 
-  const events = parseStream(stdout.split('\n'));
+  const events = parseStream(stdout.split('\n'), { cwd });
   for (const event of events) onEvent?.(event);
 
   // The NDJSON stream has no real subprocess exit code of its own; patch the

@@ -85,3 +85,35 @@ export function redact(text) {
   }
   return out;
 }
+
+/**
+ * Rewrites every string in `value` that is, or starts with, the run's own
+ * absolute `cwd` (the worktree path) to a `.`-relative one - recursing
+ * through plain objects and arrays, leaving every other value untouched.
+ * `cwd` itself becomes `.`; `<cwd>/sub/path` or `<cwd>\sub\path` becomes
+ * `./sub/path` / `.\sub\path` (whichever separator the original string
+ * used). A real run captured a tool's own `args_summary` containing the
+ * operator's absolute worktree path verbatim (a `D:\...` path on Windows -
+ * see CHANGELOG.md "tool args relative to cwd") - this is what every
+ * adapter's own tool-call/tool-result summarizer now runs a value through,
+ * before `redact()`/capping, whenever it knows the run's `cwd`. No-op (the
+ * value is returned exactly as given) when `cwd` is falsy, so every caller
+ * that has never passed one - every existing unit test included - keeps
+ * behaving exactly as before.
+ */
+export function relativizeToCwd(value, cwd) {
+  if (!cwd) return value;
+  if (typeof value === 'string') {
+    if (value === cwd) return '.';
+    if (value.startsWith(`${cwd}/`)) return `.${value.slice(cwd.length)}`;
+    if (value.startsWith(`${cwd}\\`)) return `.${value.slice(cwd.length)}`;
+    return value;
+  }
+  if (Array.isArray(value)) return value.map((v) => relativizeToCwd(v, cwd));
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = relativizeToCwd(v, cwd);
+    return out;
+  }
+  return value;
+}

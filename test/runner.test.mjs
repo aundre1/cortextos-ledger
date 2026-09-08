@@ -180,6 +180,119 @@ test('runner: malformed --initial-events is ignored rather than breaking the lau
   assert.ok(existsSync(join(outDir, 'done.marker')));
 });
 
+// ---------------------------------------------------------------------------
+// Regression: the final on-disk session.end line must carry the real
+// exit_code and elapsed_ms, for every adapter. Before this fix, once ANY
+// adapter's own createStreamParser() had reported a session.end at all
+// (mid-stream, via push() - true for all three real adapters, not just
+// opencode's synthesized end-of-stream one), this runner treated
+// `sawSessionEnd` as "nothing more to do" and never patched in the real
+// values it alone knows (the watchdog reads exit.txt for exit; measurement
+// reads elapsed time). None of the three adapters' own raw harness output
+// reports both fields correctly on its own: opencode's raw-stream fallback
+// reports both as null on purpose; codex's `turn.completed` session.end
+// reports neither; claude's final `result` line reports a real exit_code
+// but calls the field `duration_ms`, never `elapsed_ms`.
+// ---------------------------------------------------------------------------
+
+function lastSessionEnd(eventsPath) {
+  const lines = readFileSync(eventsPath, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  const ends = lines.filter((e) => e.type === 'session.end');
+  return ends[ends.length - 1];
+}
+
+function runStubHarness({ adapterName, script, exitCode }) {
+  const outDir = makeTempDir();
+  const cwd = makeTempDir();
+  const eventsPath = join(outDir, 'events.jsonl');
+  const result = runRunner([
+    '--out', outDir,
+    '--cwd', cwd,
+    '--adapter', adapterName,
+    '--events', eventsPath,
+    '--',
+    process.execPath, '-e', `${script}\nsetTimeout(() => process.exit(${exitCode}), 30);`,
+  ]);
+  assert.equal(result.status, 0, result.stderr);
+  const realExit = Number(readFileSync(join(outDir, 'exit.txt'), 'utf8').trim());
+  const realElapsed = Number(readFileSync(join(outDir, 'elapsed_ms.txt'), 'utf8').trim());
+  return { end: lastSessionEnd(eventsPath), realExit, realElapsed };
+}
+
+test('runner: opencode - the raw stream\'s null exit_code/elapsed_ms on session.end are patched with the real values', () => {
+  const script = [
+    `console.log(${JSON.stringify(JSON.stringify({ type: 'step_start', sessionID: 'ses_runner_test' }))});`,
+    `console.log(${JSON.stringify(
+      JSON.stringify({
+        type: 'step_finish',
+        sessionID: 'ses_runner_test',
+        part: { type: 'step-finish', tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } }, cost: 0 },
+      })
+    )});`,
+  ].join('\n');
+
+  const { end, realExit, realElapsed } = runStubHarness({ adapterName: 'opencode', script, exitCode: 5 });
+  assert.ok(end, 'events.jsonl should contain a session.end line');
+  assert.equal(end.exit_code, 5);
+  assert.equal(end.exit_code, realExit);
+  assert.equal(typeof end.elapsed_ms, 'number');
+  assert.ok(end.elapsed_ms >= 0);
+  // The corrected line still carries whatever the original one reported.
+  assert.equal(end.tokens_in, 10);
+  assert.equal(end.session_id, 'ses_runner_test');
+  void realElapsed;
+});
+
+test('runner: codex - turn.completed\'s session.end (missing exit_code and elapsed_ms entirely) is patched with the real values', () => {
+  const script = [
+    `console.log(${JSON.stringify(JSON.stringify({ type: 'thread.started', thread_id: 'th_runner_test' }))});`,
+    `console.log(${JSON.stringify(
+      JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 20, output_tokens: 8 } })
+    )});`,
+  ].join('\n');
+
+  const { end, realExit } = runStubHarness({ adapterName: 'codex', script, exitCode: 3 });
+  assert.ok(end, 'events.jsonl should contain a session.end line');
+  assert.equal(end.exit_code, 3);
+  assert.equal(end.exit_code, realExit);
+  assert.equal(typeof end.elapsed_ms, 'number');
+  assert.ok(end.elapsed_ms >= 0);
+  assert.equal(end.tokens_in, 20);
+  assert.equal(end.usage_source, 'reported');
+});
+
+test('runner: claude - the final result line reports a real exit_code but only "duration_ms", never "elapsed_ms" - patched onto the on-disk line', () => {
+  const script = [
+    `console.log(${JSON.stringify(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess_runner_test' }))});`,
+    `console.log(${JSON.stringify(
+      JSON.stringify({
+        type: 'result',
+        session_id: 'sess_runner_test',
+        is_error: false,
+        usage: { input_tokens: 7, output_tokens: 2 },
+        total_cost_usd: 0.001,
+        num_turns: 1,
+        duration_ms: 999,
+      })
+    )});`,
+  ].join('\n');
+
+  // is_error: false -> claude.mjs's own session.end already reports
+  // exit_code 0, which happens to already agree with the real spawned
+  // process's exit code below - only elapsed_ms is genuinely missing.
+  const { end, realExit } = runStubHarness({ adapterName: 'claude', script, exitCode: 0 });
+  assert.ok(end, 'events.jsonl should contain a session.end line');
+  assert.equal(end.exit_code, 0);
+  assert.equal(end.exit_code, realExit);
+  assert.equal(typeof end.elapsed_ms, 'number');
+  assert.ok(end.elapsed_ms >= 0);
+  assert.equal(end.duration_ms, 999, 'the harness\'s own duration_ms is untouched');
+  assert.equal(end.tokens_in, 7);
+});
+
 test('runner: normal completion (no pre-existing exit.txt) still writes the real exit code', () => {
   const outDir = makeTempDir();
   const cwd = makeTempDir();

@@ -341,6 +341,63 @@ asserting one `cost_usage` row with `tokens_in` 58646, `tokens_out` 145,
 `cost_usd` 0). `npm test`: 351/351. `node scripts/check-syntax.mjs`: 100
 files, 0 failures. `node scripts/publish-check.mjs`: clean.
 
+### Real-run regressions from E2-3: session.end's real exit/elapsed, tool args relative to cwd
+
+A real Windows run at commit `ec3dc36` (ingest correctly recorded tokens_in
+58698, tokens_out 125, 1 tool call, 2 requests - the E2-3 parser itself
+worked) exposed two regressions:
+
+1. **`events.jsonl`'s on-disk `session.end` never carried the real
+   `exit_code`/`elapsed_ms`** (`"exit_code":null,"elapsed_ms":null` on
+   disk), where before `ec3dc36` it always had real values. Root cause,
+   `src/adapters/runner.mjs`: once *any* event of type `session.end` had
+   been appended live (from any adapter's `createStreamParser().push()` or
+   `flush()`), the runner treated that as "nothing more to do" and skipped
+   its own end-of-process fallback that knows the real exit code and
+   elapsed time - it never checked whether the session.end it already saw
+   actually carried real values. This was not opencode-specific: `codex.mjs`'s
+   `turn.completed` session.end has never carried `exit_code` or
+   `elapsed_ms` at all, and `claude.mjs`'s final `result` line carries a
+   real `exit_code` but calls its own timing field `duration_ms`, never
+   `elapsed_ms` - both adapters' *real* production launches (which always go
+   through `runner.mjs`, per review round 1's "one launch path") have
+   silently had this gap since that path was introduced; it surfaced now
+   only because this was the first real, non-fixture-driven capture.
+   Fixed: `runner.mjs` now tracks the most recently appended `session.end`
+   event object and, at the real process's `close`, appends one more
+   corrected `session.end` line (preserving every other field the original
+   carried - tokens, cost, session_id, ...) whenever its `exit_code`/
+   `elapsed_ms` disagree with what the runner itself just observed.
+   `ingest`/any consumer that wants "the" session.end already takes the
+   *last* line of that type in the file, so the corrected line wins. Test:
+   3 new in `test/runner.test.mjs`, one per adapter, each spawning a real
+   stub harness through the real `runner.mjs` binary and asserting the
+   final on-disk `session.end` line's `exit_code` matches the real spawned
+   process's and `elapsed_ms` is a real number.
+2. **A tool's `args_summary` could contain the operator's absolute worktree
+   path verbatim** (a `D:\...` path on the reference Windows run, from
+   `read`'s own `state.input.filePath`) - personal information landing in
+   `events.jsonl`. Fixed with a new shared helper,
+   `relativizeToCwd(value, cwd)` (`src/adapters/credential-boundary.mjs`):
+   recurses through an object/array, rewriting any string equal to or
+   starting with `cwd` to a `.`-relative one. Wired into all three real
+   adapters' tool-call/tool-result summarizers (`claude.mjs`'s and
+   `codex.mjs`'s `capSummary`, `opencode.mjs`'s `capText`) and threaded
+   through each `createStreamParser({ cwd })`/`parseStream(lines, { cwd })`;
+   `runner.mjs`'s `loadParser` now passes the run's own `--cwd` through so
+   the real production path is covered too. A falsy/omitted `cwd` is a
+   no-op, so every pre-existing caller (every existing unit test included)
+   behaves exactly as before. Test: 8 new in `test/adapters.test.mjs`
+   (opencode's tool_use path relativized exactly and as a subpath, the real
+   fixture relativized end to end, the no-`cwd` case left unchanged) and 8
+   new in `test/credential-boundary.test.mjs` (`relativizeToCwd` itself:
+   exact match, both path separators, a false-prefix near-miss left alone,
+   recursion through nested objects/arrays, the falsy-`cwd` no-op, and
+   non-string/object values passed through untouched).
+
+`npm test`: 367/367 (351 + 16 new). `node scripts/check-syntax.mjs`: 100
+files, 0 failures. `node scripts/publish-check.mjs`: clean.
+
 ### Known limitations (open questions carried forward)
 
 Everything below is a wave log `OPEN QUESTION` that is still open after the

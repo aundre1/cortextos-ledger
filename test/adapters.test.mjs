@@ -536,6 +536,79 @@ test('opencode createStreamParser: the "agent not found" fallback text still wor
   assert.equal(events[0].type, 'agent.fallback');
 });
 
+// ---------------------------------------------------------------------------
+// opencode: tool args_summary must never contain the operator's absolute
+// worktree path - a real run captured `read`'s own `state.input.filePath`
+// verbatim (a `D:\...` path on Windows). createStreamParser({ cwd }) now
+// relativizes it (relativizeToCwd, src/adapters/credential-boundary.mjs).
+// ---------------------------------------------------------------------------
+
+const FAKE_ABS_CWD = 'D:\\CoWork\\Community\\_scratch\\oc-smoke-fake\\worktree';
+// A personal path survives however many rounds of JSON escaping the value
+// passes through (args_summary is itself a JSON.stringify'd string embedded
+// as a field of an event object that is later JSON.stringify'd again to
+// write events.jsonl) - a plain-letters substring like this one is the
+// leak-detection check that stays meaningful regardless of how many
+// backslashes get doubled along the way; `JSON.stringify(FAKE_ABS_CWD)`
+// (minus its surrounding quotes) is used wherever a test needs the exact
+// one-level-escaped form instead.
+const CWD_TELLTALE = 'CoWork';
+const ESCAPED_CWD = JSON.stringify(FAKE_ABS_CWD).slice(1, -1);
+
+function realToolUseLine(filePath) {
+  return JSON.stringify({
+    type: 'tool_use',
+    sessionID: 'ses_cwd_test',
+    part: {
+      type: 'tool',
+      tool: 'read',
+      callID: 'read:0',
+      state: { status: 'completed', input: { filePath }, output: `<path>${filePath}</path>`, time: { start: 1, end: 5 } },
+    },
+  });
+}
+
+test('opencode createStreamParser: with no cwd given, args_summary still contains the absolute path (documents the pre-fix shape)', () => {
+  const parser = opencode.createStreamParser();
+  const events = parser.push(realToolUseLine(FAKE_ABS_CWD));
+  const call = events.find((e) => e.type === 'tool.call');
+  assert.ok(call.args_summary.includes(CWD_TELLTALE));
+  assert.ok(call.args_summary.includes(ESCAPED_CWD));
+});
+
+test('opencode createStreamParser({ cwd }): args_summary is relativized when the tool input path equals cwd exactly', () => {
+  const parser = opencode.createStreamParser({ cwd: FAKE_ABS_CWD });
+  const events = parser.push(realToolUseLine(FAKE_ABS_CWD));
+  const call = events.find((e) => e.type === 'tool.call');
+  assert.equal(call.args_summary.includes(CWD_TELLTALE), false, 'the absolute cwd must never reach args_summary');
+  assert.ok(call.args_summary.includes('"filePath":"."'), `expected a "." relative path, got: ${call.args_summary}`);
+});
+
+test('opencode createStreamParser({ cwd }): args_summary is relativized when the tool input path is a subpath of cwd', () => {
+  const parser = opencode.createStreamParser({ cwd: FAKE_ABS_CWD });
+  const events = parser.push(realToolUseLine(`${FAKE_ABS_CWD}\\src\\x.mjs`));
+  const call = events.find((e) => e.type === 'tool.call');
+  assert.equal(call.args_summary.includes(CWD_TELLTALE), false);
+  assert.equal(call.args_summary, '{"filePath":".\\\\src\\\\x.mjs"}');
+});
+
+test('opencode parseStream(lines, { cwd }): the real fixture with a fake absolute cwd substituted for <worktree> is relativized end to end', () => {
+  // Backslashes must be doubled to stay valid inside the JSON text itself -
+  // the `cwd` passed to parseStream is the real (single-backslash) string.
+  const jsonEscapedCwd = FAKE_ABS_CWD.replace(/\\/g, '\\\\');
+  const raw = readFixtureLines('opencode-run.real.jsonl').map((l) => l.replaceAll('<worktree>', jsonEscapedCwd));
+  const events = opencode.parseStream(raw, { cwd: FAKE_ABS_CWD });
+  const call = events.find((e) => e.type === 'tool.call');
+  assert.ok(call, 'the read tool.call should still be produced');
+  assert.equal(JSON.stringify(events).includes(CWD_TELLTALE), false, 'no event may contain the absolute cwd once cwd is known');
+});
+
+test('opencode parseStream: omitting { cwd } is a no-op - unaffected callers (every pre-existing test) behave exactly as before', () => {
+  const events = opencode.parseStream(readFixtureLines('opencode-run.real.jsonl'));
+  const call = events.find((e) => e.type === 'tool.call');
+  assert.ok(call.args_summary.length <= 200);
+});
+
 test('opencode parseStream: fixture (already-normalized plugin events) gives expected counts and redacts secrets', () => {
   const events = opencode.parseStream(readFixtureLines('opencode-events.jsonl'));
   const byType = (t) => events.filter((e) => e.type === t);

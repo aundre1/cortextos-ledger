@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { filterEnv, rejectAnthropicModel, redact, PATTERNS } from '../src/adapters/credential-boundary.mjs';
+import { filterEnv, rejectAnthropicModel, redact, relativizeToCwd, PATTERNS } from '../src/adapters/credential-boundary.mjs';
 
 const BASE_ENV = {
   ANTHROPIC_API_KEY: 'sk-ant-secret',
@@ -135,4 +135,53 @@ for (const [text, shouldRedact] of REDACT_CASES) {
 test('redact: is non-destructive on non-string input', () => {
   assert.equal(redact(undefined), undefined);
   assert.equal(redact(42), 42);
+});
+
+// ---------------------------------------------------------------------------
+// relativizeToCwd - a tool's own captured input/output must never leak the
+// operator's absolute worktree path into events.jsonl (a real run captured
+// a `D:\...` path verbatim - see CHANGELOG.md "tool args relative to cwd").
+// ---------------------------------------------------------------------------
+
+const FAKE_CWD = 'D:\\CoWork\\Community\\_scratch\\oc-smoke-fake\\worktree';
+
+test('relativizeToCwd: a string exactly equal to cwd becomes "."', () => {
+  assert.equal(relativizeToCwd(FAKE_CWD, FAKE_CWD), '.');
+});
+
+test('relativizeToCwd: a string starting with cwd + a backslash becomes a "." relative path', () => {
+  assert.equal(relativizeToCwd(`${FAKE_CWD}\\src\\x.mjs`, FAKE_CWD), '.\\src\\x.mjs');
+});
+
+test('relativizeToCwd: a string starting with cwd + a forward slash becomes a "." relative path (posix cwd)', () => {
+  assert.equal(relativizeToCwd('/work/repo/src/x.mjs', '/work/repo'), './src/x.mjs');
+});
+
+test('relativizeToCwd: a string that merely shares a prefix with cwd (not a real path boundary) is left alone', () => {
+  // "/work2" is not "/work" plus a separator - must not be mistaken for a
+  // path under it.
+  assert.equal(relativizeToCwd('/work2/x.mjs', '/work'), '/work2/x.mjs');
+});
+
+test('relativizeToCwd: a string unrelated to cwd is left alone', () => {
+  assert.equal(relativizeToCwd('just some text', FAKE_CWD), 'just some text');
+});
+
+test('relativizeToCwd: recurses through nested objects and arrays (the real regression shape - a tool_use state.input object)', () => {
+  const input = { filePath: FAKE_CWD, tags: [`${FAKE_CWD}\\a.txt`, 'unrelated'], nested: { path: `${FAKE_CWD}\\b.txt` } };
+  const out = relativizeToCwd(input, FAKE_CWD);
+  assert.deepEqual(out, { filePath: '.', tags: ['.\\a.txt', 'unrelated'], nested: { path: '.\\b.txt' } });
+});
+
+test('relativizeToCwd: no-op (returns the value unchanged) when cwd is falsy - every pre-existing caller behaves exactly as before', () => {
+  const input = { filePath: FAKE_CWD };
+  assert.equal(relativizeToCwd(FAKE_CWD, undefined), FAKE_CWD);
+  assert.equal(relativizeToCwd(FAKE_CWD, ''), FAKE_CWD);
+  assert.deepEqual(relativizeToCwd(input, null), input);
+});
+
+test('relativizeToCwd: non-string, non-object, non-array values pass through untouched', () => {
+  assert.equal(relativizeToCwd(42, FAKE_CWD), 42);
+  assert.equal(relativizeToCwd(null, FAKE_CWD), null);
+  assert.equal(relativizeToCwd(true, FAKE_CWD), true);
 });

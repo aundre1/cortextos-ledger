@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { filterEnv, rejectAnthropicModel, redact } from './credential-boundary.mjs';
+import { filterEnv, rejectAnthropicModel, redact, relativizeToCwd } from './credential-boundary.mjs';
 import { applyResolvedCommand, resolveConfiguredCommand } from './resolve-command.mjs';
 
 const ARGS_SUMMARY_MAX = 200;
@@ -50,8 +50,18 @@ const REPO_ROOT = path.join(HERE, '..', '..');
 const AGENT_NOT_FOUND_RE = /agent "([^"]+)" not found\. Falling back to default agent/;
 const AGENT_SUBAGENT_RE = /agent "([^"]+)" is a subagent, not a primary agent\. Falling back to default agent/;
 
-function capText(value) {
-  const text = typeof value === 'string' ? value : JSON.stringify(value ?? {});
+/**
+ * `cwd`, when given, relativizes any string in `value` equal to or starting
+ * with it (see `relativizeToCwd`) before redaction/capping - a real run
+ * captured `read`'s own `state.input.filePath` as the operator's literal
+ * absolute worktree path (a `D:\...` path on Windows); this is how it never
+ * reaches `args_summary`/`error` on disk again. `redact()` still runs
+ * unconditionally afterward (secrets patterns are not paths and are not
+ * cwd-shaped).
+ */
+function capText(value, cwd) {
+  const relativized = cwd ? relativizeToCwd(value, cwd) : value;
+  const text = typeof relativized === 'string' ? relativized : JSON.stringify(relativized ?? {});
   const safe = redact(text);
   return safe.length > ARGS_SUMMARY_MAX ? safe.slice(0, ARGS_SUMMARY_MAX) : safe;
 }
@@ -499,7 +509,7 @@ function toolMs(part) {
  * agent`, plain text, never JSON) keeps working exactly as before - it is
  * matched in the `JSON.parse` catch branch, ahead of anything above.
  */
-export function createStreamParser() {
+export function createStreamParser({ cwd } = {}) {
   let sessionId = null;
   let sessionEmitted = false;
   let sawNormalizedSessionEnd = false;
@@ -557,9 +567,9 @@ export function createStreamParser() {
 
     if (NORMALIZED_TYPES.has(obj.type)) {
       const event = { ...obj };
-      if (typeof event.args_summary === 'string') event.args_summary = capText(event.args_summary);
-      if (typeof event.error === 'string') event.error = capText(event.error);
-      if (typeof event.message === 'string') event.message = capText(event.message);
+      if (typeof event.args_summary === 'string') event.args_summary = capText(event.args_summary, cwd);
+      if (typeof event.error === 'string') event.error = capText(event.error, cwd);
+      if (typeof event.message === 'string') event.message = capText(event.message, cwd);
       if (event.type === 'session.end') sawNormalizedSessionEnd = true;
       return [event];
     }
@@ -590,10 +600,10 @@ export function createStreamParser() {
             type: 'tool.call',
             tool: part.tool ?? null,
             call_id: part.callID ?? null,
-            args_summary: capText(part.state?.input ?? {}),
+            args_summary: capText(part.state?.input ?? {}, cwd),
           });
           const resultEvent = { ts, type: 'tool.result', tool: part.tool ?? null, call_id: part.callID ?? null, ok, ms: toolMs(part) };
-          if (!ok) resultEvent.error = capText(part.state?.error ?? part.state?.output ?? '');
+          if (!ok) resultEvent.error = capText(part.state?.error ?? part.state?.output ?? '', cwd);
           events.push(resultEvent);
         }
         // Any other status (still running) is a known, expected shape for
@@ -636,7 +646,7 @@ export function createStreamParser() {
           severity: 'halt',
           name: err.name ?? null,
           statusCode: data.statusCode ?? err.statusCode ?? null,
-          message: capText(data.message ?? err.message ?? ''),
+          message: capText(data.message ?? err.message ?? '', cwd),
         });
         break;
       }
@@ -676,13 +686,16 @@ export function createStreamParser() {
 }
 
 /**
- * parseStream(lines) -> normalized events, batch form. A thin wrapper over
- * createStreamParser() kept for the existing unit tests (and run()'s own
- * non-detached path below) - see createStreamParser()'s doc comment for the
- * translation rules.
+ * parseStream(lines, { cwd }) -> normalized events, batch form. A thin
+ * wrapper over createStreamParser() kept for the existing unit tests (and
+ * run()'s own non-detached path below) - see createStreamParser()'s doc
+ * comment for the translation rules. `cwd`, when given, is forwarded
+ * straight through so a tool's `args_summary` never leaks the run's own
+ * absolute worktree path (see `capText`/`relativizeToCwd`); omitted, every
+ * existing caller (every unit test included) behaves exactly as before.
  */
-export function parseStream(lines) {
-  const parser = createStreamParser();
+export function parseStream(lines, { cwd } = {}) {
+  const parser = createStreamParser({ cwd });
   const list = Array.isArray(lines) ? lines : String(lines ?? '').split('\n');
   const events = [];
   for (const raw of list) events.push(...parser.push(raw));
@@ -741,7 +754,7 @@ export async function run(opts) {
   if (timer) clearTimeout(timer);
   const elapsedMs = Date.now() - start;
 
-  const parsedEvents = parseStream(stdout.split('\n'));
+  const parsedEvents = parseStream(stdout.split('\n'), { cwd });
   // The raw-stream `session.end` createStreamParser() synthesizes in
   // flush() reports `exit_code`/`elapsed_ms` as `null` - that stream never
   // carries either - patched here from the real spawned process, the same
