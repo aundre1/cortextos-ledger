@@ -30,31 +30,39 @@ set:
 `agents.builder.model`/`agents.solo.model` must not contain `anthropic` or
 `claude` -- `src/adapters/opencode.mjs` refuses those with exit 1.
 
-## 1. Create the ledger and the OpenCode Go quota windows, once
+## 1. Create the ledger, once
 
 ```bash
 cortexctl init --config examples/config.opencode-go.json
-
-cortexctl quota:set --config examples/config.opencode-go.json \
-  --provider opencode-go --window 5h    --limit-usd 12
-cortexctl quota:set --config examples/config.opencode-go.json \
-  --provider opencode-go --window week  --limit-usd 30
-cortexctl quota:set --config examples/config.opencode-go.json \
-  --provider opencode-go --window month --limit-usd 60
 ```
 
-The config file's `providers.opencode-go.windows` block documents this same
-shape, but declaring it in JSON does not by itself enforce anything --
-`run:start`'s quota gate and `ingest` read `provider_quota` rows from the
-database, and only `quota:set` creates those. Skipping this step means the
-measurement can spend past the subscription's own ceiling without the kit
-ever refusing a run.
-
-Check headroom at any point, across all 20 tasks, with:
+`examples/config.opencode-go.json`'s `providers.opencode-go.windows` block
+(5h/week/month, matching the OpenCode Go subscription's own ceilings) is
+enforced by `run:start`'s quota gate and by `ingest` directly from the
+config file -- no `quota:set` call is required for these three windows to
+be real limits. Check headroom at any point, across all 20 tasks, with:
 
 ```bash
 cortexctl quota:show --config examples/config.opencode-go.json
 ```
+
+`quota:show`'s `origin` column reads `config` for these three windows,
+confirming the ceiling in effect came from the config file rather than a
+manual override.
+
+`quota:set` is still there as an optional override for this run only --
+useful to tighten a window below the config's own number (an
+already-partway-through-the-billing-period subscription, say) without
+editing the shared config file:
+
+```bash
+cortexctl quota:set --config examples/config.opencode-go.json \
+  --provider opencode-go --window 5h --limit-usd 8
+```
+
+A window set this way shows `origin quota:set` in `quota:show` and is never
+overwritten by the config file again, even if the config's own number for
+that window later changes.
 
 ## 2. Per PR: open the control task, one reviewer, no builder
 

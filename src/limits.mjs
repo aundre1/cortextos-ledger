@@ -13,7 +13,7 @@ import {
   insertEscalation,
   insertIntervention,
 } from './ledger.mjs';
-import { rollQuota } from './quota.mjs';
+import { rollQuota, syncConfigQuota } from './quota.mjs';
 
 // ---------------------------------------------------------------------------
 // Attempts (docs/state-machine.md "Attempt counting")
@@ -101,8 +101,16 @@ export function checkSpend(db, config, taskId, agent, model) {
  * Rolls provider_quota windows forward, then checks headroom on every row
  * matching `provider` (model-specific rows and provider-wide rows where
  * model IS NULL) for one more request plus `projectedCost` dollars. A
- * provider with no provider_quota rows at all has nothing to check against
- * and passes. `public_only` providers additionally require `isPublic`.
+ * provider with no provider_quota rows at all, and no `windows` declared in
+ * `config.providers.<name>` either, has nothing to check against and
+ * passes. `public_only` providers additionally require `isPublic`.
+ *
+ * Before rolling, `syncConfigQuota` seeds/refreshes provider_quota rows from
+ * `config.providers.<name>.windows` (never touching a row `quota:set` has
+ * already claimed with `source = 'manual'`) - this is what makes a ceiling
+ * written only in the config file, and never passed to `quota:set`, an
+ * actual enforced limit rather than dead documentation (docs/guards.md
+ * "Provider quota").
  *
  * Escalations for both failure modes are written by the caller with reason
  * 'quota' (docs/ledger.md's escalation reason enum has no separate
@@ -126,6 +134,7 @@ export function checkQuota(db, config, provider, model, projectedCost = 0, { isP
     };
   }
 
+  syncConfigQuota(db, config, new Date());
   rollQuota(db, new Date());
   const rows = db
     .prepare('SELECT * FROM provider_quota WHERE provider = ? AND (model IS NULL OR model = ?)')

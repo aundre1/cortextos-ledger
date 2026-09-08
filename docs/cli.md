@@ -9,9 +9,9 @@ Global flags: `--config <path>`, `--db <path>` (overrides config), `--json` (mac
 | `init [--dry-run]` | Create the database, apply pending migrations, print schema version |
 | `doctor [--task <id> \| --run <id> \| --all]` | Diagnose (see below) |
 | `config:show` | Print resolved config with paths made absolute |
-| `quota:set --provider <p> [--model <m>] --window <kind> [--limit-requests <n>] [--limit-usd <x>]` | Upsert a quota window |
+| `quota:set --provider <p> [--model <m>] --window <kind> [--limit-requests <n>] [--limit-usd <x>]` | Upsert a quota window, overriding the config for that (provider, model, window) permanently -- see `docs/guards.md` "Provider quota ceilings: config vs. quota:set" |
 | `quota:tick --provider <p> [--model <m>] [--requests <n>] [--usd <x>]` | Manual usage increment |
-| `quota:show` | All windows with headroom and reset time |
+| `quota:show` | All windows (including any declared only in `config.providers.<name>.windows` and never set by hand) with headroom, reset time, and `origin` (`config` or `quota:set`) |
 
 ## Tasks
 

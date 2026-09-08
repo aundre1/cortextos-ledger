@@ -12,6 +12,8 @@
 //   week        - calendar UTC week, Monday 00:00:00Z start (ISO 8601 weeks).
 //   month       - calendar UTC month, first-of-month 00:00:00Z start.
 
+import { newId } from './db.mjs';
+
 const MINUTE_MS = 60_000;
 const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
@@ -108,6 +110,78 @@ export function findQuotaRow(db, { provider, model = null, windowKind }) {
   return db
     .prepare('SELECT * FROM provider_quota WHERE provider = ? AND window_kind = ? AND model IS ?')
     .get(provider, windowKind, model);
+}
+
+// ---------------------------------------------------------------------------
+// Config-derived ceilings (docs/architecture.md "Configuration" providers.*
+// .windows[], docs/guards.md "Provider quota"). Without this, a ceiling that
+// only exists in the config file is never enforced: `checkQuota` (src/
+// limits.mjs) only ever reads `provider_quota` rows, and those rows were
+// previously created only by `quota:set`. `syncConfigQuota` makes the
+// config the fallback source of truth for a window's *limits* by writing
+// them into provider_quota (so the existing row-based check, roll and tick
+// machinery keeps working unchanged), while a `quota:set` row for the same
+// (provider, model, window_kind) always wins and is never touched again by
+// config.
+// ---------------------------------------------------------------------------
+
+/**
+ * Seed or refresh provider_quota rows from `config.providers[*].windows` so
+ * a ceiling declared only in the config file is real without ever running
+ * `quota:set`.
+ *
+ * Precedence (docs contract for this fix): a row already set by
+ * `quota:set` (`source = 'manual'`) always wins and is left completely
+ * alone here, forever, for that (provider, model, window_kind) key - config
+ * can never silently overwrite an operator's override.
+ *
+ * For every other window the config declares:
+ *   - no existing row -> insert one (`source = 'config'`, zero usage, window
+ *     starting now - the same "a brand new window starts now" convention
+ *     `upsertQuota` already uses for a fresh `quota:set` row);
+ *   - an existing non-manual row (`source` 'config' from an earlier sync, or
+ *     'ingest') -> its `limit_requests`/`limit_usd` are refreshed to the
+ *     current config value on every call, so editing the config file takes
+ *     effect immediately rather than only at the first `init` (the staleness
+ *     a one-time "seed at init" design would otherwise reintroduce);
+ *     `used_requests`/`used_usd`/`window_started_at` are left untouched, so
+ *     usage accumulated within the current window survives the refresh.
+ *
+ * A config window with no `kind` is skipped (malformed, not this
+ * function's job to validate). Called from `checkQuota` (src/limits.mjs),
+ * `quota:show`, and `quota:tick`'s command handler so the config-derived
+ * ceiling is enforced and visible everywhere provider_quota is read.
+ */
+export function syncConfigQuota(db, config, now = new Date()) {
+  const providers = config?.providers ?? {};
+  const nowIsoStr = new Date(toMs(now)).toISOString();
+
+  for (const [provider, providerConfig] of Object.entries(providers)) {
+    const windows = Array.isArray(providerConfig?.windows) ? providerConfig.windows : [];
+    for (const w of windows) {
+      const windowKind = w?.kind;
+      if (!windowKind) continue;
+      const model = w.model ?? null;
+      const limitRequests = w.limit_requests ?? null;
+      const limitUsd = w.limit_usd ?? null;
+
+      const existing = findQuotaRow(db, { provider, model, windowKind });
+      if (existing?.source === 'manual') continue; // quota:set's override always wins
+
+      if (existing) {
+        db.prepare(
+          'UPDATE provider_quota SET limit_requests = ?, limit_usd = ?, source = ?, updated_at = ? WHERE id = ?'
+        ).run(limitRequests, limitUsd, 'config', nowIsoStr, existing.id);
+      } else {
+        db.prepare(
+          `INSERT INTO provider_quota
+             (id, provider, model, window_kind, window_started_at, limit_requests, limit_usd,
+              used_requests, used_usd, source, updated_at)
+           VALUES (?,?,?,?,?,?,?,0,0,'config',?)`
+        ).run(newId('q'), provider, model, windowKind, nowIsoStr, limitRequests, limitUsd, nowIsoStr);
+      }
+    }
+  }
 }
 
 /**

@@ -10,11 +10,29 @@ Each guard maps to a failure that happened to a named person in the Agent Archit
 |---|---|---|
 | Dirty worktree | An unattended agent deleted uncommitted work; one member lost a month | `git status --porcelain` must be empty of tracked changes. Untracked files are listed but allowed unless `--strict`. Refuse with exit 2 and escalation `dirty_worktree` unless `--allow-dirty` is passed, and record the flag in `notes` so the override is visible in the ledger |
 | Secrets in tree | Keys placed in agent readable folders were exposed and had to be rotated | Scan tracked and untracked files under the worktree (skip `.git`, `node_modules`, binaries over 1 MB) for patterns: `-----BEGIN [A-Z ]*PRIVATE KEY`, `sk-[A-Za-z0-9]{20,}`, `sk-ant-`, `ghp_`, `github_pat_`, `AKIA[0-9A-Z]{16}`, `xox[abp]-`, `AIza[0-9A-Za-z_-]{35}`, `ya29\.`, `nvapi-`, and any file named `.env`, `.env.*`, `*.pem`, `*.key`, `credentials.json`. Report file path and line number only. Never print the matched value. Exit 2 with escalation `secrets` |
-| Provider quota | A shakedown died on a 20 request per day quota after one call | Roll windows, check headroom for one request and the projected cost. Exit 4 with escalation `quota` |
+| Provider quota | A shakedown died on a 20 request per day quota after one call | Roll windows, check headroom for one request and the projected cost. Exit 4 with escalation `quota`. A window declared in `config.providers.<name>.windows` (`docs/architecture.md`) is enforced even if `quota:set` was never run: the config value is the ceiling until an operator overrides it, and the override then wins for good (see "Provider quota ceilings: config vs. `quota:set`" below) |
 | Public only provider | Private repository content sent to a provider restricted to public material | If the provider config has `public_only: true` and `--public` is absent, exit 4 with reason `public_only` |
 | Node version | `node:sqlite` missing | Exit 1 with a plain message naming 22.5 |
 
 Preflight is invoked automatically by `run:start` unless `--no-preflight` is passed, and the skip is recorded in the run's `halted_reason` column as `preflight_skipped` so it is never silent.
+
+### Provider quota ceilings: config vs. `quota:set`
+
+A window under `config.providers.<name>.windows` (`docs/architecture.md`
+"Configuration") is a real ceiling as soon as the config file says so --
+`checkQuota`, `ingest`, `quota:tick`, and `quota:show` all seed or refresh a
+matching `provider_quota` row (`source = 'config'`) from it before doing
+anything else, so an operator who never runs `quota:set` still gets the
+ceiling the config file documents, not silence.
+
+`quota:set` always wins over the config for the same (provider, model,
+window kind): once it has written a row (`source = 'manual'`), that row's
+`limit_requests`/`limit_usd` are never touched by the config again, even if
+the config file's number for that window later changes. This is the one
+supported way to override a config ceiling for a single deployment without
+editing the shared config file. `quota:show` prints each window's `origin`
+(`config` or `quota:set`) so which one is currently in force is always
+visible, not just the numbers.
 
 ## Runtime (while the agent runs)
 

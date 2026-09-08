@@ -77,6 +77,8 @@ Resolution order: `--config <path>`, then `CORTEX_LEDGER_CONFIG`, then `./cortex
 
 `builder_attempts_max` counts attempts, not retries. Three attempts means one initial run and two retries. The fourth `run:start` for the builder agent on one task is refused with exit 3. This resolves the ambiguity in the original run protocol.
 
+Each entry in a provider's `windows` array is itself an enforced ceiling, not documentation: `run:start`'s quota gate, `ingest`, `quota:tick`, and `quota:show` all read it directly (via `provider_quota` rows seeded and kept in sync from the config, `src/quota.mjs`'s `syncConfigQuota`) with no `quota:set` call required. `quota:set` remains the way to override one of these windows for a single deployment -- once set, its row wins over the config for that (provider, model, window kind) permanently, until `quota:set` is used again; see `docs/guards.md` "Provider quota ceilings: config vs. `quota:set`" for the exact precedence rule.
+
 ## Portability
 
 Node 22.5 or later, because the ledger uses `node:sqlite` with zero dependencies. Windows is the first class target (PowerShell scripts alongside POSIX shell scripts). CI runs on `windows-latest` and `ubuntu-latest`. Process tree kill uses `taskkill /T /F` on Windows and process group signals elsewhere.

@@ -8,7 +8,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { insertArtifact, insertCost, sumCost } from './ledger.mjs';
 import { redact } from './adapters/credential-boundary.mjs';
-import { rollQuota, tickQuota } from './quota.mjs';
+import { rollQuota, tickQuota, syncConfigQuota } from './quota.mjs';
 import { escalate } from './limits.mjs';
 
 const SUMMARY_MAX = 300;
@@ -169,6 +169,11 @@ export function ingest(db, config, { eventsPath, taskId, runId }) {
   const deltaRequests = requests - (prior?.requests ?? 0);
   const deltaUsd = costUsd - (prior?.cost_usd ?? 0);
 
+  // syncConfigQuota first: a provider whose only ceiling lives in the config
+  // file (never a `quota:set` row) still needs a provider_quota row to tick
+  // usage into, otherwise this run's real spend would be silently untracked
+  // against that ceiling (see src/quota.mjs "Config-derived ceilings").
+  syncConfigQuota(db, config, new Date());
   rollQuota(db, new Date());
   if (deltaRequests !== 0 || deltaUsd !== 0) {
     tickQuota(db, { provider: run.provider, model: run.model, requests: deltaRequests, usd: deltaUsd });

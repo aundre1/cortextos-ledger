@@ -3,7 +3,7 @@
 
 import { migrate, pendingMigrations, schemaVersion } from '../db.mjs';
 import { upsertQuota, listQuota } from '../ledger.mjs';
-import { tickQuota, rollQuota, windowEndsAt } from '../quota.mjs';
+import { tickQuota, rollQuota, windowEndsAt, syncConfigQuota } from '../quota.mjs';
 
 function fail(errFn, code, reason, detail) {
   errFn(`cortexctl: ${reason}: ${detail}`);
@@ -20,6 +20,11 @@ function quotaRowView(row) {
     headroom_requests: row.limit_requests != null ? row.limit_requests - row.used_requests : null,
     headroom_usd: row.limit_usd != null ? row.limit_usd - row.used_usd : null,
     resets_at: windowEndsAt(row),
+    // 'config' (seeded/refreshed from config.providers.<name>.windows and
+    // never touched by quota:set) or 'manual' (quota:set's own override, or
+    // an earlier synced row it has since claimed) - see src/quota.mjs
+    // "Config-derived ceilings" for the precedence rule.
+    origin: row.source === 'manual' ? 'quota:set' : 'config',
   };
 }
 
@@ -87,11 +92,14 @@ export function register(registry) {
 
   registry.add('quota:tick', {
     description: 'Manual usage increment',
-    handler({ db, flags, err }) {
+    handler({ db, config, flags, err }) {
       const need = missing(flags, ['provider']);
       if (need.length) {
         return fail(err, 1, 'usage', `missing required flags: ${need.map((n) => '--' + n).join(', ')}`);
       }
+      // A window declared only in the config file (never `quota:set`) needs
+      // a provider_quota row to exist before it can be ticked at all.
+      syncConfigQuota(db, config);
       const ticked = tickQuota(db, {
         provider: flags.provider,
         model: flags.model ?? null,
@@ -104,8 +112,13 @@ export function register(registry) {
   });
 
   registry.add('quota:show', {
-    description: 'All windows with headroom and reset time',
-    handler({ db, flags }) {
+    description: 'All windows with headroom, reset time, and origin (config or quota:set)',
+    handler({ db, config, flags }) {
+      // Seed/refresh config-derived windows first so an operator who has
+      // never run quota:set still sees every ceiling docs/architecture.md's
+      // `providers.<name>.windows` declares, not an empty table that reads
+      // as "no limit".
+      syncConfigQuota(db, config);
       rollQuota(db);
       const rows = listQuota(db).map(quotaRowView);
       if (flags.json) return { code: 0, stdout: JSON.stringify(rows) };
@@ -114,7 +127,7 @@ export function register(registry) {
         const model = r.model ?? '*';
         const reqPart = r.limit_requests != null ? `requests ${r.used_requests}/${r.limit_requests}` : '';
         const usdPart = r.limit_usd != null ? `usd ${r.used_usd.toFixed(2)}/${r.limit_usd.toFixed(2)}` : '';
-        return `${r.provider} ${model} ${r.window_kind}  ${[reqPart, usdPart].filter(Boolean).join('  ')}  resets ${r.resets_at}`;
+        return `${r.provider} ${model} ${r.window_kind}  ${[reqPart, usdPart].filter(Boolean).join('  ')}  resets ${r.resets_at}  origin ${r.origin}`;
       });
       return { code: 0, stdout: lines.join('\n') };
     },
