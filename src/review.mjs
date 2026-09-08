@@ -26,6 +26,15 @@ const VALID_DECISIONS = new Set(['approve', 'changes_requested', 'reject']);
 const VALID_SEVERITIES = new Set(['blocker', 'major', 'minor', 'nit']);
 const MAJOR_OR_BLOCKER = new Set(['blocker', 'major']);
 
+// Phase 1a real-batch fix F2: docs/review-protocol.md's documented cap on
+// `summary`. Real evidence: three real verdicts from a single Phase 1a
+// dry-run reviewer model (754, 937, 967 characters) were each rejected
+// outright by `cortexctl verdict` (exit 5) - every finding in every one of
+// them lost over prose length alone. The findings array is the measured
+// content; prose length is a formatting preference and must not destroy a
+// run's data - see `truncateAtWordBoundary`/`storeVerdict` below.
+const SUMMARY_MAX_CHARS = 600;
+
 const VERDICT_SCHEMA_BLOCK = `\`\`\`json
 {
   "verdict_version": "1",
@@ -208,9 +217,13 @@ export function validateVerdict(obj, { testsTouchedExpected = false } = {}) {
 
   if (typeof obj.summary !== 'string' || obj.summary.length === 0) {
     errors.push('summary is required');
-  } else if (obj.summary.length > 600) {
-    errors.push(`summary must be at most 600 characters, got ${obj.summary.length}`);
   }
+  // Phase 1a real-batch fix F2: an over-length summary is no longer a
+  // validation failure - docs/review-protocol.md's "Verdict schema" now
+  // says `storeVerdict` truncates it at a word boundary to
+  // SUMMARY_MAX_CHARS instead of rejecting the whole verdict (see
+  // storeVerdict below). Every other rule in this function is unchanged and
+  // still exits 5 exactly as before.
 
   const findings = Array.isArray(obj.findings) ? obj.findings : null;
   if (!findings) {
@@ -258,6 +271,25 @@ export function validateVerdict(obj, { testsTouchedExpected = false } = {}) {
   }
 
   return { ok: errors.length === 0, errors };
+}
+
+// ---------------------------------------------------------------------------
+// truncateAtWordBoundary (Phase 1a real-batch fix F2)
+// ---------------------------------------------------------------------------
+
+/**
+ * `text` cut to at most `maxLen` characters at the last word boundary at or
+ * before that limit (never mid-word), trailing whitespace trimmed. Returns
+ * `text` unchanged when it already fits. A `text` with no whitespace at all
+ * inside the first `maxLen` characters falls back to a hard cut at `maxLen`
+ * rather than emitting nothing.
+ */
+export function truncateAtWordBoundary(text, maxLen) {
+  if (typeof text !== 'string' || text.length <= maxLen) return text;
+  const slice = text.slice(0, maxLen);
+  const lastSpace = slice.lastIndexOf(' ');
+  const cut = lastSpace > 0 ? slice.slice(0, lastSpace) : slice;
+  return cut.trimEnd();
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +357,18 @@ export function storeVerdict(db, config, { taskId, runId, reviewer, provider, mo
   // BEGIN-IMMEDIATE pattern in doRunStart.
   const blind = reviewerEventsPath && detectBlindnessBreach(reviewerEventsPath) ? 0 : 1;
 
+  // Phase 1a real-batch fix F2: truncate, never reject, an over-cap
+  // summary. `storedVerdict` (not the caller's own `verdictObj`) is what
+  // actually gets persisted in findings_json, so the stored document is
+  // internally consistent with the documented cap; `summaryTruncatedFrom`
+  // is the pre-truncation length, `null` when nothing was truncated.
+  let storedVerdict = verdictObj;
+  let summaryTruncatedFrom = null;
+  if (typeof verdictObj.summary === 'string' && verdictObj.summary.length > SUMMARY_MAX_CHARS) {
+    summaryTruncatedFrom = verdictObj.summary.length;
+    storedVerdict = { ...verdictObj, summary: truncateAtWordBoundary(verdictObj.summary, SUMMARY_MAX_CHARS) };
+  }
+
   const outcome = withImmediateTransaction(db, () => {
     let challengeSeq = 0;
 
@@ -366,12 +410,13 @@ export function storeVerdict(db, config, { taskId, runId, reviewer, provider, mo
       provider,
       model,
       blind,
-      decision: verdictObj.decision,
-      findings_total: Array.isArray(verdictObj.findings) ? verdictObj.findings.length : 0,
-      findings_json: JSON.stringify(verdictObj),
+      decision: storedVerdict.decision,
+      findings_total: Array.isArray(storedVerdict.findings) ? storedVerdict.findings.length : 0,
+      findings_json: JSON.stringify(storedVerdict),
       challenge_seq: challengeSeq,
-      tests_touched: verdictObj.tests_touched ? 1 : 0,
-      scope_exceeded: verdictObj.scope_exceeded ? 1 : 0,
+      tests_touched: storedVerdict.tests_touched ? 1 : 0,
+      scope_exceeded: storedVerdict.scope_exceeded ? 1 : 0,
+      summary_truncated_from: summaryTruncatedFrom,
       // arm defaults to the task's current arm inside insertVerdict.
     });
     return { ok: true, row };
@@ -392,6 +437,20 @@ export function storeVerdict(db, config, { taskId, runId, reviewer, provider, mo
       reason: 'verdict_invalid',
       severity: 'warn',
       detail: `reviewer ${reviewer} events show a read under builder/ or reasoning.md`,
+    });
+  }
+
+  if (summaryTruncatedFrom !== null) {
+    // Phase 1a real-batch fix F2: recorded once, after the verdict is
+    // actually stored - the reviewer, the model, and the original length,
+    // so the ledger shows truncation happened without discarding the
+    // verdict's findings the way a hard rejection would have.
+    escalate(db, {
+      taskId,
+      runId: runId ?? null,
+      reason: 'verdict_truncated',
+      severity: 'warn',
+      detail: `reviewer ${reviewer} (model ${model}) summary truncated from ${summaryTruncatedFrom} to ${SUMMARY_MAX_CHARS} characters`,
     });
   }
 

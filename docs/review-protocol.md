@@ -40,7 +40,7 @@ Generated from the ledger, written to `<runs>/<task>/reviewer/brief.md`. Content
 {
   "verdict_version": "1",
   "decision": "approve | changes_requested | reject",
-  "summary": "one paragraph, no more than 600 characters",
+  "summary": "one paragraph, up to 600 characters -- longer is truncated at a word boundary, not rejected (see the validation paragraph below)",
   "findings": [
     {
       "id": "F1",
@@ -59,7 +59,9 @@ Generated from the ledger, written to `<runs>/<task>/reviewer/brief.md`. Content
 }
 ```
 
-Validation rules enforced by `cortexctl verdict` (exit 5 on failure): `decision` in the enum; `reject` and `changes_requested` require at least one finding of severity `major` or `blocker`; `approve` allows only `minor` and `nit`; every finding has `file` and `claim`; `evidence` is required for `blocker` and `major`; `confidence` between 0 and 1; when the post run guard recorded touched test files, `tests_touched` must be `true` and `tests_touched_justified` must be a boolean with a reason in `summary`.
+Validation rules enforced by `cortexctl verdict` (exit 5 on failure, nothing stored): `decision` in the enum; `reject` and `changes_requested` require at least one finding of severity `major` or `blocker`; `approve` allows only `minor` and `nit`; every finding has `file` and `claim`; `evidence` is required for `blocker` and `major`; `confidence` between 0 and 1; when the post run guard recorded touched test files, `tests_touched` must be `true` and `tests_touched_justified` must be a boolean with a reason in `summary`. Every one of these is a semantic defect in the verdict itself and still exits 5 exactly as before, storing nothing.
+
+`summary` over 600 characters is the one exception, and is not a validation failure: three real verdicts from a single Phase 1a dry-run reviewer model exceeded it (660, 937, 967 characters) and every finding in them was lost to an exit-5 rejection before this rule existed. `cortexctl verdict` now truncates `summary` to 600 characters at the last word boundary at or before the cutoff (never mid-word, falling back to a hard cut only when no space exists in the first 600 characters), stores the verdict with the truncated `summary` and `review_verdicts.summary_truncated_from` set to the original character count (`docs/ledger.md`'s `review_verdicts` table), and writes a `warn` escalation, reason `verdict_truncated` (`docs/ledger.md`'s escalations table), naming the reviewer, model, and original length. A `summary` at or under 600 characters stores with `summary_truncated_from = null` and no escalation, unchanged from before.
 
 ## Challenge cycle
 

@@ -101,10 +101,18 @@ test('validateVerdict: confidence out of range fails', () => {
   assert.equal(validateVerdict(validVerdict({ confidence: 0 })).ok, true);
 });
 
-test('validateVerdict: summary over 600 chars fails', () => {
+// Phase 1a real-batch fix F2: an over-cap summary is no longer a validation
+// failure - see storeVerdict's own truncation tests below - only an empty
+// summary still fails here.
+test('validateVerdict: summary over 600 chars is NOT a validation failure any more (storeVerdict truncates it instead)', () => {
   const { ok, errors } = validateVerdict(validVerdict({ summary: 'x'.repeat(601) }));
+  assert.equal(ok, true, errors.join('; '));
+});
+
+test('validateVerdict: an empty summary still fails', () => {
+  const { ok, errors } = validateVerdict(validVerdict({ summary: '' }));
   assert.equal(ok, false);
-  assert.ok(errors.some((e) => e.includes('600 characters')));
+  assert.ok(errors.some((e) => e.includes('summary is required')));
 });
 
 test('validateVerdict: testsTouchedExpected requires tests_touched true and a justification', () => {
@@ -271,6 +279,61 @@ test('storeVerdict: invalid verdict returns code 5 and stores nothing', async ()
   });
   assert.equal(result.code, 5);
   assert.equal(listVerdicts(db, task.id).length, 0);
+  db.close();
+});
+
+// Phase 1a real-batch fix F2: proves both halves of the fix at once - a
+// 967 character summary (the exact length one of the three real Phase 1a
+// dry-run verdicts came back at) is stored truncated to the documented cap
+// with the escalation and the original length recorded, while a verdict
+// with an actual semantic problem still exits 5 and stores nothing, exactly
+// as before this fix.
+
+test('storeVerdict: a 967 character summary is stored truncated to 600 chars, at a word boundary, with a warn escalation recording reviewer/model/original length', async () => {
+  const { db, config } = await migrated();
+  const task = insertTask(db, { repo: 'o/n', title: 'T', task_class: 'ci', arm: 'tri' });
+  const longSummary = 'word '.repeat(200).slice(0, 967); // 967 chars, real whitespace throughout
+  assert.equal(longSummary.length, 967);
+
+  const result = storeVerdict(db, config, {
+    taskId: task.id, runId: null, reviewer: 'reviewer', provider: 'nvidia', model: 'nvidia/moonshotai/kimi-k3',
+    verdictObj: validVerdict({ summary: longSummary }), challenge: false,
+  });
+  assert.equal(result.code, 0, result.errors.join('; '));
+
+  const stored = listVerdicts(db, task.id)[0];
+  assert.equal(stored.summary_truncated_from, 967);
+  const storedSummary = JSON.parse(stored.findings_json).summary;
+  assert.ok(storedSummary.length <= 600, `stored summary is ${storedSummary.length} chars`);
+  assert.equal(storedSummary.endsWith(' '), false, 'trailing whitespace is trimmed');
+  assert.equal(longSummary.startsWith(storedSummary), true, 'truncated at a word boundary, not mid-word');
+
+  const escalations = db.prepare('SELECT * FROM escalations WHERE task_id = ?').all(task.id);
+  const truncationEscalation = escalations.find((e) => e.reason === 'verdict_truncated');
+  assert.ok(truncationEscalation, 'expected a verdict_truncated escalation');
+  assert.equal(truncationEscalation.severity, 'warn');
+  assert.match(truncationEscalation.detail, /reviewer/);
+  assert.match(truncationEscalation.detail, /nvidia\/moonshotai\/kimi-k3/);
+  assert.match(truncationEscalation.detail, /967/);
+  db.close();
+});
+
+test('storeVerdict: a genuine semantic violation (reject with no blocker/major finding) still exits 5 and stores nothing, even with an over-length summary', async () => {
+  const { db, config } = await migrated();
+  const task = insertTask(db, { repo: 'o/n', title: 'T', task_class: 'ci', arm: 'tri' });
+  const result = storeVerdict(db, config, {
+    taskId: task.id, runId: null, reviewer: 'reviewer', provider: 'p', model: 'm',
+    verdictObj: validVerdict({
+      decision: 'reject',
+      summary: 'x'.repeat(700),
+      findings: [{ id: 'F1', severity: 'nit', file: 'src/x.mjs', claim: 'a nit' }],
+    }),
+    challenge: false,
+  });
+  assert.equal(result.code, 5);
+  assert.ok(result.errors.some((e) => e.includes('requires at least one blocker or major finding')));
+  assert.equal(listVerdicts(db, task.id).length, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM escalations WHERE task_id = ?').get(task.id).c, 0);
   db.close();
 });
 
