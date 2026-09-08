@@ -171,6 +171,17 @@ test('buildReviewerBrief: never leaks reasoning.md or builder out.txt content', 
   db.close();
 });
 
+test('buildReviewerBrief: names the exact absolute verdict.json path (Phase 1a dry-run finding: a vague brief let a reviewer write it one directory too high)', async () => {
+  const { db, config } = await migrated();
+  const task = insertTask(db, { repo: 'o/n', title: 'T', task_class: 'ci', arm: 'tri' });
+
+  const { markdown } = buildReviewerBrief(db, config, { taskId: task.id, reviewer: 'reviewer' });
+  const expectedPath = join(config.runs, task.id, 'reviewer', 'verdict.json');
+  assert.ok(markdown.includes(expectedPath), `brief must name the exact output path ${expectedPath}`);
+  assert.ok(markdown.includes('# Output'));
+  db.close();
+});
+
 test('buildReviewerBrief: pr_review task reads the diff from <runs>/<task>/pr.diff, never builder/patch.diff (docs/review-protocol.md "PR triage mode")', async () => {
   const { db, config } = await migrated();
   const task = insertTask(db, {

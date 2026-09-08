@@ -142,6 +142,18 @@ export function buildReviewerBrief(db, config, { taskId, reviewer, issueFile }) 
     sections.push(`# Diff\n\nno diff found at ${sourceDiffPath} yet.`);
   }
 
+  // Dry-run finding (Phase 1a, PR #1002 on grandamenium/cortextos): with only
+  // the prompts' vague "the run directory named in your brief" to go on, a
+  // real reviewer model wrote verdict.json one level too high (taskId/, not
+  // taskId/<reviewer>/) - a brief-content gap, not a permission failure (the
+  // edit-permission carve-out and the --worktree containment both worked; see
+  // docs/adapters.md "opencode: edit permission is per-path, not per-tool
+  // (V1)"). Naming the literal absolute path here removes that ambiguity.
+  const verdictPath = join(reviewerDir, 'verdict.json');
+  sections.push(
+    `# Output\n\nWrite your verdict to exactly this absolute path (create it if it does not exist, overwrite it if it does):\n\n\`${verdictPath}\`\n\nDo not write a verdict.json anywhere else.`
+  );
+
   sections.push(`# Verdict schema\n\n${VERDICT_SCHEMA_BLOCK}`);
   sections.push(`# Reviewer instructions\n\n${readReviewerPrompt().trim()}`);
 
