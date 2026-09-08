@@ -14,6 +14,7 @@ import { join } from 'node:path';
 
 import { runCli, makeTempGitRepo, makeTempDir } from './helpers.mjs';
 import { openDb } from '../src/db.mjs';
+import { sweepTmpDir, pidSidecarPath } from '../src/tmp-sweep.mjs';
 
 function writeConfig(homeDir, { name = 'cortex-ledger.json', limits = {}, providers = {} } = {}) {
   const configPath = join(homeDir, name);
@@ -289,4 +290,103 @@ test('NF4: run:start that DOES reserve against an existing window still sets quo
 
   const row = JSON.parse(cli(['quota:show', '--json'], ctx).stdout).find((r) => r.provider === 'nf4-prov2');
   assert.equal(row.used_requests, 1, 'the one request reserved at run:start must not be double counted by ingest');
+});
+
+// ---------------------------------------------------------------------------
+// NF5 (minor, round 5): NF3's sweep decided purely on mtime age, so a
+// capture genuinely still running past the 60 minute threshold (a very
+// large diff, or any process whose wall clock jumps forward) looked
+// identical to an abandoned one to a *concurrent* init/task:new's sweep,
+// which could then unlink a file the first process was still writing.
+// Fixed with a pid sidecar (<name>.pid, containing the writing process's
+// pid) that the sweep consults before deciding an mtime-stale entry is
+// really abandoned. Unit-level against sweepTmpDir directly (src/tmp-
+// sweep.mjs) - the CLI-level task:new tests above already cover the
+// ordinary sweep-on-command-start behaviour; this exercises the sidecar
+// decision itself precisely, including a deliberately unrealistic (never
+// running) pid for the "dead" case.
+// ---------------------------------------------------------------------------
+
+const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+// Comfortably above any real OS's max pid (Linux's default ceiling is far
+// below this) and never reused within a test run - process.kill(pid, 0)
+// reliably reports ESRCH for it, without this test depending on the timing
+// of any real process actually exiting.
+const DEFINITELY_DEAD_PID = 999999999;
+
+test('NF5: an entry with a live-pid sidecar survives the sweep even when its mtime is 2 hours old', () => {
+  const runsDir = makeTempDir();
+  const tmpDir = join(runsDir, '.tmp');
+  mkdirSync(tmpDir, { recursive: true });
+
+  const rawPath = join(tmpDir, 'live.pr.diff.raw');
+  writeFileSync(rawPath, 'still being written by a genuinely running process\n');
+  writeFileSync(pidSidecarPath(rawPath), String(process.pid)); // this test process is certainly alive
+
+  const twoHoursAgo = new Date(Date.now() - TWO_HOURS_MS);
+  utimesSync(rawPath, twoHoursAgo, twoHoursAgo);
+
+  const deleted = sweepTmpDir(runsDir);
+
+  assert.deepEqual(deleted, [], `nothing should be deleted while the sidecar names a live pid: ${JSON.stringify(deleted)}`);
+  assert.ok(existsSync(rawPath), 'the raw file must survive - its sidecar names a live pid');
+  assert.ok(existsSync(pidSidecarPath(rawPath)), 'the sidecar itself must survive alongside it');
+});
+
+test('NF5: an entry with a dead-pid sidecar is removed with its sidecar once stale', () => {
+  const runsDir = makeTempDir();
+  const tmpDir = join(runsDir, '.tmp');
+  mkdirSync(tmpDir, { recursive: true });
+
+  const rawPath = join(tmpDir, 'dead.pr.diff.raw');
+  writeFileSync(rawPath, 'abandoned by a process that has since exited\n');
+  writeFileSync(pidSidecarPath(rawPath), String(DEFINITELY_DEAD_PID));
+
+  const twoHoursAgo = new Date(Date.now() - TWO_HOURS_MS);
+  utimesSync(rawPath, twoHoursAgo, twoHoursAgo);
+
+  const deleted = sweepTmpDir(runsDir);
+
+  assert.ok(deleted.includes('dead.pr.diff.raw'), `expected the raw file to be swept: ${JSON.stringify(deleted)}`);
+  assert.ok(deleted.includes('dead.pr.diff.raw.pid'), `expected the sidecar to be swept with it: ${JSON.stringify(deleted)}`);
+  assert.ok(!existsSync(rawPath), 'the raw file must be gone');
+  assert.ok(!existsSync(pidSidecarPath(rawPath)), 'the sidecar must be gone too');
+});
+
+test('NF5: an entry with a future mtime survives the sweep regardless of its sidecar', () => {
+  const runsDir = makeTempDir();
+  const tmpDir = join(runsDir, '.tmp');
+  mkdirSync(tmpDir, { recursive: true });
+
+  const rawPath = join(tmpDir, 'future.pr.diff.raw');
+  writeFileSync(rawPath, 'mtime jumped forward, e.g. a corrected system clock\n');
+  writeFileSync(pidSidecarPath(rawPath), String(DEFINITELY_DEAD_PID)); // dead pid - only the future mtime should save it
+
+  const oneHourFromNow = new Date(Date.now() + 60 * 60 * 1000);
+  utimesSync(rawPath, oneHourFromNow, oneHourFromNow);
+
+  const deleted = sweepTmpDir(runsDir);
+
+  assert.deepEqual(deleted, [], `a future mtime can never be proven stale: ${JSON.stringify(deleted)}`);
+  assert.ok(existsSync(rawPath), 'the raw file must survive a future mtime');
+  assert.ok(existsSync(pidSidecarPath(rawPath)), 'its sidecar must survive alongside it');
+});
+
+test('NF5: an entry with no sidecar at all still follows the plain mtime rule (regression, pre-NF5 behaviour preserved)', () => {
+  const runsDir = makeTempDir();
+  const tmpDir = join(runsDir, '.tmp');
+  mkdirSync(tmpDir, { recursive: true });
+
+  const stalePath = join(tmpDir, 'no-sidecar-stale.raw');
+  const freshPath = join(tmpDir, 'no-sidecar-fresh.raw');
+  writeFileSync(stalePath, 'x');
+  writeFileSync(freshPath, 'y');
+  const twoHoursAgo = new Date(Date.now() - TWO_HOURS_MS);
+  utimesSync(stalePath, twoHoursAgo, twoHoursAgo);
+
+  const deleted = sweepTmpDir(runsDir);
+
+  assert.ok(deleted.includes('no-sidecar-stale.raw'));
+  assert.ok(!existsSync(stalePath));
+  assert.ok(existsSync(freshPath));
 });

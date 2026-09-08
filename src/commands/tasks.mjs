@@ -51,7 +51,7 @@ import {
   listEscalations,
 } from '../ledger.mjs';
 import { filterEnv, redact } from '../adapters/credential-boundary.mjs';
-import { sweepTmpDir } from '../tmp-sweep.mjs';
+import { sweepTmpDir, writePidSidecar, removePidSidecar } from '../tmp-sweep.mjs';
 
 const VALID_ARMS = new Set(['tri', 'control']);
 const VALID_KINDS = new Set(['implement', 'pr_review', 'research', 'ops']);
@@ -369,6 +369,15 @@ export function register(registry) {
         mkdirSync(tmpDir, { recursive: true });
         tmpRawDiffPath = join(tmpDir, `${taskId}.pr.diff.raw`);
 
+        // Blind review NF5: write the pid sidecar the instant the raw
+        // file's path is decided - before anything ever opens it for
+        // writing (capturePr, just below, is what actually opens it) - so a
+        // concurrent init/task:new's sweep (src/tmp-sweep.mjs) can never
+        // observe this file without also seeing proof that this process is
+        // still alive and still writing it, no matter how slow the `gh pr
+        // diff` that follows turns out to be.
+        writePidSidecar(tmpRawDiffPath);
+
         // Blind review NF3(b): the raw temp diff must never survive this
         // call, on ANY exit path - gh failing, a throw during redaction or
         // hashing (disk full, permissions, anything), or the ordinary
@@ -378,7 +387,9 @@ export function register(registry) {
         // makes that true regardless of which path is taken; relying only
         // on the next `init`/`task:new` sweep (src/tmp-sweep.mjs) to catch a
         // leftover eventually would still leave an unredacted diff sitting
-        // on disk for up to that sweep's 60 minute age threshold.
+        // on disk for up to that sweep's 60 minute age threshold. The pid
+        // sidecar written above is removed here too (NF5), in the same
+        // `finally`, so it never outlives the raw file it guards.
         try {
           const captured = capturePr(flags.repo, pr.value, tmpRawDiffPath);
           if (!captured.ok) {
@@ -426,6 +437,7 @@ export function register(registry) {
             // best effort - a failed cleanup must not mask the real error
             // (or, on the success path, the result already returned).
           }
+          removePidSidecar(tmpRawDiffPath);
         }
       }
 
