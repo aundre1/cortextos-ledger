@@ -82,7 +82,7 @@ test('setMetric: updates a manual metric, writes the file back, and records a hu
     { id: 'biz-a', name: 'Test', owner: 'founder', metrics: [{ name: 'paying_customers', target: 100, current: 42, source: 'manual' }] },
   ]);
 
-  const result = setMetric(db, config, { business: 'biz-a', metric: 'paying_customers', current: 55, by: 'aundre' });
+  const result = setMetric(db, config, { business: 'biz-a', metric: 'paying_customers', current: 55, by: 'owner1' });
   assert.equal(result.before, 42);
   assert.equal(result.after, 55);
 

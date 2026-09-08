@@ -334,7 +334,7 @@ rule, not a defect:
   (owner gate list items 3 and 5).
 - Owner gate items 1, 2, 3, and 4 (Phase 1a backlog switch, OpenCode Go
   purchase, repository public flip and upstream PR, retry-semantics
-  confirmation) remain un-shipped pending Aundre's go-ahead, per the wave
+  confirmation) remain un-shipped pending the owner's go-ahead, per the wave
   todo's "Owner gate list".
 
 ### Doc mismatches found (report only - `docs/*.md` is not edited by this

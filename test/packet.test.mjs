@@ -174,7 +174,7 @@ test('buildTaskPacket: limits and next_action survive trimming, truncated flips 
 
 test('writePacket: task packet writes files and inserts an artifact + agent_messages row; board packet only writes files', async () => {
   const { db, config } = await migrated();
-  const task = insertTask(db, { repo: 'o/n', title: 'T', task_class: 'ci', arm: 'tri', owner: 'aundre' });
+  const task = insertTask(db, { repo: 'o/n', title: 'T', task_class: 'ci', arm: 'tri', owner: 'owner1' });
   const outDir = join(makeTempDir(), 'task-out');
 
   const packet = buildTaskPacket(db, config, task.id);
@@ -188,7 +188,7 @@ test('writePacket: task packet writes files and inserts an artifact + agent_mess
   assert.ok(artifactRow, 'expected a packet artifact row');
   const msgRow = db
     .prepare("SELECT * FROM agent_messages WHERE task_id = ? AND kind = 'packet' AND sender = 'ledger' AND recipient = ?")
-    .get(task.id, 'aundre');
+    .get(task.id, 'owner1');
   assert.ok(msgRow, 'expected a packet agent_messages row addressed to the owner');
 
   const boardOutDir = join(makeTempDir(), 'board-out');

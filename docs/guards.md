@@ -1,6 +1,6 @@
 # Guards
 
-Each guard maps to a failure that happened to a named person in the Agent Architects community. The kit does not quote them; it prevents the repeat.
+Each guard maps to a failure that happened to someone in the community this kit was built for. The kit does not quote them; it prevents the repeat.
 
 ## Preflight (before any agent starts)
 

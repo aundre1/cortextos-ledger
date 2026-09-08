@@ -30,7 +30,7 @@ test('apply: refused when the recomputed supporting run count is under 20', asyn
   const p = propose(db, config, { author: 'architect', business: 'biz-a', kind: 'policy', title: 'Swap reviewer', rationale: 'low precision', expectedImpact: 'raise precision', taskClass: 'ci' });
 
   assert.throws(
-    () => apply(db, config, { proposalId: p.id, by: 'aundre', overrides: { reviewer: { provider: 'openai', model: 'x' } } }),
+    () => apply(db, config, { proposalId: p.id, by: 'owner1', overrides: { reviewer: { provider: 'openai', model: 'x' } } }),
     (e) => e.code === 6 && /needs at least 20/.test(e.message)
   );
   assert.equal(activeFor(db, 'ci'), null);
@@ -41,7 +41,7 @@ test('apply: succeeds at >= 20 adjudicated runs, activeFor returns the overrides
   adjudicatedControlTasks(db, 'ci', 20);
   const p = propose(db, config, { author: 'architect', business: 'biz-a', kind: 'policy', title: 'Swap reviewer', rationale: 'low precision', expectedImpact: 'raise precision', taskClass: 'ci' });
 
-  const { policy } = apply(db, config, { proposalId: p.id, by: 'aundre', overrides: { reviewer: { provider: 'openai', model: 'gpt' } } });
+  const { policy } = apply(db, config, { proposalId: p.id, by: 'owner1', overrides: { reviewer: { provider: 'openai', model: 'gpt' } } });
   assert.match(policy.id, /^po_/);
   assert.equal(policy.active, 1);
 
@@ -59,7 +59,7 @@ test('apply: refuses a non-policy-kind proposal', async () => {
   const { db, config } = await migrated();
   adjudicatedControlTasks(db, 'ci', 20);
   const p = propose(db, config, { author: 'architect', business: 'biz-a', kind: 'task', title: 'x', rationale: 'y', expectedImpact: 'z', taskClass: 'ci' });
-  assert.throws(() => apply(db, config, { proposalId: p.id, by: 'aundre', overrides: {} }), /requires kind policy/);
+  assert.throws(() => apply(db, config, { proposalId: p.id, by: 'owner1', overrides: {} }), /requires kind policy/);
 });
 
 test('run:start consults the active policy for the task class before config.agents', async () => {
@@ -79,7 +79,7 @@ test('run:start consults the active policy for the task class before config.agen
   const proposalId = cli(['propose', '--author', 'architect', '--business', 'biz-a', '--kind', 'policy', '--title', 'Swap reviewer', '--rationale', 'r', '--impact', 'i', '--class', 'ci']).stdout.trim();
   const overridesPath = `${dir}/overrides.json`;
   writeFileSync(overridesPath, JSON.stringify({ reviewer: { adapter: 'fake', provider: 'openai', model: 'from-policy' } }));
-  const applyResult = cli(['policy:apply', '--id', proposalId, '--by', 'aundre', '--overrides', overridesPath]);
+  const applyResult = cli(['policy:apply', '--id', proposalId, '--by', 'owner1', '--overrides', overridesPath]);
   assert.equal(applyResult.code, 0, applyResult.stderr);
 
   const taskId = cli(['task:new', '--repo', 'o/n', '--title', 'Real task', '--class', 'ci', '--arm', 'tri']).stdout.trim();

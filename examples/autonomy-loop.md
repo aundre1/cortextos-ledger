@@ -53,7 +53,7 @@ Nothing is built yet. A human runs:
 
 ```bash
 cortexctl proposal:list --status under_review
-cortexctl proposal:approve --id p_... --by aundre
+cortexctl proposal:approve --id p_... --by owner1
 ```
 
 ## 3. Turning the dial up a little

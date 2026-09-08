@@ -1,6 +1,6 @@
 # Context packet
 
-The context packet is the "where we left off" file the community keeps rebuilding by hand, and it is the boot contract James described for CortextOS V2: the harness receives a packet at boot instead of a wall of history. This kit emits it from the ledger so every harness, on every machine, starts from the same compact truth.
+The context packet is the "where we left off" file the community keeps rebuilding by hand, and it is the boot contract described for CortextOS V2 by the community this kit was built for: the harness receives a packet at boot instead of a wall of history. This kit emits it from the ledger so every harness, on every machine, starts from the same compact truth.
 
 ## Command
 
@@ -20,7 +20,7 @@ Default format is `both`. Default out dir is the task's run dir (`<runs>/<task-i
   "task": {
     "id": "t_...", "title": "...", "kind": "implement", "task_class": "ci-hardening", "arm": "tri",
     "repo": "owner/name", "issue_number": 208, "pr_number": null,
-    "status": "input_required", "outcome": null, "owner": "aundre", "priority": 2, "due_at": null,
+    "status": "input_required", "outcome": null, "owner": "owner1", "priority": 2, "due_at": null,
     "base_commit": "abc123", "branch": "cortexos/issue-208-tri", "worktree": "/abs/path"
   },
   "limits": { "attempts_used": 2, "attempts_max": 3, "spend_used_usd": 1.92, "spend_max_usd": 5.0,

@@ -68,10 +68,14 @@ measurement's OpenCode Go spend exceed the subscription itself; the schema
 has no separate field for "ceiling on the whole measurement run", so tying
 the enforced ceiling to the real monthly number is the honest way to express
 it with the code that exists. Declaring the windows in `cortex-ledger.json`
-only documents the intent, though: `checkQuota` (`src/limits.mjs`) reads
-`provider_quota` rows from the database, and only `quota:set` creates those
--- the three `quota:set` commands in `examples/measurement-opencode-go.md`
-must be run once per ledger before the ceiling is actually enforced.
+is enough on its own: a window declared in `config.providers.<name>.windows`
+is enforced as an admission gate at `run:start` and reconciled at `ingest`
+(`docs/guards.md` "Provider quota ceilings: config vs. `quota:set`"), with no
+`quota:set` call required. The three `quota:set` commands in
+`examples/measurement-opencode-go.md` are an optional override, not a
+prerequisite -- useful for pinning a ceiling for this one deployment -- and,
+once run, that row wins over the config for the same (provider, model,
+window kind) permanently, until `quota:set` is used again.
 `limits.spend_usd` is a separate, per-task ceiling on top of that; it sums
 every provider's cost for one task, not only OpenCode Go's.
 

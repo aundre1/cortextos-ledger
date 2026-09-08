@@ -54,7 +54,7 @@ test('approve: refused below min_reviews', async () => {
   const { db, config } = await migrated({ min_reviews: 2 });
   const p = propose(db, config, baseProposal());
   review(db, config, { id: p.id, reviewer: 'builder', verdict: 'support' });
-  assert.throws(() => approve(db, config, { id: p.id, by: 'aundre' }), /needs 2/);
+  assert.throws(() => approve(db, config, { id: p.id, by: 'owner1' }), /needs 2/);
 });
 
 test('approve: an opposing review blocks approval unless --force', async () => {
@@ -62,9 +62,9 @@ test('approve: an opposing review blocks approval unless --force', async () => {
   const p = propose(db, config, baseProposal());
   review(db, config, { id: p.id, reviewer: 'builder', verdict: 'support' });
   review(db, config, { id: p.id, reviewer: 'reviewer', verdict: 'oppose', note: 'too risky' });
-  assert.throws(() => approve(db, config, { id: p.id, by: 'aundre' }), /opposing review/);
+  assert.throws(() => approve(db, config, { id: p.id, by: 'owner1' }), /opposing review/);
 
-  const { task, proposal } = approve(db, config, { id: p.id, by: 'aundre', force: true, note: 'overriding' });
+  const { task, proposal } = approve(db, config, { id: p.id, by: 'owner1', force: true, note: 'overriding' });
   assert.equal(proposal.status, 'converted');
   assert.equal(proposal.converted_task_id, task.id);
 });
@@ -74,10 +74,10 @@ test('approve: converts through insertTask and links converted_task_id both ways
   const p = propose(db, config, baseProposal({ business: 'biz-a', taskClass: 'feature' }));
   review(db, config, { id: p.id, reviewer: 'builder', verdict: 'support' });
 
-  const { task, proposal } = approve(db, config, { id: p.id, by: 'aundre', note: 'go' });
+  const { task, proposal } = approve(db, config, { id: p.id, by: 'owner1', note: 'go' });
   assert.equal(proposal.status, 'converted');
   assert.equal(proposal.converted_task_id, task.id);
-  assert.equal(proposal.decided_by, 'aundre');
+  assert.equal(proposal.decided_by, 'owner1');
 
   const stored = getTask(db, task.id);
   assert.equal(stored.title, p.title);
@@ -89,8 +89,8 @@ test('approve: converts through insertTask and links converted_task_id both ways
 test('approve: refuses a proposal that is already converted, rejected, or expired', async () => {
   const { db, config } = await migrated();
   const p = propose(db, config, baseProposal());
-  reject(db, config, { id: p.id, by: 'aundre', note: 'no' });
-  assert.throws(() => approve(db, config, { id: p.id, by: 'aundre' }), /already rejected/);
+  reject(db, config, { id: p.id, by: 'owner1', note: 'no' });
+  assert.throws(() => approve(db, config, { id: p.id, by: 'owner1' }), /already rejected/);
 });
 
 test('expireStale: proposed proposals older than the ttl move to expired; under_review does not', async () => {
@@ -147,12 +147,12 @@ test('CLI: propose / proposal:review / proposal:list / proposal:approve / propos
   const list = cli(['proposal:list', '--business', 'biz-a']);
   assert.match(list.stdout, new RegExp(proposalId));
 
-  const approveResult = cli(['proposal:approve', '--id', proposalId, '--by', 'aundre']);
+  const approveResult = cli(['proposal:approve', '--id', proposalId, '--by', 'owner1']);
   assert.equal(approveResult.code, 0, approveResult.stderr);
   assert.match(approveResult.stdout.trim(), /^t_/);
 
   const propose2 = cli(['propose', '--author', 'architect', '--business', 'biz-a', '--kind', 'task', '--title', 'Do another', '--rationale', 'because', '--impact', 'grows y']);
   const id2 = propose2.stdout.trim();
-  const rejectResult = cli(['proposal:reject', '--id', id2, '--by', 'aundre', '--note', 'not now']);
+  const rejectResult = cli(['proposal:reject', '--id', id2, '--by', 'owner1', '--note', 'not now']);
   assert.equal(rejectResult.code, 0, rejectResult.stderr);
 });

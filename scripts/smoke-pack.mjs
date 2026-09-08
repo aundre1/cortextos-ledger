@@ -68,22 +68,25 @@ function main() {
   }
   log(`packed ${entry.filename} (${entry.files.length} files, ${entry.size} bytes)`);
 
-  // Fail loudly, right here, if the tarball the rest of E5-3 built ever
-  // regresses back to shipping the internal build log or the test suite -
-  // scripts/publish-check.mjs checks this too, but a smoke test that
-  // silently installed the internal directory would be worse than no
-  // smoke test at all.
-  const shippedPaths = entry.files.map((f) => f.path);
-  const forbiddenlyShipped = shippedPaths.filter((p) => /^\.claude\//.test(p) || /^test\//.test(p));
-  if (forbiddenlyShipped.length) {
-    throw new Error(`tarball unexpectedly contains: ${forbiddenlyShipped.join(', ')}`);
-  }
-
   // 2. Install it into a scratch directory outside the repo, the way a
   // consumer would (`npm install <tarball>`) - never `npm link`.
   const scratch = mkdtempSync(join(tmpdir(), 'cortexctl-smoke-'));
   log(`installing into scratch dir: ${scratch}`);
   try {
+    // Fail loudly, right here, if the tarball the rest of E5-3 built ever
+    // regresses back to shipping the internal build log or the test suite -
+    // scripts/publish-check.mjs checks this too, but a smoke test that
+    // silently installed the internal directory would be worse than no
+    // smoke test at all. Kept inside the try (after the tarball already
+    // exists) so the finally below still deletes it on this failure path -
+    // a check that throws before the try/finally starts would leave the
+    // packed .tgz behind in the repo root.
+    const shippedPaths = entry.files.map((f) => f.path);
+    const forbiddenlyShipped = shippedPaths.filter((p) => /^\.claude\//.test(p) || /^test\//.test(p));
+    if (forbiddenlyShipped.length) {
+      throw new Error(`tarball unexpectedly contains: ${forbiddenlyShipped.join(', ')}`);
+    }
+
     runNpm(['install', '--no-save', '--no-audit', '--no-fund', '--loglevel=error', tarballPath], scratch);
 
     const installDir = join(scratch, 'node_modules', 'cortextos-ledger');
