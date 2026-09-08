@@ -8,6 +8,7 @@ import { filterEnv, redact, relativizeToCwd } from './credential-boundary.mjs';
 import { applyResolvedCommand, resolveConfiguredCommand } from './resolve-command.mjs';
 import { normalizeExitCode } from '../exit-code.mjs';
 import { firstStatusCode, retryableFromStatus } from './error-event.mjs';
+import { choosePromptDelivery, promptDeliveryEvent } from './prompt-delivery.mjs';
 
 const ARGS_SUMMARY_MAX = 200;
 const TOOL_ITEM_TYPES = new Set(['command_execution', 'file_change', 'mcp_tool_call']);
@@ -52,9 +53,19 @@ function capSummary(value, cwd) {
 export function buildArgv({ prompt, cwd, sandbox, readOnly, outDir, resumeThreadId, auth, cmd, argsPrefix, toolOverride, platform, env, execPath, readFile }) {
   const lastMessagePath = join(outDir, 'last-message.md');
   const resolution = resolveConfiguredCommand('codex', { cmd, toolOverride, platform, env, execPath, readFile });
+  const delivery = choosePromptDelivery(prompt);
+  const pdEvent = promptDeliveryEvent(delivery, prompt);
 
   if (resumeThreadId) {
-    const ownArgs = ['exec', 'resume', resumeThreadId, '-c', 'sandbox_mode="read-only"', '--json', '-o', lastMessagePath, prompt];
+    // Blocker 1 (src/adapters/prompt-delivery.mjs): `codex exec resume`
+    // reads stdin only when the positional PROMPT is the literal `-`
+    // (codex-rs/exec/src/cli.rs's ResumeArgs `prompt` field doc comment) -
+    // unlike plain `exec`, omitting the argument entirely does not trigger
+    // it, so a large prompt is never simply dropped here.
+    const ownArgs = [
+      'exec', 'resume', resumeThreadId, '-c', 'sandbox_mode="read-only"', '--json', '-o', lastMessagePath,
+      delivery === 'argv' ? prompt : '-',
+    ];
     const built = applyResolvedCommand(resolution, [...(argsPrefix ?? []), ...ownArgs]);
     return {
       cmd: built.cmd,
@@ -62,6 +73,9 @@ export function buildArgv({ prompt, cwd, sandbox, readOnly, outDir, resumeThread
       cwd,
       env: filterEnv(process.env, { adapter: 'codex', auth }),
       resolvedFrom: resolution.resolvedFrom,
+      promptDelivery: delivery,
+      stdin: delivery === 'stdin' ? prompt : undefined,
+      promptDeliveryEvent: pdEvent,
     };
   }
 
@@ -72,7 +86,14 @@ export function buildArgv({ prompt, cwd, sandbox, readOnly, outDir, resumeThread
     throw err;
   }
 
-  const ownArgs = ['exec', '--json', '--sandbox', chosenSandbox, '--cd', cwd, '-o', lastMessagePath, prompt];
+  // Blocker 1: `codex exec`'s own PROMPT positional is documented as "if not
+  // provided as an argument ..., instructions are read from stdin"
+  // (codex-rs/exec/src/cli.rs) - omitting it entirely (rather than passing
+  // `-`) is enough here, unlike the resume case above.
+  const ownArgs = [
+    'exec', '--json', '--sandbox', chosenSandbox, '--cd', cwd, '-o', lastMessagePath,
+    ...(delivery === 'argv' ? [prompt] : []),
+  ];
   const built = applyResolvedCommand(resolution, [...(argsPrefix ?? []), ...ownArgs]);
   return {
     cmd: built.cmd,
@@ -80,6 +101,9 @@ export function buildArgv({ prompt, cwd, sandbox, readOnly, outDir, resumeThread
     cwd,
     env: filterEnv(process.env, { adapter: 'codex', auth }),
     resolvedFrom: resolution.resolvedFrom,
+    promptDelivery: delivery,
+    stdin: delivery === 'stdin' ? prompt : undefined,
+    promptDeliveryEvent: pdEvent,
   };
 }
 
@@ -230,12 +254,31 @@ export function parseStream(lines, { cwd } = {}) {
 /** run(opts) per the interface at the top of docs/adapters.md. */
 export async function run(opts) {
   const { prompt, cwd, sandbox, readOnly, outDir, resumeThreadId, auth, timeoutMs, detach, onEvent } = opts;
-  const { cmd, args, env } = buildArgv({ prompt, cwd, sandbox, readOnly, outDir, resumeThreadId, auth });
+  const { cmd, args, env, stdin: stdinText, promptDelivery, promptDeliveryEvent: pdEvent } = buildArgv({
+    prompt, cwd, sandbox, readOnly, outDir, resumeThreadId, auth,
+  });
+
+  const earlyEvents = pdEvent ? [pdEvent] : [];
+  for (const event of earlyEvents) onEvent?.(event);
 
   mkdirSync(outDir, { recursive: true });
-  // stdin closed: an open stdin hangs codex exec (docs/adapters.md "codex").
-  const child = spawn(cmd, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+  // stdin is closed (docs/adapters.md "codex": "an open stdin hangs the
+  // process") UNLESS this launch's prompt delivery is 'stdin' (Blocker 1,
+  // src/adapters/prompt-delivery.mjs) - in that case it is piped, written
+  // with the exact prompt text, and explicitly closed right after, which is
+  // what tells codex the input is complete rather than leaving it open and
+  // waiting.
+  const child = spawn(cmd, args, {
+    cwd,
+    env,
+    stdio: [stdinText !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+    shell: false,
+  });
   writeFileSync(join(outDir, 'pid.txt'), String(child.pid ?? ''));
+  if (stdinText !== undefined) {
+    child.stdin.write(stdinText);
+    child.stdin.end();
+  }
 
   if (detach) {
     child.unref();
@@ -273,14 +316,16 @@ export async function run(opts) {
   if (timer) clearTimeout(timer);
   const elapsedMs = Date.now() - start;
 
-  const events = parseStream(stdout.split('\n'), { cwd });
-  for (const event of events) onEvent?.(event);
+  const parsedEvents = parseStream(stdout.split('\n'), { cwd });
+  for (const event of parsedEvents) onEvent?.(event);
 
   // The NDJSON stream has no real subprocess exit code of its own; patch the
   // actual one from the spawned process onto session.end so downstream
   // consumers (ingest) see the true result instead of an absent field.
-  const endEvent = [...events].reverse().find((e) => e.type === 'session.end');
+  const endEvent = [...parsedEvents].reverse().find((e) => e.type === 'session.end');
   if (endEvent && endEvent.exit_code === undefined) endEvent.exit_code = exitCode;
+
+  const events = [...earlyEvents, ...parsedEvents];
 
   writeFileSync(join(outDir, 'events.jsonl'), events.map((e) => JSON.stringify(e)).join('\n') + (events.length ? '\n' : ''));
   writeFileSync(join(outDir, 'out.txt'), redact(stdout || stderr));
@@ -300,5 +345,6 @@ export async function run(opts) {
     requests: endEvent?.requests ?? 0,
     toolCalls,
     summary: '',
+    promptDelivery,
   };
 }

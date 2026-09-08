@@ -39,7 +39,7 @@
 // `detached: true` on POSIX so it owns its own process group.
 
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { redact } from './credential-boundary.mjs';
 import { ADAPTER_NAMES } from './index.mjs';
@@ -154,6 +154,12 @@ async function main() {
   const timeoutMs = flags['timeout-ms'] !== undefined ? Number(flags['timeout-ms']) : undefined;
   const adapterName = flags.adapter;
   const eventsPath = flags.events;
+  // Blocker 1 (src/adapters/prompt-delivery.mjs, src/adapters/spawn.mjs
+  // launchDetached's `stdinFile`): a short path naming a file the caller
+  // already wrote (redacted at rest, same as out.txt) whose exact bytes this
+  // runner pipes onto the harness's own real stdin - never the prompt text
+  // itself, which never reaches this runner's own argv.
+  const stdinFilePath = flags['stdin-file'];
   // D1: events already known before the harness spawns (opencode's
   // `credentials.forwarded`/`credentials.missing`) - see spawn.mjs
   // launchDetached's `initialEvents` doc comment for why this must be seeded
@@ -171,7 +177,7 @@ async function main() {
 
   if (!outDir || !cmd) {
     process.stderr.write(
-      'runner: usage: --out <dir> --cwd <dir> [--timeout-ms <n>] [--adapter <name>] [--events <path>] [--initial-events <json>] -- <cmd> [args...]\n'
+      'runner: usage: --out <dir> --cwd <dir> [--timeout-ms <n>] [--adapter <name>] [--events <path>] [--initial-events <json>] [--stdin-file <path>] -- <cmd> [args...]\n'
     );
     process.exit(1);
   }
@@ -277,7 +283,7 @@ async function main() {
   try {
     child = spawn(cmd, args, {
       cwd,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [stdinFilePath ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       shell: false,
       detached: process.platform !== 'win32',
     });
@@ -288,6 +294,18 @@ async function main() {
   }
 
   writeFileSync(join(outDir, 'pid.txt'), String(child.pid));
+
+  // Blocker 1: write the relayed prompt file's exact bytes to the harness's
+  // real stdin, then close it - an open, never-closed stdin is exactly what
+  // docs/adapters.md's codex section warns hangs that harness, so this must
+  // always end() once the write completes, never left open waiting for more.
+  if (stdinFilePath) {
+    try {
+      child.stdin.write(readFileSync(stdinFilePath));
+    } finally {
+      child.stdin.end();
+    }
+  }
 
   child.stdout.on('data', (d) => stdoutSplitter.write(d));
   child.stderr.on('data', (d) => stderrSplitter.write(d));

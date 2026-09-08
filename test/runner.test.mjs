@@ -4,6 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 
 import { makeTempDir } from './helpers.mjs';
 
@@ -291,6 +292,70 @@ test('runner: claude - the final result line reports a real exit_code but only "
   assert.ok(end.elapsed_ms >= 0);
   assert.equal(end.duration_ms, 999, 'the harness\'s own duration_ms is untouched');
   assert.equal(end.tokens_in, 7);
+});
+
+// ---------------------------------------------------------------------------
+// Blocker 1 (owner's real machine, PR #972, 492 additions): `spawn
+// ENAMETOOLONG` on Windows from a large reviewer brief in argv. The
+// runner-level guarantee this relay depends on: `--stdin-file <path>` names
+// a file this runner itself never puts into its own argv (only the short
+// path is), and the file's exact bytes are piped onto the real harness's
+// stdin. This is checked by making the stub harness genuinely read stdin to
+// EOF and compute a sha256 checksum of what it received, rather than only
+// inspecting argv shape - proving the full 40000-character prompt survives
+// the relay byte-for-byte, not merely that no truncated/mangled copy of it
+// ended up in argv.
+// ---------------------------------------------------------------------------
+
+test('runner: --stdin-file relays the prompt file\'s exact bytes onto the harness\'s real stdin (checksum, not argv shape)', () => {
+  const outDir = makeTempDir();
+  const cwd = makeTempDir();
+  const promptDir = makeTempDir();
+
+  const prompt = 'The reviewer brief. '.repeat(2100); // well over the 40000-char threshold
+  assert.ok(prompt.length > 40000, `fixture prompt should exceed 40000 chars, got ${prompt.length}`);
+  const expectedChecksum = createHash('sha256').update(prompt, 'utf8').digest('hex');
+
+  const stdinFile = join(promptDir, 'prompt.txt');
+  writeFileSync(stdinFile, prompt);
+
+  // The stub harness: read all of stdin to EOF, then print the byte length
+  // and sha256 checksum of exactly what it received - nothing about argv is
+  // asserted here, only what actually arrived on the child's own stdin.
+  const stubScript = [
+    "const crypto = require('crypto');",
+    'let chunks = [];',
+    'process.stdin.on("data", (d) => chunks.push(d));',
+    'process.stdin.on("end", () => {',
+    '  const buf = Buffer.concat(chunks);',
+    '  const hash = crypto.createHash("sha256").update(buf).digest("hex");',
+    '  console.log(JSON.stringify({ length: buf.length, sha256: hash }));',
+    '  process.exit(0);',
+    '});',
+  ].join('\n');
+
+  const result = runRunner([
+    '--out', outDir,
+    '--cwd', cwd,
+    '--stdin-file', stdinFile,
+    '--',
+    process.execPath, '-e', stubScript,
+  ]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(Number(readFileSync(join(outDir, 'exit.txt'), 'utf8').trim()), 0);
+
+  const out = readFileSync(join(outDir, 'out.txt'), 'utf8');
+  const reportLine = out.split('\n').find((l) => l.trim().startsWith('{'));
+  assert.ok(reportLine, `expected the stub's JSON report line in out.txt, got: ${out}`);
+  const report = JSON.parse(reportLine);
+
+  // Byte-for-byte: the exact length and checksum of the 40000+ character
+  // prompt, as received by the harness's own stdin - not merely "some data
+  // arrived", and never inferred from argv (--stdin-file's argv value is
+  // only ever the short path to this fixture file, never the prompt text
+  // itself - see the runner's own usage line and doc comment above).
+  assert.equal(report.length, Buffer.byteLength(prompt, 'utf8'));
+  assert.equal(report.sha256, expectedChecksum);
 });
 
 test('runner: normal completion (no pre-existing exit.txt) still writes the real exit code', () => {

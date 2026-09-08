@@ -3,7 +3,7 @@
 // msg, artifact, test, intervene, task:close, task:resolve, task:reject.
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -43,6 +43,7 @@ import {
 } from '../guards/postrun.mjs';
 import { getAdapter } from '../adapters/index.mjs';
 import { launchDetached, pollPidFile, waitForDoneMarker } from '../adapters/spawn.mjs';
+import { redact } from '../adapters/credential-boundary.mjs';
 import { watch as watchRun } from '../guards/watchdog.mjs';
 import { activeFor } from '../policy.mjs';
 import { normalizeExitCode } from '../exit-code.mjs';
@@ -544,7 +545,7 @@ export function register(registry) {
       // synchronously, by the time this command returns.
       if (flags.sync) {
         const fixturePath = process.env.CORTEX_FAKE_FIXTURE;
-        await adapter.run({
+        const syncResult = await adapter.run({
           prompt,
           cwd: task.worktree,
           agent: flags.agent,
@@ -561,6 +562,15 @@ export function register(registry) {
             ? { fixture: fixturePath ? JSON.parse(readFileSync(fixturePath, 'utf8')) : undefined }
             : {}),
         });
+        // Blocker 1: every real adapter's run() now reports back which
+        // channel it actually used (src/adapters/prompt-delivery.mjs);
+        // the fake adapter never puts a prompt into argv at all (it is
+        // fixture driven, not prompt driven), so it has nothing to report
+        // and this defaults to 'argv' as a bookkeeping placeholder.
+        db.prepare('UPDATE task_runs SET prompt_delivery = ? WHERE id = ?').run(
+          syncResult?.promptDelivery ?? 'argv',
+          run.id
+        );
       } else {
         const adapterConfig = config.adapters?.[adapterName] ?? {};
         let dataHome;
@@ -589,7 +599,10 @@ export function register(registry) {
         // permission binding"). Harmless to pass to every adapter; only
         // opencode's buildArgv looks at it.
         const agentDef = config.agents?.[flags.agent] ?? {};
-        const { cmd, args, env, resolvedFrom, credentialsEvent } = adapter.buildArgv({
+        const {
+          cmd, args, env, resolvedFrom, credentialsEvent,
+          promptDelivery, stdin: stdinText, promptDeliveryEvent: pdEvent,
+        } = adapter.buildArgv({
           prompt,
           cwd: task.worktree,
           agent: flags.agent,
@@ -604,6 +617,28 @@ export function register(registry) {
         if (resolvedFrom === null) {
           err(`cortexctl: warn: ${adapterName} not found on PATH; spawn will fail with ENOENT`);
         }
+
+        // Blocker 1 (real defect: `spawn ENAMETOOLONG` launching a review of
+        // a 492-addition PR): whichever adapter this is, when its buildArgv
+        // chose a delivery other than 'argv' the actual prompt text comes
+        // back on `stdin` here - it must never be handed to launchDetached
+        // as an argv element (that would just move the same overflow one
+        // process over, into the detached runner's own spawn of *itself*).
+        // Instead it is written once, redacted at rest exactly like out.txt
+        // (docs/adapters.md "spawn helper and credential boundary"), and only
+        // the resulting short file path crosses into runner.mjs's own argv -
+        // see src/adapters/runner.mjs's `--stdin-file`, which pipes this
+        // file's exact bytes onto the harness's real stdin.
+        let stdinFile;
+        if (stdinText !== undefined) {
+          stdinFile = join(outDir, 'prompt.txt');
+          writeFileSync(stdinFile, redact(stdinText));
+        }
+        db.prepare('UPDATE task_runs SET prompt_delivery = ? WHERE id = ?').run(
+          promptDelivery ?? 'argv',
+          run.id
+        );
+
         launchDetached({
           argv: { cmd, args, env },
           cwd: task.worktree,
@@ -611,12 +646,15 @@ export function register(registry) {
           timeoutMs,
           adapter: adapterName,
           eventsPath: join(outDir, 'events.jsonl'),
-          // D1: opencode's own credentials.forwarded/credentials.missing
-          // bookkeeping event, seeded into events.jsonl by runner.mjs before
-          // the harness spawns (see spawn.mjs launchDetached's doc comment).
-          // undefined for every other adapter - buildArgv only returns it
-          // for opencode.
-          initialEvents: credentialsEvent ? [credentialsEvent] : undefined,
+          // D1/Blocker 1: opencode's own credentials.forwarded/missing event
+          // and/or this launch's prompt.delivery event, seeded into
+          // events.jsonl by runner.mjs before the harness spawns (see
+          // spawn.mjs launchDetached's doc comment). `credentialsEvent` is
+          // undefined for every adapter but opencode; `pdEvent` is returned
+          // by all three real adapters' buildArgv (never fake's, which has
+          // no prompt of its own to report on).
+          initialEvents: [credentialsEvent, pdEvent].filter(Boolean),
+          stdinFile,
         });
 
         // Review round 2, R2-1: doRunStart's insertRun never had a pid to

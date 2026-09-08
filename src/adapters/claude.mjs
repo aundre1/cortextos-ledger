@@ -11,15 +11,30 @@ import { filterEnv, redact, relativizeToCwd } from './credential-boundary.mjs';
 import { applyResolvedCommand, resolveConfiguredCommand } from './resolve-command.mjs';
 import { normalizeExitCode } from '../exit-code.mjs';
 import { firstStatusCode, retryableFromStatus } from './error-event.mjs';
+import { choosePromptDelivery, promptDeliveryEvent } from './prompt-delivery.mjs';
 
 const ARGS_SUMMARY_MAX = 200;
 
 /**
  * buildArgv({ prompt, cwd, model, allowedTools, auth, cmd, argsPrefix,
- * toolOverride }) -> { cmd, args, cwd, env, resolvedFrom } per
- * docs/adapters.md: prompt is always an argument, never stdin. Permission
- * flags come from config's `allowedTools`; this kit never passes
+ * toolOverride }) -> { cmd, args, cwd, env, resolvedFrom, promptDelivery,
+ * stdin?, promptDeliveryEvent } per docs/adapters.md. Permission flags come
+ * from config's `allowedTools`; this kit never passes
  * `--dangerously-skip-permissions` (docs/adapters.md "Permissions").
+ *
+ * Prompt delivery (Blocker 1, `src/adapters/prompt-delivery.mjs`): a prompt
+ * at or under `PROMPT_ARGV_THRESHOLD` is passed inline after `-p`, exactly
+ * as every version of this adapter before this task did. A larger prompt is
+ * never put into `args` at all - `-p` is still passed (Claude Code's print
+ * mode), but with nothing following it, so the CLI reads the prompt from
+ * stdin instead; the actual prompt text comes back on `stdin` for the
+ * caller to write to the child's real stdin (run() below does this itself;
+ * the detached launch path relays it via a redacted-at-rest temp file - see
+ * src/commands/runs.mjs and src/adapters/runner.mjs's `--stdin-file`).
+ * `promptDeliveryEvent` is this launch's `prompt.delivery` bookkeeping
+ * event, always returned so it can be seeded into events.jsonl before the
+ * harness ever starts (this task's own requirement: "the choice must be
+ * visible").
  *
  * Command resolution (docs/adapters.md "Windows command resolution"), in
  * precedence order: an explicit `cmd` (review round 1, F2 test harness -
@@ -33,8 +48,9 @@ const ARGS_SUMMARY_MAX = 200;
  * unchanged.
  */
 export function buildArgv({ prompt, cwd, model, allowedTools, auth, cmd, argsPrefix, toolOverride, platform, env, execPath, readFile }) {
+  const delivery = choosePromptDelivery(prompt);
   const ownArgs = [
-    '-p', prompt,
+    '-p', ...(delivery === 'argv' ? [prompt] : []),
     '--output-format', 'stream-json',
     '--verbose',
     ...(model ? ['--model', model] : []),
@@ -49,6 +65,9 @@ export function buildArgv({ prompt, cwd, model, allowedTools, auth, cmd, argsPre
     cwd,
     env: filterEnv(process.env, { adapter: 'claude', auth }),
     resolvedFrom: resolution.resolvedFrom,
+    promptDelivery: delivery,
+    stdin: delivery === 'stdin' ? prompt : undefined,
+    promptDeliveryEvent: promptDeliveryEvent(delivery, prompt),
   };
 }
 
@@ -220,11 +239,28 @@ export function parseStream(lines, { cwd } = {}) {
 /** run(opts) per the interface at the top of docs/adapters.md. */
 export async function run(opts) {
   const { prompt, cwd, model, allowedTools, auth, outDir, timeoutMs, detach, onEvent } = opts;
-  const { cmd, args, env } = buildArgv({ prompt, cwd, model, allowedTools, auth });
+  const { cmd, args, env, stdin: stdinText, promptDelivery, promptDeliveryEvent: pdEvent } = buildArgv({
+    prompt, cwd, model, allowedTools, auth,
+  });
+
+  // Blocker 1: fired as soon as the delivery choice is known, same pattern
+  // opencode.mjs's D1 credentialsEvent already uses for its own
+  // known-before-spawn bookkeeping event.
+  const earlyEvents = pdEvent ? [pdEvent] : [];
+  for (const event of earlyEvents) onEvent?.(event);
 
   mkdirSync(outDir, { recursive: true });
-  const child = spawn(cmd, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+  const child = spawn(cmd, args, {
+    cwd,
+    env,
+    stdio: [stdinText !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+    shell: false,
+  });
   writeFileSync(join(outDir, 'pid.txt'), String(child.pid ?? ''));
+  if (stdinText !== undefined) {
+    child.stdin.write(stdinText);
+    child.stdin.end();
+  }
 
   if (detach) {
     child.unref();
@@ -262,8 +298,9 @@ export async function run(opts) {
   if (timer) clearTimeout(timer);
   const elapsedMs = Date.now() - start;
 
-  const events = parseStream(stdout.split('\n'), { cwd });
-  for (const event of events) onEvent?.(event);
+  const parsedEvents = parseStream(stdout.split('\n'), { cwd });
+  for (const event of parsedEvents) onEvent?.(event);
+  const events = [...earlyEvents, ...parsedEvents];
 
   writeFileSync(join(outDir, 'events.jsonl'), events.map((e) => JSON.stringify(e)).join('\n') + (events.length ? '\n' : ''));
   writeFileSync(join(outDir, 'out.txt'), redact(stdout || stderr));
@@ -284,5 +321,6 @@ export async function run(opts) {
     requests: endEvent?.requests ?? 0,
     toolCalls,
     summary: endEvent?.result_excerpt ?? '',
+    promptDelivery,
   };
 }

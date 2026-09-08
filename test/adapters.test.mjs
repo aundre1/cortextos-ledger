@@ -8,6 +8,7 @@ import * as claude from '../src/adapters/claude.mjs';
 import * as codex from '../src/adapters/codex.mjs';
 import * as opencode from '../src/adapters/opencode.mjs';
 import { makeTempDir } from './helpers.mjs';
+import { PROMPT_ARGV_THRESHOLD } from '../src/adapters/prompt-delivery.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = join(HERE, 'fixtures');
@@ -850,4 +851,87 @@ test('opencode parseStream: fixture (already-normalized plugin events) gives exp
 
   assertNoEventFieldTooLong(events, 'args_summary');
   assertNoEventFieldTooLong(events, 'error');
+});
+
+// ---------------------------------------------------------------------------
+// Blocker 1 (owner's real machine, PR #972, 492 additions): a large reviewer
+// brief passed as a plain argv element failed to launch with `spawn
+// ENAMETOOLONG` on Windows. src/adapters/prompt-delivery.mjs's threshold
+// (8000 chars, deterministic on every platform - see its own doc comment)
+// decides argv vs stdin; every adapter must honor it. These tests build argv
+// for a 40000-character prompt with `platform`/`platformOverride: 'win32'`
+// injected (the platform this defect actually happened on) and assert no
+// element of the returned argv array contains the prompt body at all, and
+// that the delivery choice is recorded on the buildArgv result and mirrored
+// into the seeded `prompt.delivery` event. A companion short-prompt test per
+// adapter confirms the pre-existing (at-or-under-threshold) argv shape is
+// completely unaffected - this is a new branch, not a behavior change.
+// ---------------------------------------------------------------------------
+
+const HUGE_PROMPT = 'x'.repeat(40000);
+
+function assertNoArgvContainsPrompt(args, prompt) {
+  for (const a of args) {
+    assert.equal(typeof a === 'string' && a.includes(prompt), false, `argv element unexpectedly carries the prompt body: ${String(a).slice(0, 80)}...`);
+  }
+}
+
+test('claude buildArgv: a 40000-char prompt on win32 never appears in argv; delivered via stdin instead', () => {
+  const result = claude.buildArgv({ prompt: HUGE_PROMPT, cwd: '/work', platform: 'win32' });
+  assertNoArgvContainsPrompt(result.args, HUGE_PROMPT);
+  assert.ok(result.args.includes('-p'), '-p is still passed (print mode) - just with nothing following it');
+  assert.equal(result.promptDelivery, 'stdin');
+  assert.equal(result.stdin, HUGE_PROMPT, 'the exact prompt text is returned separately for the caller to pipe to stdin');
+  assert.equal(result.promptDeliveryEvent.type, 'prompt.delivery');
+  assert.equal(result.promptDeliveryEvent.delivery, 'stdin');
+  assert.equal(result.promptDeliveryEvent.length, HUGE_PROMPT.length);
+});
+
+test('claude buildArgv: a short prompt (at/under threshold) keeps the pre-existing argv shape, delivery "argv"', () => {
+  const prompt = 'x'.repeat(PROMPT_ARGV_THRESHOLD);
+  const result = claude.buildArgv({ prompt, cwd: '/work', platform: 'linux' });
+  assert.deepEqual(result.args, ['-p', prompt, '--output-format', 'stream-json', '--verbose']);
+  assert.equal(result.promptDelivery, 'argv');
+  assert.equal(result.stdin, undefined);
+});
+
+test('codex buildArgv: a 40000-char prompt on win32 never appears in argv (new run); delivered via stdin instead', () => {
+  const result = codex.buildArgv({ prompt: HUGE_PROMPT, cwd: '/work', outDir: '/out', platform: 'win32' });
+  assertNoArgvContainsPrompt(result.args, HUGE_PROMPT);
+  assert.equal(result.promptDelivery, 'stdin');
+  assert.equal(result.stdin, HUGE_PROMPT);
+  assert.equal(result.promptDeliveryEvent.delivery, 'stdin');
+  assert.equal(result.promptDeliveryEvent.length, HUGE_PROMPT.length);
+});
+
+test('codex buildArgv: a 40000-char prompt on win32 with resume passes the literal "-" (not the prompt), delivered via stdin', () => {
+  const result = codex.buildArgv({ prompt: HUGE_PROMPT, cwd: '/work', outDir: '/out', resumeThreadId: 'thread_123', platform: 'win32' });
+  assertNoArgvContainsPrompt(result.args, HUGE_PROMPT);
+  assert.equal(result.args[result.args.length - 1], '-', 'resume needs the literal "-" to read stdin (codex-rs/exec/src/cli.rs)');
+  assert.equal(result.promptDelivery, 'stdin');
+  assert.equal(result.stdin, HUGE_PROMPT);
+});
+
+test('codex buildArgv: a short prompt keeps the pre-existing argv shape, delivery "argv"', () => {
+  const prompt = 'review this';
+  const result = codex.buildArgv({ prompt, cwd: '/work', readOnly: true, outDir: '/out', platform: 'linux' });
+  assert.deepEqual(result.args, ['exec', '--json', '--sandbox', 'read-only', '--cd', '/work', '-o', join('/out', 'last-message.md'), prompt]);
+  assert.equal(result.promptDelivery, 'argv');
+  assert.equal(result.stdin, undefined);
+});
+
+test('opencode buildArgv: a 40000-char prompt on win32 never appears in argv; delivered via stdin instead', () => {
+  const result = opencode.buildArgv({ prompt: HUGE_PROMPT, cwd: '/work', agent: 'builder', model: 'opencode/x', outDir: '/out', platformOverride: 'win32' });
+  assertNoArgvContainsPrompt(result.args, HUGE_PROMPT);
+  assert.equal(result.promptDelivery, 'stdin');
+  assert.equal(result.stdin, HUGE_PROMPT);
+  assert.equal(result.promptDeliveryEvent.delivery, 'stdin');
+  assert.equal(result.promptDeliveryEvent.length, HUGE_PROMPT.length);
+});
+
+test('opencode buildArgv: a short prompt keeps the pre-existing argv shape, delivery "argv"', () => {
+  const result = opencode.buildArgv({ prompt: 'go', cwd: '/work', platformOverride: 'linux' });
+  assert.deepEqual(result.args, ['run', '--format', 'json', 'go']);
+  assert.equal(result.promptDelivery, 'argv');
+  assert.equal(result.stdin, undefined);
 });

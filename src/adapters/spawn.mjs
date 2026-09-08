@@ -45,8 +45,17 @@ const RUNNER_PATH = join(HERE, 'runner.mjs');
  * retries) and would otherwise silently wipe anything written here first.
  * Adapter-agnostic: runner.mjs does not know or care why these events
  * exist, only that they come first.
+ *
+ * `stdinFile` (Blocker 1, `src/adapters/prompt-delivery.mjs`): an absolute
+ * path to a file already written to disk (by the caller - see
+ * src/commands/runs.mjs `launchAttempt`) whose exact bytes the harness
+ * should receive on its own real stdin, for a prompt too large to ever pass
+ * through this (or any) process's argv. The path is short and safe to pass
+ * here even when the file it names holds tens of thousands of characters -
+ * the whole point of this indirection is that the large content never
+ * becomes an argv element on the way to the detached runner either.
  */
-export function launchDetached({ argv, cwd, outDir, timeoutMs, adapter, eventsPath, initialEvents }) {
+export function launchDetached({ argv, cwd, outDir, timeoutMs, adapter, eventsPath, initialEvents, stdinFile }) {
   mkdirSync(outDir, { recursive: true });
   const runnerArgs = [
     RUNNER_PATH,
@@ -58,6 +67,7 @@ export function launchDetached({ argv, cwd, outDir, timeoutMs, adapter, eventsPa
     ...(adapter ? ['--adapter', adapter] : []),
     ...(eventsPath ? ['--events', eventsPath] : []),
     ...(initialEvents && initialEvents.length ? ['--initial-events', JSON.stringify(initialEvents)] : []),
+    ...(stdinFile ? ['--stdin-file', stdinFile] : []),
     '--',
     argv.cmd,
     ...(argv.args ?? []),

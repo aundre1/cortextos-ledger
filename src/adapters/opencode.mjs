@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { filterEnv, rejectAnthropicModel, redact, relativizeToCwd } from './credential-boundary.mjs';
 import { applyResolvedCommand, resolveConfiguredCommand } from './resolve-command.mjs';
 import { normalizeExitCode } from '../exit-code.mjs';
+import { choosePromptDelivery, promptDeliveryEvent } from './prompt-delivery.mjs';
 
 const ARGS_SUMMARY_MAX = 200;
 const NORMALIZED_TYPES = new Set(['session.start', 'tool.call', 'tool.result', 'message', 'session.end']);
@@ -428,11 +429,20 @@ export function buildArgv({
     execPath,
     readFile,
   });
+  // Blocker 1 (src/adapters/prompt-delivery.mjs): OpenCode's own
+  // `resolveRunInput(message, piped)` (packages/opencode/src/cli/cmd/run.ts)
+  // returns the piped stdin text whenever the positional `message` is empty
+  // - so a large prompt is simply never appended as the trailing positional
+  // here, and `opencode run` reads it from stdin instead. See
+  // docs/adapters.md "Prompt delivery (Blocker 1)" for the exact source
+  // lines this was verified against.
+  const delivery = choosePromptDelivery(prompt);
   const ownArgs = [
     'run',
     ...(agent ? ['--agent', agent] : []),
     ...(model ? ['--model', model] : []),
-    '--format', 'json', prompt,
+    '--format', 'json',
+    ...(delivery === 'argv' ? [prompt] : []),
   ];
   const built = applyResolvedCommand(resolution, [...(argsPrefix ?? []), ...ownArgs]);
 
@@ -443,6 +453,9 @@ export function buildArgv({
     env,
     resolvedFrom: resolution.resolvedFrom,
     credentialsEvent,
+    promptDelivery: delivery,
+    stdin: delivery === 'stdin' ? prompt : undefined,
+    promptDeliveryEvent: promptDeliveryEvent(delivery, prompt),
   };
 }
 
@@ -749,19 +762,31 @@ export function parseStream(lines, { cwd } = {}) {
 /** run(opts) per the interface at the top of docs/adapters.md. */
 export async function run(opts) {
   const { prompt, cwd, agent, model, dataHome, outDir, auth, timeoutMs, detach, onEvent, agentDef } = opts;
-  const { cmd, args, env, credentialsEvent } = buildArgv({ prompt, cwd, agent, model, dataHome, outDir, auth, agentDef });
+  const { cmd, args, env, credentialsEvent, stdin: stdinText, promptDelivery, promptDeliveryEvent: pdEvent } = buildArgv({
+    prompt, cwd, agent, model, dataHome, outDir, auth, agentDef,
+  });
 
-  // D1/D2 bookkeeping (credentials.forwarded/missing, from buildArgv above):
-  // fired as soon as it is known, same as every other event this adapter
-  // reports live via onEvent, and folded into whatever this run's own
-  // events.jsonl ends up containing below (the `--sync` path never runs
-  // through runner.mjs's own event-seeding, so it must happen here instead).
-  const earlyEvents = credentialsEvent ? [credentialsEvent] : [];
+  // D1/D2 bookkeeping (credentials.forwarded/missing, from buildArgv above)
+  // plus Blocker 1's own prompt.delivery event: fired as soon as each is
+  // known, same as every other event this adapter reports live via onEvent,
+  // and folded into whatever this run's own events.jsonl ends up containing
+  // below (the `--sync` path never runs through runner.mjs's own
+  // event-seeding, so it must happen here instead).
+  const earlyEvents = [credentialsEvent, pdEvent].filter(Boolean);
   for (const event of earlyEvents) onEvent?.(event);
 
   mkdirSync(outDir, { recursive: true });
-  const child = spawn(cmd, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+  const child = spawn(cmd, args, {
+    cwd,
+    env,
+    stdio: [stdinText !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+    shell: false,
+  });
   writeFileSync(path.join(outDir, 'pid.txt'), String(child.pid ?? ''));
+  if (stdinText !== undefined) {
+    child.stdin.write(stdinText);
+    child.stdin.end();
+  }
 
   if (detach) {
     child.unref();
@@ -850,5 +875,6 @@ export async function run(opts) {
     requests: endEvent?.requests ?? 0,
     toolCalls,
     summary: '',
+    promptDelivery,
   };
 }
