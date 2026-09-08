@@ -120,10 +120,17 @@ export function buildReviewerBrief(db, config, { taskId, reviewer, issueFile }) 
     );
   }
 
-  const builderDiffPath = join(config.runs, taskId, 'builder', 'patch.diff');
+  // docs/review-protocol.md "PR triage mode": "For pr_review tasks the diff
+  // comes from `gh pr diff <n>` captured by `task:new --pr`" - that diff is
+  // written to `<runs>/<taskId>/pr.diff` (docs/cli.md's `task:new` capture),
+  // never to `builder/patch.diff` (there is no builder run in PR triage
+  // mode). Falling back to the builder's patch.diff for every other task
+  // kind, unchanged from before this fix.
+  const sourceDiffPath =
+    task.kind === 'pr_review' ? join(config.runs, taskId, 'pr.diff') : join(config.runs, taskId, 'builder', 'patch.diff');
   const reviewerDiffPath = join(reviewerDir, 'patch.diff');
-  if (existsSync(builderDiffPath)) {
-    copyFileSync(builderDiffPath, reviewerDiffPath);
+  if (existsSync(sourceDiffPath)) {
+    copyFileSync(sourceDiffPath, reviewerDiffPath);
     const bytes = statSync(reviewerDiffPath).size;
     if (bytes < INLINE_DIFF_MAX_BYTES) {
       const diffText = readFileSync(reviewerDiffPath, 'utf8');
@@ -132,7 +139,7 @@ export function buildReviewerBrief(db, config, { taskId, reviewer, issueFile }) 
       sections.push(`# Diff\n\ntoo large to inline (${bytes} bytes); see ${reviewerDiffPath}`);
     }
   } else {
-    sections.push(`# Diff\n\nno patch.diff found at ${builderDiffPath} yet.`);
+    sections.push(`# Diff\n\nno diff found at ${sourceDiffPath} yet.`);
   }
 
   sections.push(`# Verdict schema\n\n${VERDICT_SCHEMA_BLOCK}`);

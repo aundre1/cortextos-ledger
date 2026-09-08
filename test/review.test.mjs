@@ -171,6 +171,25 @@ test('buildReviewerBrief: never leaks reasoning.md or builder out.txt content', 
   db.close();
 });
 
+test('buildReviewerBrief: pr_review task reads the diff from <runs>/<task>/pr.diff, never builder/patch.diff (docs/review-protocol.md "PR triage mode")', async () => {
+  const { db, config } = await migrated();
+  const task = insertTask(db, {
+    repo: 'o/n', title: 'Triage PR #7', task_class: 'pr-triage', arm: 'tri', kind: 'pr_review',
+    pr_number: 7, base_commit: 'deadbeef', branch: 'feature/x',
+  });
+  insertMessage(db, { task_id: task.id, sender: 'ledger', recipient: 'architect', kind: 'brief', body: 'PR title\n\nPR body' });
+
+  mkdirSync(join(config.runs, task.id), { recursive: true });
+  writeFileSync(join(config.runs, task.id, 'pr.diff'), '--- a/real_file.mjs\n+++ b/real_file.mjs\n@@ -1 +1 @@\n-old\n+new\n');
+
+  const { markdown } = buildReviewerBrief(db, config, { taskId: task.id, reviewer: 'reviewer' });
+  assert.ok(markdown.includes('real_file.mjs'), 'the actual PR diff content must be in the brief');
+  assert.ok(markdown.includes('PR title'));
+  assert.ok(!markdown.includes('no diff found'));
+  assert.ok(existsSync(join(config.runs, task.id, 'reviewer', 'patch.diff')), 'pr.diff is copied into the reviewer dir under the same patch.diff name');
+  db.close();
+});
+
 test('buildReviewerBrief: includes touched test files section when a test_edit escalation exists', async () => {
   const { db, config } = await migrated();
   const task = insertTask(db, { repo: 'o/n', title: 'T', task_class: 'ci', arm: 'tri' });

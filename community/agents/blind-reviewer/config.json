@@ -20,7 +20,10 @@
     "glob": "allow",
     "grep": "allow",
     "list": "allow",
-    "edit": "deny",
+    "edit": {
+      "*": "deny",
+      "**/verdict.json": "allow"
+    },
     "todowrite": "deny",
     "bash": {
       "*": "deny",

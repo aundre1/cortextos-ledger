@@ -221,11 +221,36 @@ export function resolvePromptField(promptField, { readFile = (p) => readFileSync
   }
 }
 
-/** `true` when `permission` (OpenCode's own bare-Action-or-object shape) denies `edit` outright - either an object's own `edit` rule is `"deny"`, or (no `edit` key) its wildcard `"*"` is `"deny"`, or the whole permission value is the bare string `"deny"`. */
+/**
+ * `true` when `permission` (OpenCode's own bare-Action-or-object shape, per
+ * `packages/core/src/v1/config/permission.ts`) denies `edit` by default.
+ * `edit` is a `Rule` (`Action | Record<string, Action>`, same file): its own
+ * value can be the bare string `"deny"`, or a glob-pattern-to-action *object*
+ * whose `"*"` entry is `"deny"` - the same default-deny-plus-narrow-allowlist
+ * shape this template already used for `bash` before this change, now also
+ * used for `edit` so exactly a "verdict.json at any depth" glob can be
+ * allowed while every other path stays denied (docs/review-protocol.md
+ * "PR triage mode"; see
+ * docs/adapters.md "opencode: edit permission is per-path, not per-tool
+ * (V1)" for the full citation trail, including why a narrow allow entry
+ * elsewhere in the object does not make this return `false` - OpenCode's own
+ * `Permission.evaluate`, `packages/opencode/src/permission/index.ts`, is
+ * `rulesets.flat().findLast(...)`: the *last* matching rule wins, so a
+ * specific override placed after the wildcard in the object is what makes it
+ * win for that one path while every other path still hits the wildcard
+ * `"deny"` first). No `"*"` entry in the object at all means this cannot
+ * confirm a deny-by-default stance, so it falls through instead of guessing.
+ * When there is no `edit` key, falls back to the whole permission block's own
+ * wildcard `"*"` (unchanged from before this task), or the bare string form.
+ */
 function permissionDeniesEdit(permission) {
   if (permission == null) return false;
   if (typeof permission === 'string') return permission === 'deny';
-  if (typeof permission.edit === 'string') return permission.edit === 'deny';
+  const edit = permission.edit;
+  if (typeof edit === 'string') return edit === 'deny';
+  if (edit && typeof edit === 'object') {
+    return typeof edit['*'] === 'string' && edit['*'] === 'deny';
+  }
   if (typeof permission['*'] === 'string') return permission['*'] === 'deny';
   return false;
 }

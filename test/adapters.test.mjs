@@ -454,7 +454,10 @@ test('opencode buildArgv: --agent blind-reviewer via agentDef.template translate
   // The permission block itself, byte-correct against
   // community/agents/blind-reviewer/config.json (already written in
   // OpenCode's own schema shape - packages/core/src/v1/config/permission.ts).
-  assert.equal(def.permission.edit, 'deny');
+  // `edit` is a per-path object (Rule = Action | Record<string, Action>,
+  // same file): deny by default, except the exact path the reviewer is
+  // required to write (docs/review-protocol.md "PR triage mode").
+  assert.deepEqual(def.permission.edit, { '*': 'deny', '**/verdict.json': 'allow' });
   assert.equal(def.permission.read, 'allow');
   assert.deepEqual(def.permission.bash, {
     '*': 'deny',
@@ -490,6 +493,55 @@ test('opencode buildArgv: read_only:true with agentDef.opencode that does deny e
       model: 'google/x',
       agentDef: { read_only: true, opencode: { permission: { edit: 'deny' } } },
     })
+  );
+});
+
+test('opencode buildArgv: read_only:true with a per-path edit object (wildcard deny, one narrow allow) is allowed to launch - the verdict.json carve-out', () => {
+  assert.doesNotThrow(() =>
+    opencode.buildArgv({
+      prompt: 'x',
+      cwd: '/work',
+      agent: 'reviewer',
+      model: 'google/x',
+      agentDef: {
+        read_only: true,
+        opencode: { permission: { edit: { '*': 'deny', '**/verdict.json': 'allow' } } },
+      },
+    })
+  );
+});
+
+test('opencode buildArgv: read_only:true with a per-path edit object that is mostly-allow (wildcard allow) still refuses - a narrow deny entry does not make the default deny', () => {
+  assert.throws(
+    () =>
+      opencode.buildArgv({
+        prompt: 'x',
+        cwd: '/work',
+        agent: 'reviewer',
+        model: 'google/x',
+        agentDef: {
+          read_only: true,
+          opencode: { permission: { edit: { '*': 'allow', 'secret.txt': 'deny' } } },
+        },
+      }),
+    (e) => e instanceof Error && e.code === 1 && /read_only/.test(e.message)
+  );
+});
+
+test('opencode buildArgv: read_only:true with a per-path edit object with no wildcard entry cannot confirm deny-by-default and refuses', () => {
+  assert.throws(
+    () =>
+      opencode.buildArgv({
+        prompt: 'x',
+        cwd: '/work',
+        agent: 'reviewer',
+        model: 'google/x',
+        agentDef: {
+          read_only: true,
+          opencode: { permission: { edit: { '**/verdict.json': 'allow' } } },
+        },
+      }),
+    (e) => e instanceof Error && e.code === 1 && /read_only/.test(e.message)
   );
 });
 
