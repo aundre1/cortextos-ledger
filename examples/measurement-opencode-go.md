@@ -32,9 +32,18 @@ set:
 
 ## 1. Create the ledger, once
 
+Copy the example into the directory that will hold the ledger first. `db` and
+`runs` in the config are resolved relative to the config file, so running
+`init` against the file inside `examples/` would create `examples/.cortex/`
+inside the kit's own tree instead of in your project.
+
 ```bash
-cortexctl init --config examples/config.opencode-go.json
+cp examples/config.opencode-go.json ./cortex-ledger.json
+cortexctl init --config ./cortex-ledger.json
 ```
+
+Every later command in this recipe uses `--config ./cortex-ledger.json`;
+the `examples/...` path is shown only to name the file the settings came from.
 
 `examples/config.opencode-go.json`'s `providers.opencode-go.windows` block
 (5h/week/month, matching the OpenCode Go subscription's own ceilings) is

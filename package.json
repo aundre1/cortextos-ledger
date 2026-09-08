@@ -11,11 +11,13 @@
     "cortexctl": "bin/cortexctl.mjs"
   },
   "files": [
-    "bin",
-    "src",
-    "prompts",
-    "plugins",
-    "examples",
+    "bin/*.mjs",
+    "src/**/*.mjs",
+    "src/**/*.sql",
+    "prompts/*.md",
+    "plugins/**/*.js",
+    "examples/*.json",
+    "examples/*.md",
     "LICENSE",
     "README.md",
     "CHANGELOG.md"

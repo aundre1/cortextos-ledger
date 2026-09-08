@@ -1,0 +1,20 @@
+# Mirrors .gitignore for npm pack. With package.json "files" set, npm applies
+# this file (not .gitignore) inside the listed directories, so the ledger
+# database and run artifacts must be repeated here (docs/security.md).
+.cortex/
+**/.cortex/
+orgs/
+**/events.jsonl
+**/reasoning.md
+.env
+.env.*
+*.pem
+*.key
+node_modules/
+test/
+scripts/
+docs/
+.claude/
+.github/
+community/
+*.tgz
