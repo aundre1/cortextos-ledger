@@ -235,11 +235,33 @@ async function applyOne(db, migration) {
  */
 const TX_DEPTH = Symbol('cortex.txDepth');
 
+// Blind review NF2 (medium): a reentrant (depth > 1) call has no SQL
+// savepoint of its own - `BEGIN IMMEDIATE` only ever runs once, at depth 0 -
+// so before this fix a nested call's throw was only ever handled by
+// whatever `try/catch` happened to be between it and the outermost frame.
+// If some intermediate caller *inside* the outer transaction's own `fn`
+// caught that exception and swallowed it (logged it, ignored it, whatever),
+// the outermost frame's own `try { result = fn(); } catch` never saw
+// anything go wrong: `fn()` returned normally, so the outermost frame ran
+// `COMMIT` and persisted every write the failed nested call had already
+// made plus everything the outer call did afterward - a torn, half-failed
+// transaction committed as if it had fully succeeded. `TX_FAILED` records
+// the first such swallowed failure on the db handle itself (reentrant calls
+// share one connection, so this needs no extra plumbing through every
+// caller's own return value) the moment a nested `fn()` throws, regardless
+// of who ends up catching that throw; the outermost frame checks it right
+// before its own `COMMIT` and rolls back instead if it is set, throwing a
+// new error that names the swallowed failure rather than committing blind.
+const TX_FAILED = Symbol('cortex.txFailed');
+
 export function withImmediateTransaction(db, fn) {
   if (db[TX_DEPTH] > 0) {
     db[TX_DEPTH] += 1;
     try {
       return fn();
+    } catch (e) {
+      if (db[TX_FAILED] === undefined) db[TX_FAILED] = e;
+      throw e;
     } finally {
       db[TX_DEPTH] -= 1;
     }
@@ -247,6 +269,7 @@ export function withImmediateTransaction(db, fn) {
 
   db.exec('BEGIN IMMEDIATE');
   db[TX_DEPTH] = 1;
+  db[TX_FAILED] = undefined;
   let result;
   try {
     result = fn();
@@ -258,8 +281,28 @@ export function withImmediateTransaction(db, fn) {
       // nothing more productive to do than let the original error surface.
     }
     db[TX_DEPTH] = 0;
+    db[TX_FAILED] = undefined;
     throw e;
   }
+
+  // NF2: `fn()` returned normally, but a nested call somewhere inside it may
+  // still have failed and been swallowed by an intermediate `try/catch` - do
+  // not trust a clean return alone.
+  if (db[TX_FAILED] !== undefined) {
+    const swallowed = db[TX_FAILED];
+    db[TX_DEPTH] = 0;
+    db[TX_FAILED] = undefined;
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // best effort, same as above.
+    }
+    const swallowedMessage = swallowed instanceof Error ? swallowed.message : String(swallowed);
+    throw new Error(
+      `withImmediateTransaction: rolled back - a nested transaction failed and its exception was swallowed before reaching the outermost frame: ${swallowedMessage}`
+    );
+  }
+
   db.exec('COMMIT');
   db[TX_DEPTH] = 0;
   return result;

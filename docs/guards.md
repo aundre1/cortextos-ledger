@@ -90,6 +90,22 @@ changes close this:
   counted, that third call reserves `8 + 4 = 12 > 10` and is refused, as it
   must be (arbitration 2026-09-08).
 
+  A run left in `running` with no `run:end` holds its reservation until its
+  cost is ingested or it is ended or killed. Concretely: `reservedSpend`
+  counts a `running` run against the `spend_usd` cap only until a
+  `cost_usage` row exists for that run's `run_id` -- the instant `ingest`
+  records the run's real cost (which can happen well before `run:end` ever
+  runs, or even if it never does, since the harness may have crashed after
+  its last event but before exiting), the phantom `spend_usd` reservation
+  for that run clears, because its real, already-known cost is what
+  `used_usd` now reflects instead. Without this, a run whose cost was
+  ingested but whose `task_runs.status` never left `running` (a crashed
+  harness -- `run:start` is a documented standalone command, so nothing
+  guarantees a watchdog process is watching it) was double counted forever:
+  its real `used_usd` plus a full `spend_usd` reservation on top, a total
+  that survives even a window rollover that zeroes `used_usd` back to zero
+  (rolling a window does not touch `task_runs.status`).
+
 ### Removing a window from config
 
 Deleting a window from `config.providers.<name>.windows` does not delete or

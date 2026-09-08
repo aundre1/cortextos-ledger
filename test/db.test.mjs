@@ -2,7 +2,17 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 
-import { openDb, migrate, newId, nowIso, sql, dialects, pendingMigrations, schemaVersion } from '../src/db.mjs';
+import {
+  openDb,
+  migrate,
+  newId,
+  nowIso,
+  sql,
+  dialects,
+  pendingMigrations,
+  schemaVersion,
+  withImmediateTransaction,
+} from '../src/db.mjs';
 import { makeTempDb } from './helpers.mjs';
 
 test('newId: shape, alphabet, uniqueness', () => {
@@ -129,6 +139,81 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
 
   const migrationRows = db.prepare('SELECT version FROM schema_migrations').all();
   assert.equal(migrationRows.length, 7);
+
+  db.close();
+});
+
+// Blind review NF2 (medium): withImmediateTransaction's reentrant (depth > 1)
+// branch never had a rollback path of its own - if some intermediate caller
+// inside the outer transaction's own fn() caught a nested call's throw and
+// swallowed it, the outer frame's own try/catch never saw anything wrong and
+// committed the nested call's partial writes anyway. Primitive-level repro,
+// exactly as the reviewer reported it: outer inserts row 1; a nested
+// withImmediateTransaction call inserts row 2 then throws; an intermediate
+// try/catch swallows that throw; outer inserts row 3 and returns normally.
+test('withImmediateTransaction NF2: a nested failure swallowed by an intermediate try/catch still rolls back the whole outer transaction', () => {
+  const db = openDb(makeTempDb());
+  db.exec('CREATE TABLE nf2_rows (id INTEGER PRIMARY KEY, v TEXT)');
+  const insert = db.prepare('INSERT INTO nf2_rows (v) VALUES (?)');
+
+  let outerThrew = null;
+  try {
+    withImmediateTransaction(db, () => {
+      insert.run('row1');
+      try {
+        withImmediateTransaction(db, () => {
+          insert.run('row2');
+          throw new Error('nested boom');
+        });
+      } catch {
+        // Intermediate caller swallows the nested failure - nothing here
+        // rethrows, matching the reviewer's exact repro.
+      }
+      insert.run('row3');
+      return 'outer result';
+    });
+  } catch (e) {
+    outerThrew = e;
+  }
+
+  assert.ok(
+    outerThrew,
+    'the outer call must itself throw once it discovers the swallowed nested failure, instead of committing silently'
+  );
+  assert.match(
+    outerThrew.message,
+    /nested boom/,
+    'the thrown error should name the swallowed inner failure so it is not silent'
+  );
+
+  const rows = db.prepare('SELECT * FROM nf2_rows').all();
+  assert.equal(rows.length, 0, `zero rows should have persisted after the rollback, got ${JSON.stringify(rows)}`);
+
+  db.close();
+});
+
+test('withImmediateTransaction NF2: a clean nested call still commits normally, and the failure marker does not leak into the next unrelated transaction', () => {
+  const db = openDb(makeTempDb());
+  db.exec('CREATE TABLE nf2_rows2 (id INTEGER PRIMARY KEY, v TEXT)');
+  const insert = db.prepare('INSERT INTO nf2_rows2 (v) VALUES (?)');
+
+  // A normal, successful nested transaction commits both rows.
+  const result = withImmediateTransaction(db, () => {
+    insert.run('a');
+    withImmediateTransaction(db, () => {
+      insert.run('b');
+    });
+    return 'ok';
+  });
+  assert.equal(result, 'ok');
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM nf2_rows2').get().c, 2);
+
+  // A later, entirely separate transaction is unaffected by the earlier
+  // rollback-and-throw path (the failure marker must reset between calls).
+  withImmediateTransaction(db, () => {
+    insert.run('c');
+  });
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM nf2_rows2').get().c, 3);
 
   db.close();
 });

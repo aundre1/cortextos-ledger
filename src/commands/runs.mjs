@@ -278,9 +278,21 @@ async function doRunStart({ db, config, flags, err }) {
     // this run's provider/model matches, atomically with the gate check and
     // insert above. Marked quota_reserved so ingest (src/ingest.mjs) never
     // double-counts this run's request from its real event count (F1(c)).
-    reserveRequest(db, { provider, model });
-    db.prepare('UPDATE task_runs SET quota_reserved = 1 WHERE id = ?').run(run.id);
-    run.quota_reserved = 1;
+    //
+    // Blind review NF4 (low-medium): `reserveRequest` returns the count of
+    // provider_quota rows it actually incremented, which is zero when no
+    // window matches this run's provider/model yet - nothing was reserved,
+    // so `quota_reserved` must stay 0. Before this fix it was set to 1
+    // unconditionally: if a window was declared for this provider/model
+    // *later* and this run's events were then ingested, `ingest` saw
+    // `quota_reserved = 1` and (per F1(c) above) assumed a request had
+    // already been counted for it, permanently dropping this run's real
+    // request count from that new window's `used_requests`.
+    const reservedCount = reserveRequest(db, { provider, model });
+    if (reservedCount > 0) {
+      db.prepare('UPDATE task_runs SET quota_reserved = 1 WHERE id = ?').run(run.id);
+      run.quota_reserved = 1;
+    }
     transition(db, task.id, 'working');
     return { ok: true, run };
   });

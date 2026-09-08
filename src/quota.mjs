@@ -253,12 +253,40 @@ export function reserveRequest(db, { provider, model = null, now = new Date() } 
  * scoped to model). Zero when config.limits.spend_usd is not set. Used by
  * checkQuota (src/limits.mjs) and by quota:show's `reserved_usd` column
  * (src/commands/setup.mjs).
+ *
+ * Blind review NF1 (high): a run's real cost can be ingested (a `cost_usage`
+ * row for its `run_id` exists) while `task_runs.status` is still `running`
+ * forever, if the harness process crashed after emitting its final events
+ * but before `run:end` ever ran - `run:start` is a documented standalone
+ * command (docs/cli.md), so nothing guarantees a watchdog is watching it.
+ * Before this fix such a run was double counted: `ingest` already folded its
+ * real `cost_usd` into `provider_quota.used_usd` (via `tickQuota`), and then
+ * this function counted it *again* as a full `spend_usd` phantom reservation
+ * on top, forever - surviving even a window rollover that zeroes
+ * `used_usd`, since `status = 'running'` never changes on its own. Fixed by
+ * excluding any `running` run that already has a `cost_usage` row for its
+ * `run_id`: the moment ingest has recorded a run's real cost, that run's
+ * reservation must clear, whether or not `task_runs.status` ever catches up
+ * to reflect it (`run:end`, or a human killing/resolving it, is what
+ * eventually does that; this fix does not require either to have happened
+ * first). Implemented as a `NOT EXISTS` subquery against `cost_usage`
+ * rather than a new `task_runs` column - `cost_usage` is already the
+ * authoritative "has this run's cost been recorded" signal ingest itself
+ * writes to (one `source = 'plugin'` row per run, docs/ledger.md
+ * "cost_usage"), so no migration or extra write path is needed to keep a
+ * second column in sync with it.
  */
 export function reservedSpend(db, config, provider) {
   const perRun = config?.limits?.spend_usd;
   if (!perRun) return 0;
   const row = db
-    .prepare("SELECT COUNT(*) AS c FROM task_runs WHERE status = 'running' AND provider = ?")
+    .prepare(
+      `SELECT COUNT(*) AS c
+         FROM task_runs tr
+        WHERE tr.status = 'running'
+          AND tr.provider = ?
+          AND NOT EXISTS (SELECT 1 FROM cost_usage cu WHERE cu.run_id = tr.id)`
+    )
     .get(provider);
   return row.c * perRun;
 }
