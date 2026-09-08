@@ -110,6 +110,15 @@ function armBundle(db, task) {
 // compare
 // ---------------------------------------------------------------------------
 
+// Blocker 2: an archived task is excluded from compare exactly like an
+// unadjudicated task already is (docs/measurement.md "report") - a compare
+// anchored on an archived task, or whose linked sibling has since been
+// archived, behaves as though no pair exists rather than silently comparing
+// against work the operator set aside.
+function notArchived(task) {
+  return task != null && !task.archived_at;
+}
+
 function findSiblingPair(db, { issue, pr, task }) {
   let anchor = null;
   if (task) anchor = getTask(db, task);
@@ -118,11 +127,11 @@ function findSiblingPair(db, { issue, pr, task }) {
   } else if (pr !== undefined && pr !== null) {
     anchor = db.prepare('SELECT * FROM tasks WHERE pr_number = ? ORDER BY created_at').get(pr);
   }
-  if (!anchor) return null;
+  if (!notArchived(anchor)) return null;
 
   if (anchor.sibling_id) {
     const sibling = getTask(db, anchor.sibling_id);
-    if (sibling) return anchor.arm === 'tri' ? [anchor, sibling] : [sibling, anchor];
+    if (notArchived(sibling)) return anchor.arm === 'tri' ? [anchor, sibling] : [sibling, anchor];
   }
 
   // Fall back to same repo + issue/pr number with both arms present.
@@ -130,7 +139,7 @@ function findSiblingPair(db, { issue, pr, task }) {
   const value = column === 'issue_number' ? anchor.issue_number : column === 'pr_number' ? anchor.pr_number : null;
   if (column && value != null) {
     const rows = db
-      .prepare(`SELECT * FROM tasks WHERE repo = ? AND ${column} = ?`)
+      .prepare(`SELECT * FROM tasks WHERE repo = ? AND ${column} = ? AND archived_at IS NULL`)
       .all(anchor.repo, value);
     const tri = rows.find((t) => t.arm === 'tri');
     const control = rows.find((t) => t.arm === 'control');
@@ -143,7 +152,8 @@ function findSiblingPair(db, { issue, pr, task }) {
 /**
  * Tri versus control (docs/measurement.md "Commands"). Refuses a winner
  * when either arm is unadjudicated - prints 'unadjudicated' instead, per
- * the doc.
+ * the doc. Also refuses (the same "no linked pair" shape) when either arm
+ * is archived (Blocker 2) - see `findSiblingPair`/`notArchived` above.
  */
 export function compare(db, config, { issue, pr, task } = {}) {
   const pair = findSiblingPair(db, { issue, pr, task });
@@ -176,7 +186,10 @@ export function compare(db, config, { issue, pr, task } = {}) {
 const ADJUDICATED_THRESHOLD = 20;
 
 function tasksForReport(db, { taskClass, since }) {
-  const clauses = [];
+  // Blocker 2: an archived task is excluded from report (and, by extension,
+  // from every statistic below derived from this query) exactly like an
+  // unadjudicated task already is - see docs/measurement.md.
+  const clauses = ['archived_at IS NULL'];
   const params = [];
   if (taskClass) {
     clauses.push('task_class = ?');
@@ -186,7 +199,7 @@ function tasksForReport(db, { taskClass, since }) {
     clauses.push('created_at >= ?');
     params.push(since);
   }
-  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const where = `WHERE ${clauses.join(' AND ')}`;
   return db.prepare(`SELECT * FROM tasks ${where}`).all(...params);
 }
 
@@ -235,11 +248,14 @@ export function report(db, config, { taskClass, since, guards, reviewers, loop }
 
   if (reviewers) {
     // Precision per provider/task class: sum(findings_real)/sum(findings_total) over adjudicated verdicts.
+    // Blocker 2: joined against tasks so an archived task's verdicts are
+    // excluded from precision statistics exactly like an unadjudicated
+    // task's are (docs/measurement.md).
     const rows = db
       .prepare(
         `SELECT v.provider AS provider, t.task_class AS task_class, v.findings_real AS findings_real, v.findings_total AS findings_total
          FROM review_verdicts v JOIN tasks t ON t.id = v.task_id
-         WHERE v.findings_real IS NOT NULL`
+         WHERE v.findings_real IS NOT NULL AND t.archived_at IS NULL`
       )
       .all();
     const byKey = new Map();
@@ -257,7 +273,16 @@ export function report(db, config, { taskClass, since, guards, reviewers, loop }
   }
 
   if (guards) {
-    const rows = db.prepare('SELECT reason, COUNT(*) AS c FROM escalations GROUP BY reason ORDER BY reason').all();
+    // Blocker 2: an archived task's own escalations are excluded from the
+    // guard-firing counts too, same reasoning as reviewer_precision above.
+    const rows = db
+      .prepare(
+        `SELECT e.reason AS reason, COUNT(*) AS c
+         FROM escalations e JOIN tasks t ON t.id = e.task_id
+         WHERE t.archived_at IS NULL
+         GROUP BY e.reason ORDER BY e.reason`
+      )
+      .all();
     result.guard_firings = rows.map((r) => ({ reason: r.reason, count: r.c }));
   }
 

@@ -32,6 +32,10 @@ Run the control arm first, so it is not contaminated by review findings. `task:n
 
 `cortexctl export --format csv|json [--table <name>] [--since <date>] --out <dir>`: one file per table, for Grafana, a spreadsheet, or a notebook. This is the observability answer for members who built their own Grafana stacks: the ledger is the source, the dashboard is theirs.
 
+## Archived tasks
+
+Owner's explicit instruction: work that needs to be set aside (a connectivity test, a batch superseded by a provider outage) is archived, never deleted, so it can still be retrieved and audited later (`cortexctl task:archive`, `docs/state-machine.md` "Archive, never delete"). An archived task (`tasks.archived_at` set) is excluded from `compare`, `board`, and every statistic `report` computes -- per-class counts, first pass rates, mean cost and elapsed, reviewer precision, guard firings -- the *same* exclusion this doc already gives an unadjudicated task above (`compare` refuses to print a winner and prints `unadjudicated` instead; `report`'s per-class counts and rates are built only from tasks that count), applied by the identical mechanism (`src/measure.mjs`'s query filters) rather than a second, parallel one. Nothing about the task's own row changes because of this: `cortexctl task:show <id>` still prints it in full (with an `ARCHIVED at <ts>: <reason>` line), and `cortexctl export` still writes it out with its `archived_at`/`archive_reason` columns -- archiving removes a task from the *measured* set, never from the record.
+
 ## Promotion criteria (unchanged from Phase 1)
 
 Phase 2 begins only when, across at least two pilot tasks: the tri arm caught at least one real defect the control arm shipped, or the ledger shows it did not and that result is accepted; every hard limit fired correctly at least once under deliberate test (the fake adapter test suite covers this); cost per task in the tri arm is known within 10 percent; no task needed more than one human rescue.

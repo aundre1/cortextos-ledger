@@ -38,11 +38,12 @@ import {
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
-import { withImmediateTransaction, newId } from '../db.mjs';
+import { withImmediateTransaction, newId, nowIso } from '../db.mjs';
 import {
   insertTask,
   insertMessage,
   insertArtifact,
+  insertIntervention,
   getTask,
   listTasks,
   listRuns,
@@ -571,6 +572,14 @@ export function register(registry) {
       lines.push(`  owner ${task.owner ?? '-'}  priority ${task.priority}  due ${task.due_at ?? '-'}`);
       if (task.outcome) lines.push(`  outcome ${task.outcome}`);
       if (task.notes) lines.push(`  notes ${task.notes}`);
+      // Blocker 2: task:show always shows an archived task and says so
+      // plainly (docs/state-machine.md "Archive, never delete") - archiving
+      // never removes anything from what this command reports.
+      if (task.archived_at) {
+        lines.push(
+          `  ARCHIVED at ${task.archived_at}${task.archive_reason ? `: ${task.archive_reason}` : ''}`
+        );
+      }
       lines.push(`  runs (${runs.length}):`);
       for (const r of runs) lines.push(`    ${r.id}  seq ${r.seq}  ${r.agent}  ${r.status ?? 'running'}`);
       lines.push(`  verdicts (${verdicts.length}):`);
@@ -586,7 +595,7 @@ export function register(registry) {
   });
 
   registry.add('board', {
-    description: 'Table of open tasks, input_required first',
+    description: 'Table of open tasks, input_required first (archived tasks excluded - see task:archive)',
     handler({ db, flags }) {
       let tasks;
       if (flags.status) {
@@ -594,6 +603,11 @@ export function register(registry) {
       } else {
         tasks = listTasks(db, { owner: flags.owner }).filter((t) => OPEN_STATUSES.includes(t.status));
       }
+      // Blocker 2: an archived task is excluded from board exactly like an
+      // unadjudicated task already is from report's statistics
+      // (docs/measurement.md) - archiving does not change `status`, so this
+      // filter is independent of the `--status` branch above.
+      tasks = tasks.filter((t) => !t.archived_at);
       tasks = [...tasks].sort(boardCompare);
 
       if (flags.json) return { code: 0, stdout: JSON.stringify(tasks) };
@@ -603,6 +617,73 @@ export function register(registry) {
           `${t.status.padEnd(15)} p${t.priority}  ${t.id}  ${(t.due_at ?? '-').padEnd(24)} ${t.owner ?? '-'}  ${t.title}`
       );
       return { code: 0, stdout: lines.join('\n') };
+    },
+  });
+
+  // Blocker 2 (owner's explicit instruction): the operator's actual need was
+  // never "delete a task" - it was "set this aside, but never lose it".
+  // `task:archive` records that decision on the task itself
+  // (`tasks.archived_at`/`archive_reason`, migration 009-v02-archive.mjs)
+  // and in the ledger (a `human_interventions` row of kind `archive`,
+  // docs/ledger.md) - it never deletes a row, never changes `status`, and
+  // never resolves an open escalation or kills a running process ("Archive
+  // resolves nothing and kills nothing"). `board`/`compare`/`report` (this
+  // file and src/measure.mjs) exclude an archived task exactly as they
+  // already exclude an unadjudicated one; `task:show`/`export` are
+  // unaffected - nothing about the record disappears.
+  registry.add('task:archive', {
+    description: 'Archive a task (excluded from board/compare/report; task:show and export are unaffected) - see task:unarchive, purge',
+    handler({ db, flags, err }) {
+      const need = missing(flags, ['task']);
+      if (need.length) {
+        return fail(err, 1, 'usage', `missing required flags: ${need.map((n) => '--' + n).join(', ')}`);
+      }
+      const task = getTask(db, flags.task);
+      if (!task) return fail(err, 1, 'not_found', `no such task: ${flags.task}`);
+
+      // Archiving a task with a run still `running` is refused: exit code 6
+      // (docs/state-machine.md "Task is in a state that does not allow the
+      // command") - the same code every other invalid-state refusal in this
+      // kit uses (e.g. run:start on a completed task, task:close's close
+      // gate). Archive is metadata, not a kill switch - a running run must
+      // finish (or be halted by a guard, or a human) on its own first.
+      const runningCount = db
+        .prepare("SELECT COUNT(*) AS c FROM task_runs WHERE task_id = ? AND status = 'running'")
+        .get(task.id).c;
+      if (runningCount > 0) {
+        return fail(
+          err,
+          6,
+          'task_state',
+          `task ${task.id} has ${runningCount} run(s) still running; cannot archive until they finish (archive resolves nothing and kills nothing)`
+        );
+      }
+
+      const reason = flags.reason ?? null;
+      withImmediateTransaction(db, () => {
+        db.prepare('UPDATE tasks SET archived_at = ?, archive_reason = ? WHERE id = ?').run(
+          nowIso(),
+          reason,
+          task.id
+        );
+        insertIntervention(db, { task_id: task.id, kind: 'archive', detail: reason });
+      });
+      return { code: 0, stdout: 'ok' };
+    },
+  });
+
+  registry.add('task:unarchive', {
+    description: 'Restore an archived task to board/compare/report',
+    handler({ db, flags, err }) {
+      const need = missing(flags, ['task']);
+      if (need.length) {
+        return fail(err, 1, 'usage', `missing required flags: ${need.map((n) => '--' + n).join(', ')}`);
+      }
+      const task = getTask(db, flags.task);
+      if (!task) return fail(err, 1, 'not_found', `no such task: ${flags.task}`);
+
+      db.prepare('UPDATE tasks SET archived_at = NULL, archive_reason = NULL WHERE id = ?').run(task.id);
+      return { code: 0, stdout: 'ok' };
     },
   });
 }

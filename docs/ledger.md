@@ -37,10 +37,12 @@ Migration 001 must handle an existing database created by the original `schema.s
 | defects_escaped | INTEGER | new. Defects found by a human after the loop declared done |
 | closed_at | TEXT | |
 | notes | TEXT | |
+| archived_at | TEXT | nullable; migration `009-v02-archive`. Set by `task:archive`, cleared by `task:unarchive`. Owner's explicit instruction: work is set aside for later retrieval, never deleted (`docs/state-machine.md` "Archive, never delete") -- an archived task is excluded from `board`/`compare`/`report` exactly like an unadjudicated one, but `task:show` and `export` are unaffected |
+| archive_reason | TEXT | nullable; migration `009-v02-archive`. Free text set by `task:archive --reason`, cleared alongside `archived_at` by `task:unarchive` |
 
 ### task_runs
 
-Adds `worktree TEXT`, `out_dir TEXT`, `exit_code INTEGER`, `files_touched INTEGER`, `wallclock_limit_s INTEGER`, `halted_reason TEXT`, `pid INTEGER`, `quota_reserved INTEGER NOT NULL DEFAULT 0` (set to 1 by `run:start` when it reserved one request against this run's provider/model quota window(s) at admission; `ingest` reads it so it never adds a second request for the same run -- see `provider_quota` below and `docs/guards.md` "Reserved spend and requests"), `failure_class TEXT` (nullable; migration `007-v02-provider-and-verdict`). `status` values: `running`, `ok`, `fail`, `halted`, `stalled`. `agent` values are free text but the kit ships `architect`, `builder`, `reviewer`, `reviewer_b`, `second-opinion`, `solo`.
+Adds `worktree TEXT`, `out_dir TEXT`, `exit_code INTEGER`, `files_touched INTEGER`, `wallclock_limit_s INTEGER`, `halted_reason TEXT`, `pid INTEGER`, `quota_reserved INTEGER NOT NULL DEFAULT 0` (set to 1 by `run:start` when it reserved one request against this run's provider/model quota window(s) at admission; `ingest` reads it so it never adds a second request for the same run -- see `provider_quota` below and `docs/guards.md` "Reserved spend and requests"), `failure_class TEXT` (nullable; migration `007-v02-provider-and-verdict`), `prompt_delivery TEXT` (nullable; migration `008-v02-prompt-delivery`; `argv`, `stdin`, or `file` -- see `docs/adapters.md` "Prompt delivery (Blocker 1)"; recorded from the seeded `prompt.delivery` event on every launch, both `run:launch`'s detached path and any adapter's own `--sync` path). `status` values: `running`, `ok`, `fail`, `halted`, `stalled`. `agent` values are free text but the kit ships `architect`, `builder`, `reviewer`, `reviewer_b`, `second-opinion`, `solo`.
 
 `failure_class` is set by `run:end` only when `status = 'fail'` and no other `halted_reason` already explains it. The only value the kit writes today is `provider_unavailable`: the run's `events.jsonl` ended on a terminal `error` event with `retryable: true` and the stream never recorded a successful completion (`src/guards/postrun.mjs`'s `classifyFailureClass`; see `docs/state-machine.md` "Provider unavailable" for the production evidence that motivated it and `docs/adapters.md`'s normalized `error` event for the `status_code`/`retryable` fields it reads). Setting this column never itself writes an escalation and never changes task status; it exists so `checkAttempts` (`src/limits.mjs`) can exclude a provider's own outage from `builder_attempts_max`, and so `doctor` can report it per provider.
 
@@ -100,7 +102,7 @@ A `UNIQUE` index on `(provider, model, window_kind)` enforces at most one row pe
 | task_id | TEXT | |
 | run_id | TEXT | nullable |
 | created_at | TEXT | |
-| kind | TEXT | `rescue`, `edit`, `adjudicate`, `approve`, `abort`, `retry_authorized`, `note` |
+| kind | TEXT | `rescue`, `edit`, `adjudicate`, `approve`, `abort`, `retry_authorized`, `note`, `archive` |
 | minutes | INTEGER | nullable, self reported |
 | detail | TEXT | |
 

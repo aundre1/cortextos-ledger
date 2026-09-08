@@ -398,6 +398,99 @@ worked) exposed two regressions:
 `npm test`: 367/367 (351 + 16 new). `node scripts/check-syntax.mjs`: 100
 files, 0 failures. `node scripts/publish-check.mjs`: clean.
 
+### Blocker 1 & Blocker 2: prompt delivery via stdin, archive never delete (executor Y)
+
+Two defects found on the owner's real machine.
+
+**Blocker 1 - `spawn ENAMETOOLONG` launching a review of PR #972 (492
+additions).** The reviewer's brief is passed to every adapter as a single
+`argv` element; Windows' `CreateProcess` caps a full command line around
+32767 characters and the practical `spawn` limit is lower still. Fixed with
+a new module, `src/adapters/prompt-delivery.mjs`: `choosePromptDelivery`
+picks `argv` (unchanged, pre-existing behaviour) or `stdin`, deterministically
+by a fixed 8000-character threshold on every platform, never by the host's
+real (and varying) argv limit. Verified from each harness's own source
+before choosing `stdin` for all three real adapters (`file` is documented but
+unused - see `docs/adapters.md` "Prompt delivery (Blocker 1)" for the full
+citation trail): opencode's `resolveRunInput`
+(`packages/opencode/src/cli/cmd/run.ts:40-50`, tag `v1.18.27`) returns piped
+stdin text whenever the positional `message` is empty; codex's top-level
+`exec` `PROMPT` (`codex-rs/exec/src/cli.rs:74-77`, tag `rust-v0.48.0`) reads
+stdin when the argument is omitted, while `exec resume`'s own `PROMPT`
+(same file, `:97-99`) needs the literal `-` passed explicitly - `codex.mjs`
+now does exactly that on the `stdin` path, never bare omission there;
+claude's `-p` reads stdin when passed with nothing following it. Every
+`buildArgv()` now returns `promptDelivery`/`stdin`/`promptDeliveryEvent`, and
+every adapter's `run()` writes `stdin` to the child's real stdin and closes
+it when the delivery is `stdin`. The choice is never silent: a
+`prompt.delivery` event (`severity: 'info'`, the mode and the prompt's own
+character count, never its text) is seeded into `events.jsonl` before the
+harness spawns, and `task_runs.prompt_delivery` (new column, migration
+`008-v02-prompt-delivery`) records it on the run row from both the
+`run:launch` detached path and any adapter's own `--sync` path.
+
+The relay never puts the prompt into *any* process's own argv, including
+`runner.mjs`'s own (the detached wrapper `run:launch` spawns, itself a
+`child_process.spawn` target and just as exposed to this defect as the
+harness). `src/commands/runs.mjs` writes the prompt to a redacted-at-rest
+`<outDir>/prompt.txt` (same `redact()` `out.txt` already uses) and passes
+only its short path to `runner.mjs` via a new `--stdin-file <path>` flag;
+`runner.mjs` reads that file's exact bytes onto the harness's real stdin and
+closes it. Tests: `test/adapters.test.mjs` builds argv for a 40000-character
+prompt with `platform`/`platformOverride: 'win32'` injected for all three
+adapters (codex's resume branch too), asserting no argv element carries the
+prompt body and that `promptDelivery`/the seeded event both read `stdin`,
+plus a same-length-as-threshold companion proving the pre-existing `argv`
+shape is unaffected under it. `test/runner.test.mjs` spawns a real stub
+harness through the actual `runner.mjs` binary with a 40000+ character
+prompt file and `--stdin-file`, and the stub itself reads stdin to EOF and
+reports a sha256 checksum and byte length of what it actually received -
+asserted to match the source prompt exactly, proving the full relay end to
+end rather than only the absence of the prompt from argv.
+
+**Blocker 2 - `purge` deletes; the owner's instruction is that work must be
+archived for later retrieval, never deleted.** New commands `task:archive
+--task <id> [--reason ...]` and `task:unarchive --task <id>`
+(`src/commands/tasks.mjs`), new columns `tasks.archived_at`/`archive_reason`
+(migration `009-v02-archive`). An archived task is excluded from `board`,
+`compare`, and every `report` statistic - the identical mechanism (query
+filters in `src/measure.mjs`) already used to exclude an unadjudicated task,
+not a second parallel one - while `task:show` (prints an `ARCHIVED at ...`
+line) and `export` (an `archived_at`/`archive_reason` column) are unaffected:
+nothing about the row itself changes, only its membership in the measured
+set. `task:archive` refuses (exit 6, reason `task_state` -
+`docs/state-machine.md`'s existing "task is in a state that does not allow
+the command" code) while any of the task's runs is still `running` -
+archiving resolves nothing and kills nothing. It writes a
+`human_interventions` row of kind `archive` (added to the documented enum,
+`docs/ledger.md`). `purge` stays (test cleanup only) but now refuses (exit
+6, reason `not_archived`) any task that is not already archived, and both
+its `--confirm` usage message and its `docs/cli.md` row say plainly that it
+deletes irreversibly and that `task:archive` is the intended way to set work
+aside. Tests: 7 new in `test/archive.test.mjs` - board exclusion and
+`task:unarchive` restoring it; the `human_interventions` row and
+`task:show`'s archived display; `export` still including an archived task
+with its new columns; archiving a task with a run still `running` refused
+with exit 6 and the task left exactly as it was; `purge` on a non-archived
+task refused with exit 6 (and the task still there afterward), then
+succeeding once archived; `purge` without `--confirm` naming `task:archive`
+on stderr; an archived task excluded from `compare` (the same "no linked
+pair" refusal an unpaired task already gets) and from `report`'s per-class
+count.
+
+Docs: `docs/cli.md` (`task:archive`/`task:unarchive` rows, `purge`'s row
+rewritten), `docs/state-machine.md` (exit code 6 table entry, new "Archive,
+never delete" section), `docs/ledger.md` (`tasks.archived_at`/
+`archive_reason`, `task_runs.prompt_delivery`, `human_interventions.kind`
+gains `archive`), `docs/adapters.md` (new "Prompt delivery (Blocker 1)"
+section with the full citation trail, `claude`/`codex`/`opencode` sections
+updated for the threshold), `docs/measurement.md` (new "Archived tasks"
+section mirroring the unadjudicated-task exclusion language).
+
+`npm test`: 417/417 (402 + 15 new: 7 archive, 7 adapter prompt-delivery
+argv-shape, 1 runner stdin-relay checksum). `node scripts/check-syntax.mjs`:
+108 files, 0 failures. `node scripts/publish-check.mjs`: clean.
+
 ### Known limitations (open questions carried forward)
 
 Everything below is a wave log `OPEN QUESTION` that is still open after the

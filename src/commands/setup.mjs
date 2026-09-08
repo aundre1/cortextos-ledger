@@ -180,6 +180,18 @@ export function register(registry) {
   // task and every row across the other task-scoped tables that reference
   // it. Children first, task row last, since `foreign_keys = ON` (src/db.mjs)
   // would otherwise refuse the parent delete.
+  //
+  // Blocker 2 (owner's explicit instruction): purge is IRREVERSIBLE - it
+  // deletes rows outright, with no undo - and `task:archive` is the intended
+  // way to set work aside instead (src/commands/tasks.mjs, migration
+  // 009-v02-archive.mjs). Both the `--confirm` usage message below and this
+  // command's own description now say so plainly, and purge refuses outright
+  // (exit 6, docs/state-machine.md "Task is in a state that does not allow
+  // the command" - the same code `task:archive` itself uses when it refuses
+  // to archive a task with a run still running) unless the task is already
+  // archived - nothing can be deleted through this command without having
+  // been archived first, so an operator cannot lose work to purge by
+  // accident the way `task:archive`'s absence used to allow.
   const PURGE_CHILD_TABLES = [
     'task_runs',
     'agent_messages',
@@ -193,17 +205,31 @@ export function register(registry) {
   ];
 
   registry.add('purge', {
-    description: 'Delete a task and its rows (test cleanup only)',
+    description:
+      'Irreversibly delete an already-archived task and its rows (test cleanup only) - task:archive is the intended way to set work aside; purge refuses a task that is not already archived',
     handler({ db, flags, err }) {
       const need = missing(flags, ['task']);
       if (need.length) {
         return fail(err, 1, 'usage', `missing required flags: ${need.map((n) => '--' + n).join(', ')}`);
       }
       if (!flags.confirm) {
-        return fail(err, 1, 'usage', 'purge requires --confirm (deletes a task and all its rows)');
+        return fail(
+          err,
+          1,
+          'usage',
+          'purge requires --confirm (this IRREVERSIBLY DELETES a task and all its rows, with no undo - use task:archive to set work aside instead)'
+        );
       }
-      const task = db.prepare('SELECT id FROM tasks WHERE id = ?').get(flags.task);
+      const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(flags.task);
       if (!task) return fail(err, 1, 'not_found', `no such task: ${flags.task}`);
+      if (!task.archived_at) {
+        return fail(
+          err,
+          6,
+          'not_archived',
+          `task ${flags.task} must be archived first (cortexctl task:archive --task ${flags.task} --reason "..."); purge never un-archives on its own and deletes irreversibly`
+        );
+      }
 
       for (const table of PURGE_CHILD_TABLES) {
         db.prepare(`DELETE FROM ${table} WHERE task_id = ?`).run(flags.task);

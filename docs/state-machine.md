@@ -58,7 +58,7 @@ Real evidence from a production batch: 12 of 16 runs failed with `out.txt` conta
 | 3 | Hard limit reached |
 | 4 | Provider quota exhausted or `public_only` provider asked to touch private material |
 | 5 | Verdict JSON invalid |
-| 6 | Task is in a state that does not allow the command (for example `run:start` on `completed`) |
+| 6 | Task is in a state that does not allow the command (for example `run:start` on `completed`; `task:archive` on a task with a run still `running`, reason `task_state`; `purge` on a task that is not already archived, reason `not_archived` -- see "Archive, never delete" below) |
 | 7 | `run:launch --retry` exhausted its retry budget: every attempt ended `provider_unavailable` (terminal retryable provider error, no successful completion) |
 
 Every non zero exit prints one line to stderr in the form `cortexctl: <reason>: <detail>` and, where applicable, the escalation id. Scripts key on the code, humans read the line.
@@ -82,3 +82,11 @@ For the run's provider and model, every window row in `provider_quota` is rolled
 ## Close gate
 
 `task:close` requires: an outcome; for `implement` tasks, at least one `test_results` row or `--no-tests`; no open `halt` escalations. It sets `closed_at`, copies `arm` into any verdict rows that lack it, and prints the compare hint if the sibling arm task exists.
+
+## Archive, never delete
+
+Owner's explicit instruction: work is set aside for later retrieval, never deleted. `task:archive --task <id> [--reason ...]` sets `tasks.archived_at`/`archive_reason` (never a status transition of its own -- an archived task keeps whatever `status` it already had) and writes a `human_interventions` row of kind `archive` (`docs/ledger.md`). It is refused with **exit 6, reason `task_state`** while any of the task's runs is still `running` -- archiving resolves nothing and kills nothing, so a run that could still finish and write its own result is left alone. `task:unarchive --task <id>` clears both columns.
+
+An archived task is excluded from `board`, `compare`, and every `report` statistic (first-pass rate, mean cost, mean elapsed, reviewer precision, guard firings), the same exclusion `report` already applies to an unadjudicated task (`docs/measurement.md` "Archived tasks") -- `task:show` and `export` are unaffected, so nothing is ever lost from the record.
+
+`purge --task <id> --confirm` still exists (test cleanup only) and still deletes rows outright, with no undo. It now refuses with **exit 6, reason `not_archived`** unless the task is already archived -- nothing can be deleted through `purge` without having first gone through `task:archive`, so an operator cannot lose work to `purge` by reflex the way its absence used to allow. `purge`'s own `--confirm` usage message and `docs/cli.md` row both say plainly that it deletes irreversibly and that `task:archive` is the intended way to set work aside instead.

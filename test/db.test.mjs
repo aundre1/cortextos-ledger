@@ -74,6 +74,8 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
     '005-v02-pr-capture',
     '006-v02-quota-reserve',
     '007-v02-provider-and-verdict',
+    '008-v02-prompt-delivery',
+    '009-v02-archive',
   ]);
 
   const applied = await migrate(db);
@@ -86,8 +88,10 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
     '005-v02-pr-capture',
     '006-v02-quota-reserve',
     '007-v02-provider-and-verdict',
+    '008-v02-prompt-delivery',
+    '009-v02-archive',
   ]);
-  assert.equal(schemaVersion(db), '007-v02-provider-and-verdict');
+  assert.equal(schemaVersion(db), '009-v02-archive');
   assert.deepEqual(pendingMigrations(db), []);
 
   const tableNames = db
@@ -137,16 +141,24 @@ test('migrate: fresh database gets every table and is idempotent', async () => {
   // Running migrate again is a no-op: nothing pending, no error, same version.
   const secondApplied = await migrate(db);
   assert.deepEqual(secondApplied, []);
-  assert.equal(schemaVersion(db), '007-v02-provider-and-verdict');
+  assert.equal(schemaVersion(db), '009-v02-archive');
 
   const migrationRows = db.prepare('SELECT version FROM schema_migrations').all();
-  assert.equal(migrationRows.length, 8);
+  assert.equal(migrationRows.length, 10);
 
   // task_runs.failure_class / review_verdicts.summary_truncated_from
   // (Phase 1a real-batch fixes F1/F2).
   assert.ok(runColumns.includes('failure_class'), 'task_runs should have column failure_class');
   const verdictColumns = db.prepare('PRAGMA table_info(review_verdicts)').all().map((c) => c.name);
   assert.ok(verdictColumns.includes('summary_truncated_from'), 'review_verdicts should have column summary_truncated_from');
+
+  // task_runs.prompt_delivery (Blocker 1: argv/stdin/file, never a large
+  // prompt as an argv element).
+  assert.ok(runColumns.includes('prompt_delivery'), 'task_runs should have column prompt_delivery');
+
+  // tasks.archived_at / archive_reason (Blocker 2: archive, never delete).
+  assert.ok(taskColumns.includes('archived_at'), 'tasks should have column archived_at');
+  assert.ok(taskColumns.includes('archive_reason'), 'tasks should have column archive_reason');
 
   db.close();
 });

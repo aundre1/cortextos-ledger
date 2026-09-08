@@ -35,6 +35,7 @@ test('cortexctl: `help` lists every command from docs/cli.md, one line each', ()
   const DOCUMENTED_COMMANDS = [
     'init', 'doctor', 'config:show', 'quota:set', 'quota:tick', 'quota:show',
     'task:new', 'task:show', 'task:close', 'task:resolve', 'task:reject', 'board',
+    'task:archive', 'task:unarchive',
     'preflight', 'run:start', 'run:launch', 'run:end', 'watch', 'ingest', 'msg', 'artifact',
     'review:brief', 'verdict', 'adjudicate', 'triage:note',
     'test', 'intervene',
