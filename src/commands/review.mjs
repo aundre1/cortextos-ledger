@@ -5,6 +5,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { buildReviewerBrief, storeVerdict, adjudicate, triageNote } from '../review.mjs';
+import { getTask } from '../ledger.mjs';
+import { checkNotArchived } from '../limits.mjs';
 
 function fail(errFn, code, reason, detail) {
   errFn(`cortexctl: ${reason}: ${detail}`);
@@ -43,6 +45,27 @@ export function register(registry) {
       const need = missing(flags, ['task', 'run', 'reviewer', 'provider', 'model', 'file']);
       if (need.length) {
         return fail(err, 1, 'usage', `missing required flags: ${need.map((n) => '--' + n).join(', ')}`);
+      }
+
+      // Codex round, F7 (major): `storeVerdict` (src/review.mjs) already
+      // checks archive state "before schema validation and before the
+      // blind/challenge gates" per its own doc comment - but this handler
+      // used to read and JSON.parse `--file` FIRST, and returned exit
+      // 5/verdict_invalid on a bad or missing file before ever calling
+      // storeVerdict. So an archived task with a malformed (or simply
+      // missing) verdict file got exit 5/verdict_invalid instead of exit
+      // 6/archived - the exact inversion of docs/state-machine.md's "archive
+      // check happens before any other state check" invariant, and
+      // observable proof of it: pointing --file at a bad path is enough to
+      // make an archived task look like a schema problem instead of an
+      // archive one. Fixed by checking archive state here, before the file
+      // is even touched, so the task's own state always wins regardless of
+      // what --file contains or whether it exists at all.
+      const task = getTask(db, flags.task);
+      if (!task) return fail(err, 1, 'not_found', `no such task: ${flags.task}`);
+      const notArchived = checkNotArchived(task);
+      if (!notArchived.ok) {
+        return fail(err, 6, 'archived', notArchived.detail);
       }
 
       let verdictObj;

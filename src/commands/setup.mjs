@@ -1,7 +1,7 @@
 // Setup commands: init, config:show, limits, quota:set, quota:tick,
 // quota:show, purge (docs/cli.md "Setup" and "Packet, measurement, usage").
 
-import { migrate, pendingMigrations, schemaVersion } from '../db.mjs';
+import { migrate, pendingMigrations, schemaVersion, withImmediateTransaction } from '../db.mjs';
 import { upsertQuota, listQuota } from '../ledger.mjs';
 import { tickQuota, rollQuota, windowEndsAt, syncConfigQuota, findQuotaRow, reservedSpend } from '../quota.mjs';
 import { sweepTmpDir } from '../tmp-sweep.mjs';
@@ -204,9 +204,52 @@ export function register(registry) {
     'usage_snapshots',
   ];
 
+  // Codex round, F6 (major): `tasks.parent_id` and `tasks.sibling_id`
+  // (migration 002-v01-columns.mjs, both `REFERENCES tasks(id)`) and
+  // `proposals.converted_task_id` / `lessons.task_id` (migration
+  // 003-v02-autonomy.sql) can all hold a foreign key pointing INTO the task
+  // being purged. None of those four rows is a "child" of this task in the
+  // PURGE_CHILD_TABLES sense (its own runs/messages/artifacts/etc) - each is
+  // a DIFFERENT row that happens to reference this one, and nothing above
+  // ever clears them. Reviewer's repro: purge an archived task that a child
+  // task's --parent still points at - every PURGE_CHILD_TABLES delete
+  // succeeds (nothing there references the child), then the final `DELETE
+  // FROM tasks` throws a foreign key violation because the child row still
+  // points at the now-vanishing parent. At that moment the task's entire
+  // run/message/artifact/verdict/escalation history is already gone
+  // forever - archive, never delete (Blocker 2) makes this the worst
+  // possible failure mode: irrecoverable data loss from a command that then
+  // reports failure, so the operator has no reason to think anything was
+  // lost - while the half-purged `tasks` row itself, still holding the
+  // dangling reference, survives.
+  //
+  // Fixed two ways. (1) Refuse up front, before touching any table, if
+  // anything still references this task: purge must not silently drop or
+  // reassign another row's reference on the operator's behalf, so it names
+  // what refers to the task and leaves retargeting or clearing those rows
+  // to the operator (or purging/archiving them first). (2) Wrap the whole
+  // delete sequence in `withImmediateTransaction` as defense in depth - even
+  // a reference this check does not know about (a future migration adding a
+  // fifth FK into `tasks`, say) now fails the entire purge atomically
+  // instead of leaving a partially-deleted task behind.
+  function referencingRows(db, taskId) {
+    const refs = [];
+    const childTasks = db.prepare('SELECT COUNT(*) AS c FROM tasks WHERE parent_id = ?').get(taskId).c;
+    if (childTasks) refs.push(`${childTasks} task(s) with --parent ${taskId}`);
+    const siblingTasks = db.prepare('SELECT COUNT(*) AS c FROM tasks WHERE sibling_id = ?').get(taskId).c;
+    if (siblingTasks) refs.push(`${siblingTasks} task(s) with --sibling ${taskId}`);
+    const proposalRows = db
+      .prepare('SELECT COUNT(*) AS c FROM proposals WHERE converted_task_id = ?')
+      .get(taskId).c;
+    if (proposalRows) refs.push(`${proposalRows} proposal(s) converted to ${taskId}`);
+    const lessonRows = db.prepare('SELECT COUNT(*) AS c FROM lessons WHERE task_id = ?').get(taskId).c;
+    if (lessonRows) refs.push(`${lessonRows} lesson(s) recorded against ${taskId}`);
+    return refs;
+  }
+
   registry.add('purge', {
     description:
-      'Irreversibly delete an already-archived task and its rows (test cleanup only) - task:archive is the intended way to set work aside; purge refuses a task that is not already archived',
+      'Irreversibly delete an already-archived task and its rows (test cleanup only) - task:archive is the intended way to set work aside; purge refuses a task that is not already archived or that is still referenced by another row',
     handler({ db, flags, err }) {
       const need = missing(flags, ['task']);
       if (need.length) {
@@ -231,10 +274,24 @@ export function register(registry) {
         );
       }
 
-      for (const table of PURGE_CHILD_TABLES) {
-        db.prepare(`DELETE FROM ${table} WHERE task_id = ?`).run(flags.task);
+      const refs = referencingRows(db, flags.task);
+      if (refs.length) {
+        return fail(
+          err,
+          6,
+          'referenced',
+          `task ${flags.task} is still referenced by ${refs.join(
+            ', '
+          )}; retarget or clear those references (or purge/archive them first) before purging - purge never reassigns another row's reference on its own`
+        );
       }
-      db.prepare('DELETE FROM tasks WHERE id = ?').run(flags.task);
+
+      withImmediateTransaction(db, () => {
+        for (const table of PURGE_CHILD_TABLES) {
+          db.prepare(`DELETE FROM ${table} WHERE task_id = ?`).run(flags.task);
+        }
+        db.prepare('DELETE FROM tasks WHERE id = ?').run(flags.task);
+      });
       return { code: 0, stdout: 'ok' };
     },
   });

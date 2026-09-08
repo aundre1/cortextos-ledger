@@ -23,12 +23,34 @@ const ARTIFACT_FILES = [
   ['out.txt', 'stdout'],
 ];
 
+// Codex round, F4 (major): this used to swallow ANY read failure - missing
+// file, moved file, typo'd --events path, permission error, all of it - into
+// a plain `return []`, indistinguishable from "the file exists and is
+// legitimately empty." `ingest()` below then proceeded exactly as if this
+// run really did produce zero tokens and zero cost: it overwrote
+// task_runs.cost_usd with 0 regardless of what it held before, and (line
+// ~176-178, the deltaUsd tick) applied `0 - prior.cost_usd` to
+// provider_quota.used_usd - a NEGATIVE delta that refunds a real, previously
+// recorded charge. Reproduced exactly as the reviewer described: ingesting a
+// real capture recorded cost 0.0031; ingesting a nonexistent path for the
+// SAME run afterward silently zeroed both task_runs.cost_usd and the
+// provider's used_usd. Fixed by throwing on an unreadable file instead of
+// returning an empty result - `ingest()`'s first line below then never
+// reaches any write, and src/commands/ingest.mjs's handler already turns
+// this into a clean exit-1 refusal (same shape as any other thrown error
+// here). A file that reads successfully but has zero valid lines (every line
+// malformed, or truly empty) is left as-is: that is real information about
+// the run, not a read failure, and still ingests as zero cost - unlike a
+// wrong or vanished path, this is not silently invented.
 function parseEventsFile(eventsPath) {
+  if (!existsSync(eventsPath)) {
+    throw new Error(`events file not found: ${eventsPath} - refusing to ingest as if it were empty`);
+  }
   let text;
   try {
     text = readFileSync(eventsPath, 'utf8');
-  } catch {
-    return [];
+  } catch (e) {
+    throw new Error(`could not read events file ${eventsPath}: ${e.message}`);
   }
   const events = [];
   for (const line of text.split('\n')) {

@@ -244,6 +244,91 @@ test('withImmediateTransaction NF2: a clean nested call still commits normally, 
   db.close();
 });
 
+// Codex round, F3 (major): `db.exec('COMMIT')` was bare - SQLite defers some
+// constraint checks (a deferred foreign key, reproduced here) to COMMIT time
+// rather than the statement that actually violated them. When that COMMIT
+// itself threw, execution left withImmediateTransaction before the line that
+// resets `TX_DEPTH` to 0, so the underlying transaction stayed open and the
+// helper's own bookkeeping thought it was still one level deep. The next
+// call then took the reentrant branch (no new BEGIN) and ran directly
+// against that broken, still-open state - a caller whose own fn() returned
+// or threw normally got a result with no error, while nothing was actually
+// committed or rolled back for it.
+test('withImmediateTransaction F3: a COMMIT that itself throws (deferred FK violation) rolls back and resets state cleanly for the next call', async () => {
+  const db = openDb(makeTempDb());
+  await migrate(db);
+
+  const taskId = newId('t');
+  db.prepare(
+    `INSERT INTO tasks (id, created_at, repo, title, task_class, arm, status, human_edits)
+     VALUES (?, ?, 'o/n', 't', 'ci', 'control', 'open', 0)`
+  ).run(taskId, nowIso());
+
+  // First call: fn() defers FK checking (so the bad insert below succeeds
+  // immediately) and inserts a task_runs row pointing at a task_id that does
+  // not exist, then returns normally - the violation only surfaces when
+  // withImmediateTransaction issues COMMIT.
+  let firstError = null;
+  try {
+    withImmediateTransaction(db, () => {
+      db.exec('PRAGMA defer_foreign_keys = ON');
+      db.prepare(
+        `INSERT INTO task_runs (id, task_id, seq, agent, provider, model, started_at)
+         VALUES (?, 'no_such_task', 1, 'builder', 'fake', 'm1', ?)`
+      ).run(newId('r'), nowIso());
+      return 'fn returned cleanly, but COMMIT should still fail';
+    });
+  } catch (e) {
+    firstError = e;
+  }
+
+  assert.ok(firstError, 'a COMMIT-time FK violation must surface as a thrown error, not a silent success');
+  assert.match(
+    firstError.message,
+    /FOREIGN KEY/i,
+    `expected a foreign key error to propagate, got: ${firstError.message}`
+  );
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS c FROM task_runs').get().c,
+    0,
+    'the bad row must not persist - COMMIT failing should mean the whole transaction rolled back'
+  );
+
+  // Second, unrelated call: if the first call's failure had left TX_DEPTH
+  // stuck above 0, this would silently take the reentrant branch (no new
+  // BEGIN, no rollback of its own on throw) and its insert would survive
+  // the throw below via SQLite's autocommit rather than being rolled back.
+  db.exec('CREATE TABLE f3_scratch (id INTEGER PRIMARY KEY, v TEXT)');
+  let secondError = null;
+  try {
+    withImmediateTransaction(db, () => {
+      db.prepare('INSERT INTO f3_scratch (v) VALUES (?)').run('should not survive');
+      throw new Error('intentional second-call failure');
+    });
+  } catch (e) {
+    secondError = e;
+  }
+  assert.ok(secondError, 'the second call should still throw its own fn() error');
+  assert.match(secondError.message, /intentional second-call failure/);
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS c FROM f3_scratch').get().c,
+    0,
+    'the second call must have run inside its own real transaction and rolled back on throw - ' +
+      'a nonzero count here means state from the first COMMIT failure was still stuck'
+  );
+
+  // Third call proves the connection is fully healthy afterward: a normal,
+  // successful transaction commits for real.
+  const result = withImmediateTransaction(db, () => {
+    db.prepare('INSERT INTO f3_scratch (v) VALUES (?)').run('committed');
+    return 'ok';
+  });
+  assert.equal(result, 'ok');
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM f3_scratch').get().c, 1);
+
+  db.close();
+});
+
 test('migrate: init twice from the CLI is safe (smoke check via direct call)', async () => {
   const path = makeTempDb();
   const db1 = openDb(path);

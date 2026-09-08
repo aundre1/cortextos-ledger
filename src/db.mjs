@@ -303,7 +303,33 @@ export function withImmediateTransaction(db, fn) {
     );
   }
 
-  db.exec('COMMIT');
+  // Codex round, F3 (major): `db.exec('COMMIT')` itself can throw - SQLite
+  // defers some constraint checks (a deferred foreign key, for one) to
+  // COMMIT time rather than at the statement that actually violated them.
+  // This call was bare: on that throw, execution left this function without
+  // ever reaching the line below it, so `db[TX_DEPTH]` stayed at 1 and the
+  // underlying SQL transaction stayed open (COMMIT never actually closed
+  // it). The next `withImmediateTransaction` call then saw `TX_DEPTH > 0`
+  // and took the reentrant branch at the top of this function - no new
+  // `BEGIN`, just `fn()` run directly against that same broken, still-open
+  // transaction - so a caller whose `fn()` happened to succeed got back a
+  // normal result with no error at all, while nothing it wrote was ever
+  // committed. Reproduced with a real deferred foreign-key violation.
+  // Fixed the same way the two throwing branches above already handle a
+  // failure here: best-effort ROLLBACK, then unconditionally reset the
+  // bookkeeping so the next call starts clean, then rethrow.
+  try {
+    db.exec('COMMIT');
+  } catch (e) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // best effort, same as the other two ROLLBACK attempts above.
+    }
+    db[TX_DEPTH] = 0;
+    db[TX_FAILED] = undefined;
+    throw e;
+  }
   db[TX_DEPTH] = 0;
   return result;
 }

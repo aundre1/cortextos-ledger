@@ -123,6 +123,62 @@ test('canAutoApprove: truth table', async () => {
   assert.equal(canAutoApprove(dialOff, { kind: 'task', estimated_usd: 0 }, support), false, 'dial at 0 never approves');
 });
 
+test('F5: canAutoApprove never approves a negative/non-finite estimated_usd, even with the dial fully off (auto_approve_below_usd: 0)', async () => {
+  // Codex round, F5 (major): the original check was
+  // `estimated_usd < auto_approve_below_usd` - with the dial at its
+  // documented "never" value of 0, a NEGATIVE estimate (`-1 < 0`) evaluated
+  // true and slipped straight through, auto-approving a task the operator
+  // had explicitly turned auto-approval off for. Reproduced with the dial
+  // both off (0) and on (2, the truth table's own threshold above) to prove
+  // the bypass was not specific to the "0 means never" sentinel alone - a
+  // negative estimate defeats ANY positive threshold too, since it is
+  // "under" every one of them.
+  const { config } = await migrated({ auto_approve_below_usd: 2, min_reviews: 1 });
+  const support = [{ verdict: 'support' }];
+  const dialOff = { ...config, autonomy: { ...config.autonomy, auto_approve_below_usd: 0 } };
+
+  assert.equal(
+    canAutoApprove(dialOff, { kind: 'task', estimated_usd: -1 }, support),
+    false,
+    'a negative estimate must not bypass the dial being fully off'
+  );
+  assert.equal(
+    canAutoApprove(config, { kind: 'task', estimated_usd: -1 }, support),
+    false,
+    'a negative estimate must not auto-approve even under a normal positive threshold'
+  );
+  assert.equal(
+    canAutoApprove(config, { kind: 'task', estimated_usd: -Infinity }, support),
+    false,
+    '-Infinity is "under" every threshold and must still be refused'
+  );
+  assert.equal(
+    canAutoApprove(config, { kind: 'task', estimated_usd: NaN }, support),
+    false,
+    'NaN must still be refused (already true pre-fix, kept as a guard against regressing it)'
+  );
+});
+
+test('F5: propose rejects a negative or non-finite --usd outright, at the point the proposal is authored', async () => {
+  const { db, config } = await migrated();
+  assert.throws(
+    () => propose(db, config, baseProposal({ usd: -1 })),
+    /usd must be a non-negative finite number/
+  );
+  assert.throws(
+    () => propose(db, config, baseProposal({ usd: NaN })),
+    /usd must be a non-negative finite number/
+  );
+  assert.throws(
+    () => propose(db, config, baseProposal({ usd: 'not-a-number' })),
+    /usd must be a non-negative finite number/
+  );
+  // A genuine zero estimate is a legitimate, non-negative value and must
+  // still be accepted (this is a value check, not a truthiness check).
+  const free = propose(db, config, baseProposal({ usd: 0 }));
+  assert.equal(free.estimated_usd, 0);
+});
+
 test('CLI: propose / proposal:review / proposal:list / proposal:approve / proposal:reject', async () => {
   const { runCli } = await import('./helpers.mjs');
   const dir = makeTempDir();

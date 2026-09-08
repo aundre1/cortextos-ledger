@@ -275,6 +275,25 @@ export function reserveRequest(db, { provider, model = null, now = new Date() } 
  * writes to (one `source = 'plugin'` row per run, docs/ledger.md
  * "cost_usage"), so no migration or extra write path is needed to keep a
  * second column in sync with it.
+ *
+ * Codex round, F2 (major): `tr.status = 'running'` here meant `run:end`
+ * dropped a run's reservation the instant it left `running`, regardless of
+ * whether `ingest` had ever run for it. `run:end` accepts a `--cost` flag
+ * but never touches `cost_usage` or `provider_quota` itself (only `ingest`
+ * does); a caller that calls `run:start` / `run:end` without a following
+ * `ingest` therefore had its spend counted nowhere - not as a reservation
+ * (this function stopped seeing it the moment status changed), not as real
+ * usage (nothing ticked `provider_quota.used_usd`). Reproduced: three runs
+ * at `--cost 4` against `limit_usd: 5` all admitted cleanly with
+ * `reserved_usd`/`used_usd` reading 0 throughout. Fixed by dropping the
+ * `running` filter entirely: any `task_runs` row for this provider with no
+ * `cost_usage` row yet reserves its full per-run budget, whether it is
+ * still running, already ended, or halted - the reservation only ever
+ * clears once `ingest` records the run's real cost (or a row that truly
+ * never spent anything is ingested with zero cost, which still satisfies
+ * `NOT EXISTS` going forward). This is deliberately fail-closed: a caller
+ * who skips `ingest` keeps consuming budget headroom until they run it,
+ * rather than that spend silently vanishing.
  */
 export function reservedSpend(db, config, provider) {
   const perRun = config?.limits?.spend_usd;
@@ -283,8 +302,7 @@ export function reservedSpend(db, config, provider) {
     .prepare(
       `SELECT COUNT(*) AS c
          FROM task_runs tr
-        WHERE tr.status = 'running'
-          AND tr.provider = ?
+        WHERE tr.provider = ?
           AND NOT EXISTS (SELECT 1 FROM cost_usage cu WHERE cu.run_id = tr.id)`
     )
     .get(provider);

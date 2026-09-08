@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-import { runCli, makeTempDb } from './helpers.mjs';
+import { runCli, makeTempDb, makeTempGitRepo } from './helpers.mjs';
 
 function newTask(dbPath, extra = []) {
   const result = runCli([
@@ -117,6 +117,53 @@ test('purge on a non-archived task is refused with exit 6; purge on an archived 
   const purged = runCli(['purge', '--db', dbPath, '--task', id, '--confirm']);
   assert.equal(purged.code, 0, purged.stderr);
   assert.equal(runCli(['task:show', id, '--db', dbPath, '--json']).code, 1, 'the task should genuinely be gone after purge');
+});
+
+test('F6: purge refuses (exit 6) a task another task still points at via --parent, instead of destroying its history and leaving a dangling reference', () => {
+  const dbPath = makeTempDb();
+  const { dir, baseCommit } = makeTempGitRepo();
+  assert.equal(runCli(['init', '--db', dbPath]).code, 0);
+  const parentId = newTask(dbPath, ['--worktree', dir, '--base', baseCommit]);
+  const childId = newTask(dbPath, ['--parent', parentId]);
+
+  // Give the parent real history worth losing: a completed run (not
+  // 'running' - task:archive refuses that regardless of F6, per the test
+  // above - so run:start then run:end brings it to a terminal 'ok' status
+  // first).
+  const started = runCli([
+    'run:start', '--db', dbPath,
+    '--task', parentId, '--agent', 'builder', '--provider', 'fake', '--model', 'fake-1',
+  ]);
+  assert.equal(started.code, 0, started.stderr);
+  const runId = started.stdout.trim();
+  const ended = runCli(['run:end', '--db', dbPath, '--run', runId, '--exit', '0']);
+  assert.equal(ended.code, 0, ended.stderr);
+
+  assert.equal(runCli(['task:archive', '--db', dbPath, '--task', parentId, '--reason', 'x']).code, 0);
+
+  const refused = runCli(['purge', '--db', dbPath, '--task', parentId, '--confirm']);
+  assert.equal(refused.code, 6, refused.stderr);
+  assert.match(refused.stderr, /referenced/);
+  assert.match(refused.stderr, /--parent/);
+
+  // The reviewer's exact failure mode: before the fix, PURGE_CHILD_TABLES
+  // deletes (task_runs among them) all committed fine, only the final
+  // `DELETE FROM tasks` threw on the child's dangling --parent reference -
+  // so the run row was already gone forever while the task row survived.
+  // After the fix, the whole thing must never have been attempted: the run
+  // is still there, untouched, and so is the task itself.
+  const shown = JSON.parse(runCli(['task:show', parentId, '--db', dbPath, '--json']).stdout);
+  assert.equal(shown.runs.length, 1, 'purge must not have deleted the run when it refused up front');
+  assert.equal(shown.task.id, parentId);
+
+  // Clearing the reference (here, by purging the child itself, since this
+  // kit has no task:update to retarget --parent in place) lets the parent
+  // purge succeed.
+  assert.equal(runCli(['task:archive', '--db', dbPath, '--task', childId, '--reason', 'x']).code, 0);
+  assert.equal(runCli(['purge', '--db', dbPath, '--task', childId, '--confirm']).code, 0);
+
+  const purged = runCli(['purge', '--db', dbPath, '--task', parentId, '--confirm']);
+  assert.equal(purged.code, 0, purged.stderr);
 });
 
 test('purge without --confirm names task:archive as the intended alternative on stderr', () => {

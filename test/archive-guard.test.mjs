@@ -266,6 +266,35 @@ test('verdict on an archived task refuses exit 6 reason archived; works again af
   assert.equal(verdict.code, 0, verdict.stderr);
 });
 
+test('F7: verdict on an archived task still refuses exit 6 reason archived even when --file is missing/unparseable, never falling through to exit 5 verdict_invalid', () => {
+  // Codex round, F7 (major): src/commands/review.mjs's `verdict` handler used
+  // to JSON.parse(readFileSync(flags.file)) BEFORE calling storeVerdict (the
+  // function that actually checks archive state) - so a bad or missing
+  // --file made an archived task look like exit 5/verdict_invalid instead of
+  // exit 6/archived, inverting docs/state-machine.md's "archive check
+  // happens before any other state check" invariant. The test above already
+  // covers a VALID --file (which reached storeVerdict's own archive check
+  // fine, even before this fix) - this one is the actual repro: an
+  // unreadable path.
+  const dbPath = makeTempDb();
+  assert.equal(runCli(['init', '--db', dbPath]).code, 0);
+  const id = newTask(dbPath);
+  archiveTask(dbPath, id);
+
+  const verdictArgs = [
+    'verdict', '--db', dbPath, '--task', id, '--run', 'r_doesnotexist', '--reviewer', 'reviewer',
+    '--provider', 'p', '--model', 'm', '--file', join(makeTempDir(), 'does-not-exist.json'),
+  ];
+  const result = runCli(verdictArgs);
+  assertArchivedRefusal(result);
+  assert.doesNotMatch(result.stderr, /verdict_invalid/, 'must not fall through to the file-validation branch');
+
+  unarchiveTask(dbPath, id);
+  const stillInvalid = runCli(verdictArgs);
+  assert.equal(stillInvalid.code, 5, stillInvalid.stderr);
+  assert.match(stillInvalid.stderr, /verdict_invalid/, 'once unarchived, the same bad --file should surface its real problem');
+});
+
 test('adjudicate on an archived task refuses exit 6 reason archived; works again after task:unarchive', () => {
   const dbPath = makeTempDb();
   assert.equal(runCli(['init', '--db', dbPath]).code, 0);

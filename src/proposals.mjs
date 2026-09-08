@@ -43,6 +43,21 @@ export function propose(db, config, fields) {
   if (!fields.business) throw invalid('business is required');
   if (!fields.title) throw invalid('title is required');
 
+  // Codex round, F5 (major), source-side half of the fix: reject a
+  // negative or non-finite --usd outright at the point a proposal is
+  // authored, rather than relying solely on canAutoApprove (below) to
+  // notice later. A real cost estimate is never negative; letting one
+  // through here is what let a negative `estimated_usd` reach
+  // canAutoApprove at all and defeat `auto_approve_below_usd`'s "0 means
+  // never" sentinel (`-1 < 0` is true even with the dial fully off).
+  let estimatedUsd = null;
+  if (fields.usd !== undefined && fields.usd !== null) {
+    estimatedUsd = Number(fields.usd);
+    if (!Number.isFinite(estimatedUsd) || estimatedUsd < 0) {
+      throw invalid(`usd must be a non-negative finite number, got ${fields.usd}`);
+    }
+  }
+
   return insertProposal(db, {
     author: fields.author,
     business_id: fields.business,
@@ -51,7 +66,7 @@ export function propose(db, config, fields) {
     title: fields.title,
     rationale: fields.rationale,
     expected_impact: fields.expectedImpact,
-    estimated_usd: fields.usd !== undefined && fields.usd !== null ? Number(fields.usd) : null,
+    estimated_usd: estimatedUsd,
     estimated_hours: fields.hours !== undefined && fields.hours !== null ? Number(fields.hours) : null,
     task_class: fields.taskClass,
   });
@@ -110,7 +125,33 @@ export function canAutoApprove(config, proposal, reviews) {
   const a = config.autonomy;
   if (proposal.kind !== 'task') return false;
   if (!a.auto_approve_kinds.includes(proposal.kind)) return false;
-  if (typeof proposal.estimated_usd !== 'number' || !(proposal.estimated_usd < a.auto_approve_below_usd)) return false;
+
+  // Codex round, F5 (major): this function's own doc comment says
+  // `auto_approve_below_usd: 0` means "never" - the dial's hard off switch.
+  // The original `estimated_usd < a.auto_approve_below_usd` comparison
+  // treated 0 as an ordinary threshold instead of that sentinel: a NEGATIVE
+  // `estimated_usd` (an author's typo, or a hostile one - `propose()` never
+  // validated this field's sign) makes `-1 < 0` evaluate true even with the
+  // dial fully off, auto-approving a task the operator explicitly
+  // configured to never auto-approve - and the same bypass works at ANY
+  // dial setting, not only 0 (a negative estimate is always "under" a
+  // positive threshold too). Fixed with two explicit checks instead of
+  // trusting the comparison alone: the dial itself must be a genuinely
+  // positive number (`<= 0` always refuses, matching "0 means never"
+  // literally), and the estimate itself must be a finite, non-negative
+  // number (a negative, NaN, or infinite estimate never auto-approves,
+  // regardless of the dial) before the normal below-threshold comparison
+  // even runs.
+  if (!(a.auto_approve_below_usd > 0)) return false;
+  if (
+    typeof proposal.estimated_usd !== 'number' ||
+    !Number.isFinite(proposal.estimated_usd) ||
+    proposal.estimated_usd < 0
+  ) {
+    return false;
+  }
+  if (!(proposal.estimated_usd < a.auto_approve_below_usd)) return false;
+
   const supporting = reviews.filter((r) => r.verdict === 'support').length;
   const opposing = reviews.filter((r) => r.verdict === 'oppose').length;
   if (opposing > 0) return false;

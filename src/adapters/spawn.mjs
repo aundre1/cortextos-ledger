@@ -72,7 +72,20 @@ export function launchDetached({ argv, cwd, outDir, timeoutMs, adapter, eventsPa
     argv.cmd,
     ...(argv.args ?? []),
   ];
-  const env = { ...process.env, ...(argv.env ?? {}) };
+  // Codex round, F1 (blocker): every adapter's buildArgv already returns a
+  // COMPLETE environment via credential-boundary.mjs's filterEnv(process.env,
+  // ...) - filterEnv copies every key of its input except the ones its rules
+  // strip, so argv.env already carries everything the child needs (PATH
+  // included) minus the secrets the boundary is meant to remove. Spreading
+  // process.env again here as the base, with argv.env only overlaid on top,
+  // silently restored every key argv.env had deliberately omitted (an
+  // omitted key never overrides anything, it just leaves the base's value
+  // standing) - so ANTHROPIC_API_KEY/OPENAI_API_KEY etc. reached this
+  // process's own env (inherited by runner.mjs, and from there the harness
+  // it spawns) whenever this process happened to have them set, defeating
+  // the boundary entirely. Confirmed with a real child process launched
+  // through this exact path. Use argv.env as-is; do not re-merge process.env.
+  const env = { ...(argv.env ?? {}) };
   const child = spawn(process.execPath, runnerArgs, {
     cwd,
     env,

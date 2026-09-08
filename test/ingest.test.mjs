@@ -178,3 +178,46 @@ test('ingest: re-ingesting the same run does not duplicate cost_usage or artifac
   assert.equal(quotaRow.used_usd, 0.0031, 'quota usage reflects the run once, not three times');
   assert.equal(quotaRow.used_requests, 1);
 });
+
+// Codex round, F4 (major): parseEventsFile silently returned [] for ANY
+// read failure - missing file, moved file, a typo'd --events path - exactly
+// like a legitimately empty capture. ingest() then overwrote task_runs with
+// zero cost and, worse, ticked provider_quota.used_usd by a NEGATIVE delta
+// (0 minus whatever the prior real cost was), refunding spend that actually
+// happened. Reproduced here exactly as found: ingest a real capture first
+// (recording a nonzero cost), then ingest a nonexistent path for the SAME
+// run - before the fix this silently zeroed both task_runs.cost_usd and the
+// provider's used_usd; now it must refuse outright and leave the previously
+// recorded usage untouched.
+test('ingest: a nonexistent/unreadable events path refuses instead of silently erasing a run\'s previously recorded cost and quota usage', async () => {
+  const db = await freshDb();
+  const { task, run, outDir } = makeTaskAndRun(db, { provider: 'opencode-go', model: 'opencode/deepseek-v4' });
+  upsertQuota(db, { provider: 'opencode-go', model: 'opencode/deepseek-v4', window_kind: '5h', limit_usd: 12 });
+
+  const eventsPath = join(outDir, 'events.jsonl');
+  writeFileSync(eventsPath, readFileSync(join(FIXTURES, 'opencode-events.jsonl')));
+
+  const first = ingest(db, config(), { eventsPath, taskId: task.id, runId: run.id });
+  assert.equal(first.cost_usd, 0.0031, 'sanity: the real fixture should record its known nonzero cost');
+
+  const missingPath = join(outDir, 'events-that-does-not-exist.jsonl');
+  assert.throws(
+    () => ingest(db, config(), { eventsPath: missingPath, taskId: task.id, runId: run.id }),
+    /not found|could not read/i,
+    'ingest must refuse a nonexistent events path rather than treating it as an empty run'
+  );
+
+  const runRow = db.prepare('SELECT cost_usd FROM task_runs WHERE id = ?').get(run.id);
+  assert.equal(runRow.cost_usd, 0.0031, 'task_runs.cost_usd must still hold the real recorded cost, not 0');
+
+  const costRows = db.prepare("SELECT * FROM cost_usage WHERE run_id = ? AND source = 'plugin'").all(run.id);
+  assert.equal(costRows.length, 1, 'the real plugin cost row must survive the refused ingest, not be deleted');
+  assert.equal(costRows[0].cost_usd, 0.0031);
+
+  const [quotaRow] = listQuota(db, { provider: 'opencode-go' });
+  assert.equal(
+    quotaRow.used_usd,
+    0.0031,
+    'provider_quota.used_usd must still reflect the real charge - the refused ingest must not refund it'
+  );
+});
